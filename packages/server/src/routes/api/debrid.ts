@@ -131,6 +131,7 @@ router.get(
               downloadUrl: fileInfo.downloadUrl,
               hash: fileInfo.hash,
               private: fileInfo.private,
+              placeholderHash: fileInfo.placeholderHash,
               sources: fileInfo.sources,
               index: fileInfo.index,
               filename: filename,
