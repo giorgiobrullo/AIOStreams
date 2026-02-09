@@ -896,6 +896,11 @@ export class StremThruService
     const realHash = await StremThruService.hashMapping.get(
       `${serviceName}:${hash}`
     );
+    if (realHash) {
+      logger.debug(`Resolved placeholder hash ${hash} → ${realHash}`, {
+        serviceName,
+      });
+    }
     return realHash ?? hash;
   }
 
@@ -957,11 +962,16 @@ export class StremThruService
         logger.debug(
           `Mapped placeholder hash ${hash} → real hash ${realHash}`
         );
-        StremThruService.hashMapping
-          .set(`${this.serviceName}:${hash}`, realHash, 3600 * 24 * 7)
-          .catch((err) =>
-            logger.warn(`Failed to cache hash mapping: ${err.message}`)
+        try {
+          await StremThruService.hashMapping.set(
+            `${this.serviceName}:${hash}`,
+            realHash,
+            3600 * 24 * 7,
+            true
           );
+        } catch (err: any) {
+          logger.warn(`Failed to cache hash mapping: ${err.message}`);
+        }
         hash = realHash;
       }
 
@@ -1143,6 +1153,13 @@ export class StremThruService
       appConfig.builtins.debrid.playbackLinkCacheTtl,
       true
     );
+
+    // Invalidate stale instant availability cache entries so the next browse
+    // reflects the updated state (torrent now available in the store).
+    this.checkCacheDelete(playbackInfo.hash);
+    if (hash !== playbackInfo.hash) {
+      this.checkCacheDelete(hash);
+    }
 
     if (autoRemoveDownloads && magnetDownload.id && !magnetDownload.private) {
       this.removeMagnet(magnetDownload.id.toString()).catch((err) => {
