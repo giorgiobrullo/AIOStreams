@@ -27,6 +27,12 @@ import {
 } from '../../debrid/index.js';
 import { parseTorrentTitle, ParsedResult } from '@viren070/parse-torrent-title';
 import { preprocessTitle, normaliseTitle } from '../../parser/utils.js';
+import { StremThruService } from '../../debrid/stremthru.js';
+
+// we have a list of torrents which need to be
+// - 1. checked for instant availability for each configured debrid service
+// - 2. pick a file from file list if available
+// - 3. return list of torrents but with service info too.
 
 const logger = createLogger('debrid');
 
@@ -244,6 +250,22 @@ async function processTorrentsForDebridService(
   }
 
   const results: TorrentWithSelectedFile[] = [];
+
+  // Resolve placeholder hashes to real info hashes if we've seen them before
+  // (e.g. after a previous play through qBittorrent). This lets cache checks
+  // correctly identify already-downloaded private tracker torrents.
+  for (const torrent of torrents) {
+    if (torrent.placeholderHash) {
+      const realHash = await StremThruService.resolveHash(
+        service.id,
+        torrent.hash
+      );
+      if (realHash !== torrent.hash) {
+        torrent.hash = realHash;
+        torrent.placeholderHash = false;
+      }
+    }
+  }
 
   const magnetCheckResults = await debridService.checkMagnets(
     torrents.map((torrent) => torrent.hash),
