@@ -327,6 +327,7 @@ const SERVICE_DETAILS: Record<
     shortName: string;
     knownNames: string[];
     signUpText: string;
+    debrid: boolean;
     credentials: Option[];
   }
 > = {
@@ -335,6 +336,7 @@ const SERVICE_DETAILS: Record<
     name: 'Real-Debrid',
     shortName: 'RD',
     knownNames: ['RD', 'Real Debrid', 'RealDebrid', 'Real-Debrid'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://real-debrid.com/?id=9483829)",
     credentials: [
@@ -353,6 +355,7 @@ const SERVICE_DETAILS: Record<
     name: 'AllDebrid',
     shortName: 'AD',
     knownNames: ['AD', 'All Debrid', 'AllDebrid', 'All-Debrid'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://alldebrid.com/?uid=3n8qa&lang=en)",
     credentials: [
@@ -371,6 +374,7 @@ const SERVICE_DETAILS: Record<
     name: 'Premiumize',
     shortName: 'PM',
     knownNames: ['PM', 'Premiumize'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://www.premiumize.me/register)",
     credentials: [
@@ -389,6 +393,7 @@ const SERVICE_DETAILS: Record<
     name: 'Debrid-Link',
     shortName: 'DL',
     knownNames: ['DL', 'Debrid Link', 'DebridLink', 'Debrid-Link'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://debrid-link.com/id/EY0JO)",
     credentials: [
@@ -407,6 +412,7 @@ const SERVICE_DETAILS: Record<
     name: 'TorBox',
     shortName: 'TB',
     knownNames: ['TB', 'TorBox', 'Torbox', 'TRB'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://torbox.app/subscription?referral=9ca21adb-dbcb-4fb0-9195-412a5f3519bc) or use my referral code `9ca21adb-dbcb-4fb0-9195-412a5f3519bc`.",
     credentials: [
@@ -425,6 +431,7 @@ const SERVICE_DETAILS: Record<
     name: 'Stremio NNTP',
     shortName: 'SN',
     knownNames: ['SN', 'Stremio NNTP', 'StremioNntp', 'Stremio-NNTP'],
+    debrid: false,
     signUpText:
       "Stream usenet directly from your provider via Stremio's NNTP client.",
     credentials: [
@@ -449,6 +456,7 @@ const SERVICE_DETAILS: Record<
     name: 'NzbDAV',
     shortName: 'ND',
     knownNames: ['ND'],
+    debrid: false,
     signUpText: 'Stream usenet directly from your provider via Nzb DAV.',
     credentials: [
       {
@@ -514,6 +522,7 @@ const SERVICE_DETAILS: Record<
     name: 'AltMount',
     shortName: 'AM',
     knownNames: ['AM'],
+    debrid: false,
     signUpText: 'Stream usenet directly from your provider via AltMount.',
     credentials: [
       {
@@ -580,6 +589,7 @@ const SERVICE_DETAILS: Record<
     name: 'Offcloud',
     shortName: 'OC',
     knownNames: ['OC', 'Offcloud'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://offcloud.com/?=06202a3d)",
     credentials: [
@@ -614,6 +624,7 @@ const SERVICE_DETAILS: Record<
     name: 'put.io',
     shortName: 'P.IO',
     knownNames: ['PO', 'put.io', 'putio'],
+    debrid: true,
     signUpText: "Don't have an account? [Sign up here](https://put.io/)",
     credentials: [
       {
@@ -639,6 +650,7 @@ const SERVICE_DETAILS: Record<
     name: 'Easynews',
     shortName: 'EN',
     knownNames: ['EN', 'Easynews'],
+    debrid: false,
     signUpText:
       "Don't have an account? [Sign up here](https://www.easynews.com/)",
     credentials: [
@@ -663,6 +675,7 @@ const SERVICE_DETAILS: Record<
     name: 'EasyDebrid',
     shortName: 'ED',
     knownNames: ['ED', 'EasyDebrid'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://paradise-cloud.com/products/easydebrid)",
     credentials: [
@@ -681,6 +694,7 @@ const SERVICE_DETAILS: Record<
     name: 'Debrider',
     shortName: 'DR',
     knownNames: ['DBD', 'DR', 'DER', 'DB', 'Debrider'],
+    debrid: true,
     signUpText: "Don't have an account? [Sign up here](https://debrider.app/)",
     credentials: [
       {
@@ -698,6 +712,7 @@ const SERVICE_DETAILS: Record<
     name: 'PikPak',
     shortName: 'PKP',
     knownNames: ['PP', 'PikPak', 'PKP'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://mypikpak.com/drive/activity/invited?invitation-code=72822731)",
     credentials: [
@@ -722,6 +737,7 @@ const SERVICE_DETAILS: Record<
     name: 'Seedr',
     shortName: 'SDR',
     knownNames: ['SR', 'Seedr', 'SDR'],
+    debrid: true,
     signUpText:
       "Don't have an account? [Sign up here](https://www.seedr.cc/?r=6542079)",
     credentials: [
@@ -774,6 +790,7 @@ const SERVICE_DETAILS: Record<
     name: 'qBittorrent',
     shortName: 'QB',
     knownNames: ['QB', 'qBittorrent', 'qBit'],
+    debrid: false,
     signUpText:
       'Stream from your own seedbox or server running qBittorrent. Ideal for private tracker users who need a dedicated IP and ratio management.',
     credentials: [
