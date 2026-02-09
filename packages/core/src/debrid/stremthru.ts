@@ -918,7 +918,7 @@ export class StremThruService
         id: magnetDownload.id,
       });
     } else if (
-      playbackInfo.private !== undefined &&
+      (playbackInfo.private !== undefined || playbackInfo.placeholderHash) &&
       playbackInfo.downloadUrl &&
       appConfig.builtins.debrid.useTorrentDownloadUrl &&
       (await this.checkCacheGet(hash))?.status !== 'cached'
