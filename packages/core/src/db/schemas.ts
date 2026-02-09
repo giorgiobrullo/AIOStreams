@@ -1292,6 +1292,7 @@ const StatusResponseSchema = z.object({
         name: z.string(),
         shortName: z.string(),
         knownNames: z.array(z.string()),
+        debrid: z.boolean(),
         signUpText: z.string(),
         credentials: z.array(OptionDefinition),
       })
