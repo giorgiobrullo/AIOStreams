@@ -892,15 +892,23 @@ export class StremThruService
     serviceName: string,
     hash: string
   ): Promise<string> {
-    const realHash = await StremThruService.hashMapping.get(
-      `${serviceName}:${hash}`
-    );
-    if (realHash) {
-      logger.debug(`Resolved placeholder hash ${hash} → ${realHash}`, {
+    try {
+      const realHash = await StremThruService.hashMapping.get(
+        `${serviceName}:${hash}`
+      );
+      if (realHash) {
+        logger.debug(`Resolved placeholder hash ${hash} → ${realHash}`, {
+          serviceName,
+        });
+      }
+      return realHash ?? hash;
+    } catch (e) {
+      logger.warn(`Failed to look up hash mapping for ${hash}`, {
         serviceName,
+        error: e,
       });
+      return hash;
     }
-    return realHash ?? hash;
   }
 
   private async _resolveTorrent(
