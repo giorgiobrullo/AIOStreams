@@ -1,5 +1,6 @@
 import {
   BuiltinServiceId,
+  constants,
   createLogger,
   Env,
   getTimeTakenSincePoint,
@@ -32,7 +33,6 @@ import {
   extractInfoHashFromMagnet,
 } from '../../parser/utils.js';
 export { extractInfoHashFromMagnet };
-import { StremThruService } from '../../debrid/stremthru.js';
 
 // we have a list of torrents which need to be
 // - 1. checked for instant availability for each configured debrid service
@@ -197,7 +197,7 @@ async function processTorrentsForDebridService(
   // since it runs on user-controlled infrastructure.
   if (
     Env.BUILTIN_DEBRID_EXCLUDE_PRIVATE_TRACKERS &&
-    service.id !== 'qbittorrent'
+    service.id !== constants.QBITTORRENT_SERVICE
   ) {
     const privateTorrents = torrents.filter((t) => t.private);
     if (privateTorrents.length > 0) {
@@ -253,15 +253,14 @@ async function processTorrentsForDebridService(
   // Resolve placeholder hashes to real info hashes if we've seen them before
   // (e.g. after a previous play through qBittorrent). This lets cache checks
   // correctly identify already-downloaded private tracker torrents.
-  for (const torrent of torrents) {
-    if (torrent.placeholderHash) {
-      const realHash = await StremThruService.resolveHash(
-        service.id,
-        torrent.hash
-      );
-      if (realHash !== torrent.hash) {
-        torrent.hash = realHash;
-        torrent.placeholderHash = false;
+  if (debridService.resolveHash) {
+    for (const torrent of torrents) {
+      if (torrent.placeholderHash) {
+        const realHash = await debridService.resolveHash(torrent.hash);
+        if (realHash !== torrent.hash) {
+          torrent.hash = realHash;
+          torrent.placeholderHash = false;
+        }
       }
     }
   }
