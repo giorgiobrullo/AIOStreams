@@ -85,8 +85,10 @@ export class StremThruService
     'st:check'
   );
   // Maps placeholder hashes (SHA-1 of downloadUrl) to real info hashes returned
-  // by StremThru after addTorrent. Persists via Redis or SQL so that future
-  // cache checks resolve correctly (e.g. showing qBittorrent torrents as cached).
+  // by StremThru after addTorrent. This mapping is permanent — a download URL
+  // always corresponds to the same info hash. Actual availability (is the
+  // torrent still in qBit?) is checked live via checkMagnets on each browse.
+  // Persists via Redis or SQL so mappings survive restarts.
   private static hashMapping = Cache.getInstance<string, string>(
     'st:hash-map',
     5000,
@@ -847,7 +849,11 @@ export class StremThruService
    * Used by the cache-checking pipeline to look up real hashes before
    * calling checkMagnets, so already-downloaded torrents show as cached.
    */
-  public static async resolveHash(
+  public async resolveHash(hash: string): Promise<string> {
+    return StremThruInterface._resolveHash(this.serviceName, hash);
+  }
+
+  private static async _resolveHash(
     serviceName: string,
     hash: string
   ): Promise<string> {
@@ -914,7 +920,7 @@ export class StremThruService
           await StremThruService.hashMapping.set(
             `${this.serviceName}:${hash}`,
             realHash,
-            3600 * 24 * 7,
+            3600 * 24 * 365,
             true
           );
         } catch (err: any) {

@@ -219,6 +219,13 @@ export interface UsenetDebridService extends BaseDebridService {
   ): Promise<string>;
   removeNzb?(nzbId: string): Promise<void>;
   getNzb?(nzbId: string): Promise<DebridDownload>;
+
+  // Placeholder hash resolution (e.g. for private tracker torrents)
+  resolveHash?(hash: string): Promise<string>;
+
+  // Service info
+  readonly serviceName: ServiceId;
+  readonly supportsUsenet: boolean;
 }
 
 export type DebridService = TorrentDebridService | UsenetDebridService;
