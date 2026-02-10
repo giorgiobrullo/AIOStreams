@@ -969,7 +969,9 @@ export class StremThruService
         );
         streamingWhileDownloading = true;
       } else {
-        StremThruService.playbackLinkCache.set(cacheKey, null, 60);
+        StremThruService.playbackLinkCache.set(cacheKey, null, 60).catch(
+          (e) => logger.debug('Failed to cache null playback link', { error: e })
+        );
         if (!cacheAndPlay) {
           return undefined;
         }
@@ -1126,7 +1128,9 @@ export class StremThruService
           `Streaming-while-downloading link generation failed for ${hash}, falling back`,
           { error: error.message }
         );
-        StremThruService.playbackLinkCache.set(cacheKey, null, 60);
+        StremThruService.playbackLinkCache.set(cacheKey, null, 60).catch(
+          (e) => logger.debug('Failed to cache null playback link', { error: e })
+        );
         return undefined;
       }
       throw error;
