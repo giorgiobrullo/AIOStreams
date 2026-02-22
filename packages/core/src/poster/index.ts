@@ -23,13 +23,6 @@ export const ALL_POSTER_SERVICE_DOMAINS = [
 ];
 
 /**
- * Check whether a poster URL is already from any poster service.
- */
-export function isPosterFromAnyService(posterUrl: string): boolean {
-  return ALL_POSTER_SERVICE_DOMAINS.some((d) => posterUrl.includes(d));
-}
-
-/**
  * Create a poster service instance from user data, or return null if
  * the service is 'none' or no API key is configured.
  */

@@ -30,7 +30,7 @@ import {
   Subtitle,
 } from './db/schemas.js';
 import { createProxy } from './proxy/index.js';
-import { createPosterService, isPosterFromAnyService } from './poster/index.js';
+import { createPosterService } from './poster/index.js';
 import { FeatureControl } from './utils/feature.js';
 import Proxifier from './streams/proxifier.js';
 import StreamLimiter from './streams/limiter.js';
@@ -974,8 +974,8 @@ export class AIOStreams {
       items.map(async (item) => {
         if (posterApi && item.poster) {
           let posterUrl = item.poster;
-          if (isPosterFromAnyService(posterUrl)) {
-            // already a poster from a poster service, do nothing.
+          if (posterApi.isPosterFromThisService(posterUrl)) {
+            // already a poster from this service, do nothing
           } else if (this.userData.usePosterRedirectApi) {
             const itemId = (item as any).imdb_id || item.id;
             posterUrl = posterApi.buildRedirectUrl(itemId, type, item.poster);
