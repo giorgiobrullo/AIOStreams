@@ -1,5 +1,5 @@
 import { DistributedLock } from '../utils/distributed-lock.js';
-import { Metadata, MetadataTitle } from './utils.js';
+import { deduplicateTitles, Metadata, MetadataTitle } from './utils.js';
 import { TMDBMetadata } from './tmdb.js';
 import { getTraktAliases } from './trakt.js';
 import { IMDBMetadata } from './imdb.js';
@@ -352,26 +352,7 @@ export class MetadataService {
                 yearEnd = imdbSuggestionData.yearEnd;
             }
 
-            // Deduplicate titles by lowercase title string
-            const indexMap = new Map<string, number>();
-            const uniqueTitles: MetadataTitle[] = [];
-            for (const t of titles) {
-              const key = t.title.toLowerCase();
-              const existingIndex = indexMap.get(key);
-              if (existingIndex === undefined) {
-                indexMap.set(key, uniqueTitles.length);
-                uniqueTitles.push({ title: t.title, language: t.language });
-              } else {
-                const existing = uniqueTitles[existingIndex];
-                // Prefer a title entry that has a language over one without
-                if (!existing.language && t.language) {
-                  uniqueTitles[existingIndex] = {
-                    title: t.title,
-                    language: t.language,
-                  };
-                }
-              }
-            }
+            const uniqueTitles = deduplicateTitles(titles);
 
             if (
               !uniqueTitles.length ||
@@ -400,7 +381,9 @@ export class MetadataService {
               `Found metadata for ${id.fullId} in ${getTimeTakenSincePoint(start)}`,
               {
                 ...metadata,
-                titles: metadata.titles.map((t) => t.title),
+                titles: metadata.titles.map(
+                  (t) => `${t.title}${t.language ? ` (${t.language})` : ''}`
+                ),
                 seasons: metadata.seasons?.map(
                   (s) => `{s:${s.season_number},e:${s.episode_count}}`
                 ),

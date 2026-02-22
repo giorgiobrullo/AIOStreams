@@ -1,6 +1,6 @@
 import { Headers } from 'undici';
 import { Env, Cache, makeRequest, ParsedId, IdType } from '../utils/index.js';
-import { Metadata, MetadataTitle } from './utils.js';
+import { deduplicateTitles, Metadata, MetadataTitle } from './utils.js';
 import { iso31661ToIso6391 } from '../formatters/utils.js';
 import { z } from 'zod';
 
@@ -245,16 +245,20 @@ export class TMDBMetadata {
 
     if (mediaType === 'movie') {
       const data = MovieAlternativeTitlesSchema.parse(json);
-      return data.titles.map((title) => ({
-        title: title.title,
-        language: iso31661ToIso6391(title.iso_3166_1) || undefined,
-      }));
+      return data.titles
+        .filter((t) => t.title)
+        .map((title) => ({
+          title: title.title,
+          language: iso31661ToIso6391(title.iso_3166_1) || undefined,
+        }));
     } else {
       const data = TVAlternativeTitlesSchema.parse(json);
-      return data.results.map((title) => ({
-        title: title.title,
-        language: iso31661ToIso6391(title.iso_3166_1) || undefined,
-      }));
+      return data.results
+        .filter((t) => t.title)
+        .map((title) => ({
+          title: title.title,
+          language: iso31661ToIso6391(title.iso_3166_1) || undefined,
+        }));
     }
   }
 
@@ -388,7 +392,7 @@ export class TMDBMetadata {
       genres = tvData.genres?.map((g) => g.name) ?? [];
     }
 
-    allTitles.push({ title: primaryTitle });
+    allTitles.push({ title: primaryTitle, language: originalLanguage });
 
     const year = this.parseReleaseDate(releaseDate);
 
@@ -433,15 +437,7 @@ export class TMDBMetadata {
       );
     }
 
-    const seen = new Set<string>();
-    const uniqueTitles: MetadataTitle[] = [];
-    for (const t of allTitles) {
-      const key = t.title.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        uniqueTitles.push(t);
-      }
-    }
+    const uniqueTitles = deduplicateTitles(allTitles);
     const metadata: Metadata = {
       title: primaryTitle,
       titles: uniqueTitles,

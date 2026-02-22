@@ -668,7 +668,19 @@ class StreamFilterer {
         // the stream is in that language (English/Japanese titles are universal)
         const isCommon = lang === 'en' || (isAnime && lang === 'ja');
 
-        if (!isCommon) {
+        // Don't infer language if the stream already carries a specific language tag.
+        // Unknown / Dual Audio / Multi / Dubbed are non-specific and don't count.
+        const nonSpecificLanguages = [
+          'Unknown',
+          'Dual Audio',
+          'Multi',
+          'Dubbed',
+        ];
+        const hasSpecificLanguage = stream.parsedFile.languages.some(
+          (l) => !nonSpecificLanguages.includes(l)
+        );
+
+        if (!isCommon && !hasSpecificLanguage) {
           const inferredLanguage = iso6391ToLanguage(lang);
           if (
             inferredLanguage &&
