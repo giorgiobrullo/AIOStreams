@@ -181,9 +181,12 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
         Math.abs(new Date().getTime() - new Date(date).getTime()) /
           (1000 * 60 * 60)
       );
-
-      const languages = parseNabLanguages(result.newznab?.language);
-
+      const languages = [
+        ...(result.newznab?.language
+          ? parseNabLanguages(result.newznab.language)
+          : []),
+        ...(result.newznab?.subs ? parseNabLanguages(result.newznab.subs) : []),
+      ];
       const nzb: NZB = {
         confirmed: meta.searchType === 'id',
         hash: md5,
