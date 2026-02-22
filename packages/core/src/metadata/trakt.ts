@@ -35,6 +35,12 @@ export async function getTraktAliases(
     logger.debug(
       `Retrieved ${cachedAliases.length} (cached) Trakt aliases for ${parsedId.value}`
     );
+    if (cachedAliases.every((a) => typeof a === 'string')) {
+      return (cachedAliases as unknown as string[]).map((title) => ({
+        title,
+        language: undefined,
+      }));
+    }
     return cachedAliases;
   }
   // need imdb id, trakt id requires authentication.

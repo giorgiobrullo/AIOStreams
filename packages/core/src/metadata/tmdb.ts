@@ -299,6 +299,16 @@ export class TMDBMetadata {
     const cacheKey = `${tmdbId}:${parsedId.mediaType}`;
     const cachedMetadata = await TMDBMetadata.metadataCache.get(cacheKey);
     if (cachedMetadata) {
+      if (
+        cachedMetadata.titles &&
+        Array.isArray(cachedMetadata.titles) &&
+        cachedMetadata.titles.every((t) => typeof t === 'string')
+      ) {
+        cachedMetadata.titles = cachedMetadata.titles.map((title) => ({
+          title: title,
+          language: undefined,
+        }));
+      }
       return { ...cachedMetadata, tmdbId: Number(tmdbId) };
     }
 
