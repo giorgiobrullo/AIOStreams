@@ -159,7 +159,6 @@ export class PresetManager {
         NAME: metadata.NAME,
         LOGO: metadata.LOGO,
         DESCRIPTION: metadata.DESCRIPTION,
-        URL: metadata.URL,
         SUPPORTED_RESOURCES: metadata.SUPPORTED_RESOURCES,
         SUPPORTED_STREAM_TYPES: metadata.SUPPORTED_STREAM_TYPES,
         SUPPORTED_SERVICES: metadata.SUPPORTED_SERVICES,

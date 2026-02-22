@@ -1168,7 +1168,6 @@ const PresetMinimalMetadataSchema = z.object({
   NAME: z.string(),
   LOGO: z.string().optional(),
   DESCRIPTION: z.string(),
-  URL: z.string(),
   DISABLED: z
     .object({
       reason: z.string(),
@@ -1185,6 +1184,7 @@ const PresetMinimalMetadataSchema = z.object({
 });
 
 const PresetMetadataSchema = PresetMinimalMetadataSchema.extend({
+  URL: z.string(),
   TIMEOUT: z.number(),
   USER_AGENT: z.string(),
 });
