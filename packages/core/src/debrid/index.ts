@@ -5,7 +5,7 @@ export * from './torbox.js';
 export * from './nzbdav.js';
 export * from './altmount.js';
 
-import { Env, ServiceId, fromUrlSafeBase64 } from '../utils/index.js';
+import { Env, ServiceId, Time, fromUrlSafeBase64 } from '../utils/index.js';
 import { DebridService, DebridServiceConfig, DebridError } from './base.js';
 import { StremThruService } from './stremthru.js';
 import { TorboxDebridService } from './torbox.js';
@@ -37,6 +37,10 @@ export function getDebridService(
             token: config.token,
           },
           capabilities: { torrents: true, usenet: true },
+          cacheAndPlayOptions: {
+            pollingInterval: 10 * Time.Second,
+            maxWaitTime: 2 * Time.Minute,
+          },
         });
       }
       return new TorboxDebridService(config);
@@ -72,13 +76,11 @@ function createStremThruNewzService(
 ): StremThruService {
   let url: string;
   let authToken: string;
-  let publicUrl: string | undefined;
 
   try {
     const parsed = JSON.parse(fromUrlSafeBase64(config.token));
     url = parsed.url;
     authToken = parsed.authToken;
-    publicUrl = parsed.publicUrl;
   } catch {
     throw new DebridError(
       'Invalid StremThru Newz credentials. Expected base64-encoded JSON with url and authToken.',
@@ -108,7 +110,6 @@ function createStremThruNewzService(
   return new StremThruService({
     serviceName: 'stremthru_newz',
     clientIp: config.clientIp,
-    publicUrl,
     stremthru: {
       baseUrl: url,
       store: 'stremthru',
@@ -119,6 +120,10 @@ function createStremThruNewzService(
       alwaysCacheAndPlay: true,
       neverAutoRemove: true,
       treatUnknownAsCached: true,
+    },
+    cacheAndPlayOptions: {
+      pollingInterval: 5 * Time.Second,
+      maxWaitTime: 1 * Time.Minute,
     },
   });
 }

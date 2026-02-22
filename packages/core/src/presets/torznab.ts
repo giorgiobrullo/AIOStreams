@@ -214,7 +214,6 @@ export class TorznabPreset extends BuiltinAddonPreset {
       formatPassthrough:
         options.formatPassthrough ?? options.streamPassthrough ?? false,
       resultPassthrough: options.resultPassthrough ?? false,
-      forceToTop: options.forceToTop ?? false,
       headers: {
         'User-Agent': this.METADATA.USER_AGENT,
       },

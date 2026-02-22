@@ -75,6 +75,7 @@ const ResultLimitOptions = z.object({
   streamType: z.number().min(1).optional(),
   indexer: z.number().min(1).optional(),
   releaseGroup: z.number().min(1).optional(),
+  mode: z.enum(['independent', 'conjunctive']).optional(),
 });
 
 // const SizeFilter = z.object({
@@ -144,7 +145,8 @@ const AddonSchema = z.object({
   library: z.boolean().optional(),
   formatPassthrough: z.boolean().optional(),
   resultPassthrough: z.boolean().optional(),
-  forceToTop: z.boolean().optional(),
+  // forceToTop: z.boolean().optional(),
+  pinPosition: z.enum(['top', 'bottom']).optional(),
   serviceWrapped: z.boolean().optional(),
   headers: z.record(z.string().min(1), z.string().min(1)).optional(),
   ip: z.union([z.ipv4(), z.ipv6()]).optional(),
@@ -599,6 +601,7 @@ export const UserDataSchema = z.object({
       enabled: z.boolean().optional(),
       tolerance: z.number().min(0).max(100).optional(),
       strict: z.boolean().optional(),
+      useInitialAirDate: z.boolean().optional(),
       requestTypes: z.array(z.string()).optional(),
       addons: z.array(z.string()).optional(),
     })

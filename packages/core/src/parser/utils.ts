@@ -1,5 +1,6 @@
 import { extract, FuzzballExtractOptions } from 'fuzzball';
 import { createLogger } from '../utils/index.js';
+import { MetadataTitle } from '../metadata/utils.js';
 
 const logger = createLogger('parser');
 
@@ -13,41 +14,88 @@ const umlautMap: Record<string, string> = {
   ß: 'ss',
 };
 
-export function titleMatch(
+type TitleMatchOptions = {
+  threshold: number;
+  limitTitles?: number;
+} & Exclude<FuzzballExtractOptions, 'returnObjects'>;
+
+interface TitleMatchInnerResult {
+  matched: boolean;
+  matchedIndex?: number;
+}
+
+/**
+ * Inner matching function shared by titleMatch and titleMatchWithLang.
+ * Returns the match result and the index of the best matching title.
+ */
+function _titleMatchInner(
   parsedTitle: string,
   titles: string[],
-  options: {
-    threshold: number;
-    limitTitles?: number;
-  } & Exclude<FuzzballExtractOptions, 'returnObjects'>
-) {
-  const { threshold, ...extractOptions } = options;
+  options: TitleMatchOptions
+): TitleMatchInnerResult {
+  const { threshold, limitTitles, ...extractOptions } = options;
+
+  if (limitTitles && titles.length > limitTitles) {
+    titles = titles.slice(0, limitTitles);
+  }
 
   // when threshold is 1, no need to use levenshtein distance, just check for exact matches
   if (threshold === 1 && !extractOptions.scorer) {
-    return titles.some(
+    const idx = titles.findIndex(
       (title) => title.toLowerCase() === parsedTitle.toLowerCase()
     );
-  }
-
-  if (options.limitTitles && titles.length > options.limitTitles) {
-    titles.length = options.limitTitles;
+    return { matched: idx !== -1, matchedIndex: idx !== -1 ? idx : undefined };
   }
 
   const results = extract(parsedTitle, titles, {
     ...extractOptions,
     returnObjects: true,
-  });
+  }) as { choice: string; score: number; key: number }[];
 
-  const highestScore =
-    results.reduce(
-      (max: number, result: { choice: string; score: number; key: number }) => {
-        return Math.max(max, result.score);
-      },
-      0
-    ) / 100;
+  let bestScore = 0;
+  let bestKey: number | undefined;
+  for (const result of results) {
+    if (result.score > bestScore) {
+      bestScore = result.score;
+      bestKey = result.key;
+    }
+  }
 
-  return highestScore >= threshold;
+  const matched = bestScore / 100 >= threshold;
+  return { matched, matchedIndex: matched ? bestKey : undefined };
+}
+
+/**
+ * Check if a parsed title matches any of the provided titles.
+ * @returns true if a match is found above the threshold.
+ */
+export function titleMatch(
+  parsedTitle: string,
+  titles: string[],
+  options: TitleMatchOptions
+): boolean {
+  return _titleMatchInner(parsedTitle, titles, options).matched;
+}
+
+/**
+ * Like titleMatch, but accepts MetadataTitle[] and returns the language
+ * of the best matching title (if any). Normalises MetadataTitle strings
+ * internally so callers only need to normalise parsedTitle.
+ */
+export function titleMatchWithLang(
+  parsedTitle: string,
+  titles: MetadataTitle[],
+  options: TitleMatchOptions
+): { matched: boolean; language?: string } {
+  const normalisedTitles = titles.map((t) => normaliseTitle(t.title));
+  const result = _titleMatchInner(parsedTitle, normalisedTitles, options);
+  return {
+    matched: result.matched,
+    language:
+      result.matchedIndex !== undefined
+        ? titles[result.matchedIndex]?.language
+        : undefined,
+  };
 }
 
 export function preprocessTitle(

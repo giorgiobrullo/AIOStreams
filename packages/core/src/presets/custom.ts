@@ -164,7 +164,7 @@ export class CustomPreset extends Preset {
       formatPassthrough:
         options.formatPassthrough ?? options.streamPassthrough ?? false,
       resultPassthrough: options.resultPassthrough ?? false,
-      forceToTop: options.forceToTop ?? false,
+      pinPosition: options.pinPosition || undefined,
       headers: {
         'User-Agent': this.METADATA.USER_AGENT,
       },

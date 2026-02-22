@@ -788,7 +788,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
 
     const searchMetadata: SearchMetadata = {
       primaryTitle: metadata.title,
-      titles: metadata.titles ?? [],
+      titles: metadata.titles?.map((t) => t.title) ?? [],
       season: parsedId.season ? Number(parsedId.season) : undefined,
       episode: parsedId.episode ? Number(parsedId.episode) : undefined,
       absoluteEpisode,
@@ -904,6 +904,10 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         filename: torrentOrNzb.file.name,
         folderSize: torrentOrNzb.size,
       },
+      ...(torrentOrNzb.languages &&
+        torrentOrNzb.languages.length > 0 && {
+          languages: torrentOrNzb.languages,
+        }),
     };
   }
 

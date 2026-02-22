@@ -14,6 +14,24 @@ import {
   SearchResultItem,
 } from './api.js';
 import { createQueryLimit, useAllTitles } from '../../utils/general.js';
+import { LANGUAGES } from '../../../utils/constants.js';
+
+/**
+ * Parse a comma-separated language string from a newznab/torznab attribute
+ * into an array of canonical AIOStreams language names.
+ */
+export function parseNabLanguages(
+  value: string | number | boolean | undefined
+): string[] {
+  if (typeof value !== 'string' || !value) return [];
+  return value
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .filter((v): v is (typeof LANGUAGES)[number] => {
+      return LANGUAGES.includes(v as any);
+    });
+}
 
 export const NabAddonConfigSchema = BaseDebridConfigSchema.extend({
   url: z.string(),

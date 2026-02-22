@@ -1,6 +1,7 @@
 import { Headers } from 'undici';
 import { Env, Cache, makeRequest, ParsedId, IdType } from '../utils/index.js';
-import { Metadata } from './utils.js';
+import { Metadata, MetadataTitle } from './utils.js';
+import { iso31661ToIso6391 } from '../formatters/utils.js';
 import { z } from 'zod';
 
 export type TMDBIdType = 'imdb_id' | 'tmdb_id' | 'tvdb_id';
@@ -62,6 +63,7 @@ const MovieAlternativeTitlesSchema = z.object({
   titles: z.array(
     z.object({
       title: z.string(),
+      iso_3166_1: z.string(),
     })
   ),
 });
@@ -70,6 +72,7 @@ const TVAlternativeTitlesSchema = z.object({
   results: z.array(
     z.object({
       title: z.string(),
+      iso_3166_1: z.string(),
     })
   ),
 });
@@ -226,7 +229,7 @@ export class TMDBMetadata {
   private async fetchAlternativeTitles(
     url: URL,
     mediaType: string
-  ): Promise<string[]> {
+  ): Promise<MetadataTitle[]> {
     const response = await makeRequest(url.toString(), {
       timeout: 5000,
       headers: this.getHeaders(),
@@ -242,17 +245,23 @@ export class TMDBMetadata {
 
     if (mediaType === 'movie') {
       const data = MovieAlternativeTitlesSchema.parse(json);
-      return data.titles.map((title) => title.title);
+      return data.titles.map((title) => ({
+        title: title.title,
+        language: iso31661ToIso6391(title.iso_3166_1) || undefined,
+      }));
     } else {
       const data = TVAlternativeTitlesSchema.parse(json);
-      return data.results.map((title) => title.title);
+      return data.results.map((title) => ({
+        title: title.title,
+        language: iso31661ToIso6391(title.iso_3166_1) || undefined,
+      }));
     }
   }
 
   private async fetchTranslatedTitles(
     url: URL,
     mediaType: string
-  ): Promise<string[]> {
+  ): Promise<MetadataTitle[]> {
     const response = await makeRequest(url.toString(), {
       timeout: 5000,
       headers: this.getHeaders(),
@@ -265,8 +274,15 @@ export class TMDBMetadata {
     const json = await response.json();
     const data = TranslationsSchema.parse(json);
     return data.translations
-      .map((translation) => translation.data.title || translation.data.name)
-      .filter((s): s is string => Boolean(s));
+      .map((translation) => {
+        const title = translation.data.title || translation.data.name;
+        if (!title) return null;
+        return {
+          title,
+          language: translation.iso_639_1 || undefined,
+        } as MetadataTitle;
+      })
+      .filter((t): t is MetadataTitle => t !== null);
   }
 
   public async getMetadata(parsedId: ParsedId): Promise<Metadata> {
@@ -313,7 +329,7 @@ export class TMDBMetadata {
     let seasons:
       | Array<{ season_number: number; episode_count: number }>
       | undefined;
-    let allTitles: string[] = [];
+    let allTitles: MetadataTitle[] = [];
     let originalLanguage: string | undefined;
     let runtime: number | undefined;
     let genres: string[] = [];
@@ -325,7 +341,10 @@ export class TMDBMetadata {
           ? (movieData.original_title ?? movieData.title)
           : movieData.title;
       if (movieData.original_title) {
-        allTitles.push(movieData.original_title);
+        allTitles.push({
+          title: movieData.original_title,
+          language: movieData.original_language,
+        });
       }
       originalLanguage = movieData.original_language;
       releaseDate = movieData.release_date;
@@ -338,7 +357,10 @@ export class TMDBMetadata {
           ? (tvData.original_title ?? tvData.name)
           : tvData.name;
       if (tvData.original_title) {
-        allTitles.push(tvData.original_title);
+        allTitles.push({
+          title: tvData.original_title,
+          language: tvData.original_language,
+        });
       }
       originalLanguage = tvData.original_language;
       releaseDate = tvData.first_air_date ?? undefined;
@@ -356,7 +378,7 @@ export class TMDBMetadata {
       genres = tvData.genres?.map((g) => g.name) ?? [];
     }
 
-    allTitles.push(primaryTitle);
+    allTitles.push({ title: primaryTitle });
 
     const year = this.parseReleaseDate(releaseDate);
 
@@ -401,7 +423,15 @@ export class TMDBMetadata {
       );
     }
 
-    const uniqueTitles = [...new Set(allTitles)];
+    const seen = new Set<string>();
+    const uniqueTitles: MetadataTitle[] = [];
+    for (const t of allTitles) {
+      const key = t.title.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueTitles.push(t);
+      }
+    }
     const metadata: Metadata = {
       title: primaryTitle,
       titles: uniqueTitles,

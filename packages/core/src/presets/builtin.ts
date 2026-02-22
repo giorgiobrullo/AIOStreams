@@ -6,6 +6,24 @@ import { Preset } from './preset.js';
 import { stremthruSpecialCases } from './stremthru.js';
 
 export class BuiltinStreamParser extends StreamParser {
+  protected override getLanguages(
+    stream: Stream,
+    currentParsedStream: ParsedStream
+  ): string[] {
+    const languages = super.getLanguages(stream, currentParsedStream);
+    const builtinLanguages = (stream as Record<string, unknown>).languages as
+      | string[]
+      | undefined;
+    if (builtinLanguages) {
+      for (const lang of builtinLanguages) {
+        if (!languages.includes(lang)) {
+          languages.push(lang);
+        }
+      }
+    }
+    return languages;
+  }
+
   protected getFolder(
     stream: Stream,
     currentParsedStream: ParsedStream

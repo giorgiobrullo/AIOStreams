@@ -312,7 +312,9 @@ async function buildMetadata(
   if (!contextMetadata) return undefined;
 
   return {
-    titles: contextMetadata.titles ?? [contextMetadata.title],
+    titles: contextMetadata.titles?.map((t) => t.title) ?? [
+      contextMetadata.title,
+    ],
     season: context.parsedId?.season
       ? Number(context.parsedId.season)
       : undefined,

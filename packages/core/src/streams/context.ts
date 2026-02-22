@@ -586,7 +586,7 @@ export class StreamContext {
         ? Number(this.parsedId.episode)
         : undefined,
       title: this._metadata?.title,
-      titles: this._metadata?.titles,
+      titles: this._metadata?.titles?.map((t) => t.title),
       year: this._metadata?.year,
       yearEnd: this._metadata?.yearEnd,
       genres: this._metadata?.genres,
@@ -628,7 +628,7 @@ export class StreamContext {
         : undefined,
       // Metadata fields
       title: this._metadata?.title,
-      titles: this._metadata?.titles,
+      titles: this._metadata?.titles?.map((t) => t.title),
       year: this._metadata?.year,
       yearEnd: this._metadata?.yearEnd,
       genres: this._metadata?.genres ?? [],

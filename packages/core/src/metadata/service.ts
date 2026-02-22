@@ -1,5 +1,5 @@
 import { DistributedLock } from '../utils/distributed-lock.js';
-import { Metadata } from './utils.js';
+import { Metadata, MetadataTitle } from './utils.js';
 import { TMDBMetadata } from './tmdb.js';
 import { getTraktAliases } from './trakt.js';
 import { IMDBMetadata } from './imdb.js';
@@ -43,7 +43,7 @@ export class MetadataService {
           `metadata:${id.mediaType}:${id.type}:${id.value}${this.config.tmdbAccessToken || this.config.tmdbApiKey ? ':tmdb' : ''}${this.config.tvdbApiKey ? ':tvdb' : ''}`,
           async () => {
             const start = Date.now();
-            const titles: string[] = [];
+            const titles: MetadataTitle[] = [];
             let releaseDate: string | undefined;
             let year: number | undefined;
             let yearEnd: number | undefined;
@@ -86,10 +86,13 @@ export class MetadataService {
                   : null;
 
             if (animeEntry) {
-              if (animeEntry.imdb?.title) titles.push(animeEntry.imdb.title);
-              if (animeEntry.trakt?.title) titles.push(animeEntry.trakt.title);
-              if (animeEntry.title) titles.push(animeEntry.title);
-              if (animeEntry.synonyms) titles.push(...animeEntry.synonyms);
+              if (animeEntry.imdb?.title)
+                titles.push({ title: animeEntry.imdb.title });
+              if (animeEntry.trakt?.title)
+                titles.push({ title: animeEntry.trakt.title });
+              if (animeEntry.title) titles.push({ title: animeEntry.title });
+              if (animeEntry.synonyms)
+                titles.push(...animeEntry.synonyms.map((s) => ({ title: s })));
               year = animeEntry.animeSeason?.year ?? undefined;
             }
 
@@ -162,7 +165,7 @@ export class MetadataService {
             ] = (await Promise.allSettled(promises)) as [
               PromiseSettledResult<(Metadata & { tmdbId: string }) | undefined>,
               PromiseSettledResult<(Metadata & { tvdbId: number }) | undefined>,
-              PromiseSettledResult<string[] | undefined>,
+              PromiseSettledResult<MetadataTitle[] | undefined>,
               PromiseSettledResult<Meta | undefined>,
               PromiseSettledResult<Metadata | undefined>,
             ];
@@ -170,7 +173,8 @@ export class MetadataService {
             // Process TMDB results
             if (tmdbResult.status === 'fulfilled' && tmdbResult.value) {
               const tmdbMetadata = tmdbResult.value;
-              if (tmdbMetadata.title) titles.unshift(tmdbMetadata.title);
+              if (tmdbMetadata.title)
+                titles.unshift({ title: tmdbMetadata.title });
               if (tmdbMetadata.titles) titles.push(...tmdbMetadata.titles);
               if (tmdbMetadata.year) year = tmdbMetadata.year;
               if (tmdbMetadata.yearEnd) yearEnd = tmdbMetadata.yearEnd;
@@ -194,7 +198,8 @@ export class MetadataService {
             // Process TVDB results
             if (tvdbResult.status === 'fulfilled' && tvdbResult.value) {
               const tvdbMetadata = tvdbResult.value;
-              if (tvdbMetadata.title) titles.unshift(tvdbMetadata.title);
+              if (tvdbMetadata.title)
+                titles.unshift({ title: tvdbMetadata.title });
               if (tvdbMetadata.titles) titles.push(...tvdbMetadata.titles);
               if (tvdbMetadata.year) year = tvdbMetadata.year;
               if (tvdbMetadata.yearEnd) yearEnd = tvdbMetadata.yearEnd;
@@ -252,7 +257,8 @@ export class MetadataService {
             // Process IMDb results
             if (imdbResult.status === 'fulfilled' && imdbResult.value) {
               const cinemetaData = imdbResult.value;
-              if (cinemetaData.name) titles.unshift(cinemetaData.name);
+              if (cinemetaData.name)
+                titles.unshift({ title: cinemetaData.name });
               if (cinemetaData.releaseInfo && !year) {
                 if (cinemetaData.releaseInfo) {
                   const parts = cinemetaData.releaseInfo
@@ -339,17 +345,33 @@ export class MetadataService {
             ) {
               const imdbSuggestionData = imdbSuggestionResult.value;
               if (imdbSuggestionData.title)
-                titles.unshift(imdbSuggestionData.title);
+                titles.unshift({ title: imdbSuggestionData.title });
               if (imdbSuggestionData.year && !year)
                 year = imdbSuggestionData.year;
               if (imdbSuggestionData.yearEnd && !yearEnd)
                 yearEnd = imdbSuggestionData.yearEnd;
             }
 
-            // Deduplicate titles, lowercase all before deduplication
-            const uniqueTitles = [
-              ...new Set(titles.map((title) => title.toLowerCase())),
-            ];
+            // Deduplicate titles by lowercase title string
+            const indexMap = new Map<string, number>();
+            const uniqueTitles: MetadataTitle[] = [];
+            for (const t of titles) {
+              const key = t.title.toLowerCase();
+              const existingIndex = indexMap.get(key);
+              if (existingIndex === undefined) {
+                indexMap.set(key, uniqueTitles.length);
+                uniqueTitles.push({ title: t.title, language: t.language });
+              } else {
+                const existing = uniqueTitles[existingIndex];
+                // Prefer a title entry that has a language over one without
+                if (!existing.language && t.language) {
+                  uniqueTitles[existingIndex] = {
+                    title: t.title,
+                    language: t.language,
+                  };
+                }
+              }
+            }
 
             if (
               !uniqueTitles.length ||
@@ -359,7 +381,7 @@ export class MetadataService {
             }
 
             const metadata = {
-              title: uniqueTitles[0],
+              title: uniqueTitles[0].title,
               titles: uniqueTitles,
               year,
               yearEnd,
@@ -378,6 +400,7 @@ export class MetadataService {
               `Found metadata for ${id.fullId} in ${getTimeTakenSincePoint(start)}`,
               {
                 ...metadata,
+                titles: metadata.titles.map((t) => t.title),
                 seasons: metadata.seasons?.map(
                   (s) => `{s:${s.season_number},e:${s.episode_count}}`
                 ),

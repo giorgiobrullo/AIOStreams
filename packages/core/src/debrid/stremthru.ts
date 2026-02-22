@@ -36,7 +36,6 @@ function convertStremThruError(error: StremThruError): DebridError {
 export interface StremThruServiceConfig {
   serviceName: ServiceId;
   clientIp?: string;
-  publicUrl?: string;
   stremthru: {
     baseUrl: string;
     store: string;
@@ -51,16 +50,26 @@ export interface StremThruServiceConfig {
     neverAutoRemove?: boolean;
     treatUnknownAsCached?: boolean;
   };
+  cacheAndPlayOptions?: {
+    pollingInterval?: number;
+    maxWaitTime?: number;
+    // maxPolls?: number;
+    // maxWaitTime?: number; // max wait time is inferred from pollingInterval * maxPolls,
+    // though a max wait time config is more user friendly. so we support maxWaitTime, infer maxPolls instead./
+  };
 }
 
 export class StremThruService
   implements TorrentDebridService, UsenetDebridService
 {
   private readonly stremthru: StremThru;
-  private readonly publicUrl?: string;
   readonly serviceName: ServiceId;
 
   readonly capabilities: { torrents: boolean; usenet: boolean };
+  private readonly cacheAndPlayOptions: {
+    pollingInterval: number;
+    maxWaitTime: number;
+  };
   private readonly usenetOptions: {
     alwaysCacheAndPlay: boolean;
     neverAutoRemove: boolean;
@@ -87,6 +96,10 @@ export class StremThruService
       neverAutoRemove: config.usenetOptions?.neverAutoRemove ?? false,
       treatUnknownAsCached: config.usenetOptions?.treatUnknownAsCached ?? false,
     };
+    this.cacheAndPlayOptions = {
+      pollingInterval: config.cacheAndPlayOptions?.pollingInterval ?? 5000,
+      maxWaitTime: config.cacheAndPlayOptions?.maxWaitTime ?? 120000,
+    };
     const timeouts = {
       add: 30000,
       global: 10000,
@@ -105,7 +118,6 @@ export class StremThruService
         addNewz: timeouts.add,
       },
     });
-    this.publicUrl = config.publicUrl;
   }
 
   //  Shared check cache helpers
@@ -531,7 +543,6 @@ export class StremThruService
         newResults = allItems.map((item) => ({
           id: -1,
           hash: item.hash,
-          // status: item.status == 'unknown' ? 'cached' : item.status,
           status:
             this.usenetOptions.treatUnknownAsCached && item.status === 'unknown'
               ? 'cached'
@@ -786,8 +797,14 @@ export class StremThruService
             effectiveAutoRemove
           ),
         {
-          timeout: effectiveCacheAndPlay ? 120000 : 30000,
-          ttl: effectiveCacheAndPlay ? 130000 : 40000,
+          timeout: effectiveCacheAndPlay
+            ? (this.config.cacheAndPlayOptions?.maxWaitTime ?? 120000)
+            : 30000,
+          ttl: effectiveCacheAndPlay
+            ? (this.config.cacheAndPlayOptions?.maxWaitTime ?? 120000) + 10000
+            : 40000,
+          // timeout: effectiveCacheAndPlay ? 120000 : 30000,
+          // ttl: effectiveCacheAndPlay ? 130000 : 40000,
         }
       );
       return result;
@@ -878,8 +895,12 @@ export class StremThruService
       if (!cacheAndPlay) {
         return undefined;
       }
-      for (let i = 0; i < 10; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 11000));
+      const pollingInterval = this.cacheAndPlayOptions.pollingInterval;
+      const maxPolls = Math.ceil(
+        this.cacheAndPlayOptions.maxWaitTime / pollingInterval
+      );
+      for (let i = 0; i < maxPolls; i++) {
+        await new Promise((resolve) => setTimeout(resolve, pollingInterval));
         const list = await this.listMagnets();
         const magnetDownloadInList = list.find(
           (magnet) => magnet.hash === hash
@@ -1084,9 +1105,14 @@ export class StremThruService
       if (!cacheAndPlay) {
         return undefined;
       }
-      // poll status when cacheAndPlay is true, max wait time is 110s
-      for (let i = 0; i < 10; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 11000));
+      const maxPolls = Math.floor(
+        this.cacheAndPlayOptions.maxWaitTime /
+          this.cacheAndPlayOptions.pollingInterval
+      );
+      for (let i = 0; i < maxPolls; i++) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, this.cacheAndPlayOptions.pollingInterval)
+        );
         try {
           const polledDownload = await this.getNzb(
             usenetDownload.id.toString()
@@ -1218,22 +1244,6 @@ export class StremThruService
       undefined,
       this.config.clientIp
     );
-
-    if (this.publicUrl) {
-      try {
-        const playbackUrl = new URL(playbackLink);
-        const publicUrl = new URL(this.publicUrl);
-        playbackUrl.host = publicUrl.host;
-        playbackUrl.protocol = publicUrl.protocol;
-        playbackLink = playbackUrl.toString();
-      } catch (error) {
-        logger.warn(`Failed to rewrite playback link with public URL`, {
-          error: (error as Error).message,
-          playbackLink,
-          publicUrl: this.publicUrl,
-        });
-      }
-    }
 
     await StremThruService.playbackLinkCache.set(
       cacheKey,

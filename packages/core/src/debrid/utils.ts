@@ -77,6 +77,7 @@ interface BaseFile {
   indexer?: string;
   seeders?: number;
   group?: string;
+  languages?: string[]; // languages extracted from indexer attributes (e.g. newznab/torznab)
   age?: number; // age in hours
   duration?: number; // duration in seconds
   library?: boolean; // whether the file is already in the user's library

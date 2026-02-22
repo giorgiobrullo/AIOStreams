@@ -2227,6 +2227,9 @@ export class AIOStreams {
     // Resolve service-wrapped P2P streams through debrid services.
     // This runs after the initial filter pass (which lets P2P streams through
     // when serviceWrap is enabled) so that the streams can be converted to debrid.
+    // Capture existing stream IDs before service wrapping so we can skip
+    // per-stream precomputation for streams already precomputed in the fetcher.
+    const preServiceWrapIds = new Set(processedStreams.map((s) => s.id));
     const resolvedResults = await resolveServiceWrappedStreams(
       processedStreams,
       context,
@@ -2246,8 +2249,18 @@ export class AIOStreams {
     processedStreams = await this.deduplicator.deduplicate(processedStreams);
 
     if (isMeta || resolvedResults.hasNewStreams) {
-      // Run preferred matching after filter
-      await this.precomputer.precomputePreferred(processedStreams, context);
+      // When service wrapping added new streams and we're not in meta mode,
+      // existing streams were already precomputed in the fetcher — skip
+      // per-stream regex/keyword ops for them.
+      const skipPerStreamIds =
+        !isMeta && resolvedResults.hasNewStreams
+          ? preServiceWrapIds
+          : undefined;
+      await this.precomputer.precomputePreferred(
+        processedStreams,
+        context,
+        skipPerStreamIds
+      );
     }
 
     let finalStreams = await this.filterer.applyStreamExpressionFilters(

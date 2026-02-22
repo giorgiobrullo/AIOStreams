@@ -1,6 +1,11 @@
+export interface MetadataTitle {
+  title: string;
+  language?: string; // ISO 639-1 language code, normalised from provider-specific formats
+}
+
 export interface Metadata {
   title: string;
-  titles?: string[];
+  titles?: MetadataTitle[];
   year?: number;
   yearEnd?: number;
   originalLanguage?: string;

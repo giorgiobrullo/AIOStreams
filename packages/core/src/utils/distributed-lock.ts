@@ -3,6 +3,7 @@ import { RedisClientType } from 'redis';
 import { TransactionQueue } from '../db/queue.js';
 import { Cache, Env, REDIS_PREFIX } from './index.js';
 import { createLogger } from './logger.js';
+import { Time } from './time.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -116,7 +117,7 @@ export class DistributedLock {
     fn: () => Promise<T>,
     options: LockOptions
   ): Promise<LockResult<T>> {
-    const { timeout = 30000, ttl = 60000 } = options;
+    const { timeout = 30 * Time.Second, ttl = Time.Minute } = options;
     const owner = Math.random().toString(36).substring(2);
     const redisKey = `${lockPrefix}${key}`;
     const doneChannel = `${redisKey}:done`;
@@ -210,7 +211,7 @@ export class DistributedLock {
     fn: () => Promise<T>,
     options: LockOptions
   ): Promise<LockResult<T>> {
-    const { timeout = 30000, ttl = 60000 } = options;
+    const { timeout = 30 * Time.Second, ttl = Time.Minute } = options;
     const owner = Math.random().toString(36).substring(2);
 
     // Clean up expired locks
@@ -322,7 +323,11 @@ export class DistributedLock {
     fn: () => Promise<T>,
     options: LockOptions
   ): Promise<LockResult<T>> {
-    const { timeout = 30000, ttl = 300000, lockDir } = options;
+    const {
+      timeout = 30 * Time.Second,
+      ttl = 5 * Time.Minute,
+      lockDir,
+    } = options;
 
     if (!lockDir) {
       throw new Error('lockDir is required for file-based locks');
@@ -446,7 +451,7 @@ export class DistributedLock {
     options: LockOptions
   ): Promise<LockResult<T>> {
     const db = DB.getInstance();
-    const { timeout = 30000, ttl = 60000 } = options;
+    const { timeout = 30 * Time.Second, ttl = Time.Minute } = options;
     const { retryInterval = db.isSQLite() ? 250 : 100 } = options;
     const owner = Math.random().toString(36).substring(2);
     const expiresAt = Date.now() + ttl;

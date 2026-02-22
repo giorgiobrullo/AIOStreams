@@ -1651,6 +1651,23 @@ function Content() {
                       }));
                     }}
                   />
+                  <Switch
+                    label="Use Initial Air Date"
+                    side="right"
+                    help="For series/anime, compare against only the initial air year instead of the full year range."
+                    moreHelp="Helps filter out same-title-different-show results (e.g. 'One Piece 2023' live-action vs 'One Piece 1999' anime). May also filter torrents that include a season air year in their name."
+                    disabled={!userData.yearMatching?.enabled}
+                    value={userData.yearMatching?.useInitialAirDate ?? false}
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        yearMatching: {
+                          ...prev.yearMatching,
+                          useInitialAirDate: value,
+                        },
+                      }));
+                    }}
+                  />
                   <NumberInput
                     label="Year Tolerance"
                     disabled={!userData.yearMatching?.enabled}
@@ -2886,6 +2903,24 @@ function Content() {
               <HeadingWithPageControls heading="Result Limits" />
               <SettingsCard description="Apply limits to specific kinds of results">
                 <div className="space-y-4">
+                  <Select
+                    label="Limit Mode"
+                    help="Independent: each category limit is checked separately. Conjunctive: category limits are combined into a composite key (e.g. 3 per resolution per addon)."
+                    value={userData.resultLimits?.mode ?? 'independent'}
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        resultLimits: {
+                          ...prev.resultLimits,
+                          mode: value as 'independent' | 'conjunctive',
+                        },
+                      }));
+                    }}
+                    options={[
+                      { label: 'Independent', value: 'independent' },
+                      { label: 'Conjunctive', value: 'conjunctive' },
+                    ]}
+                  />
                   <NumberInput
                     help="Global limit for all results"
                     label="Global Limit"

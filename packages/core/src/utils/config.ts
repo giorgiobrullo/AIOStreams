@@ -797,6 +797,26 @@ export function applyMigrations(config: any): UserData {
     }
   }
 
+  // migrate forceToTop at addon level to pinPosition set to 'top'
+  if (config.presets && Array.isArray(config.presets)) {
+    config.presets = config.presets.map((preset: any) => {
+      if (
+        preset.options?.forceToTop === true &&
+        preset.options.pinPosition === undefined
+      ) {
+        delete preset.options.forceToTop;
+        return {
+          ...preset,
+          options: {
+            ...preset.options,
+            pinPosition: 'top',
+          },
+        };
+      }
+      return preset;
+    });
+  }
+
   return config;
 }
 

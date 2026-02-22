@@ -11,6 +11,7 @@ import {
   BaseNabAddon,
   NabAddonConfigSchema,
   NabAddonConfig,
+  parseNabLanguages,
 } from '../base/nab/addon.js';
 
 const logger = createLogger('torznab');
@@ -59,6 +60,8 @@ export class TorznabAddon extends BaseNabAddon<NabAddonConfig, TorznabApi> {
       if (seenTorrents.has(infoHash ?? downloadUrl!)) continue;
       seenTorrents.add(infoHash ?? downloadUrl!);
 
+      const languages = parseNabLanguages(result.torznab?.language);
+
       torrents.push({
         confirmed: meta.searchType === 'id',
         hash: infoHash,
@@ -77,6 +80,7 @@ export class TorznabAddon extends BaseNabAddon<NabAddonConfig, TorznabApi> {
           result.size ??
           (result.torznab?.size ? Number(result.torznab.size) : 0),
         type: 'torrent',
+        ...(languages.length > 0 && { languages }),
       });
     }
 

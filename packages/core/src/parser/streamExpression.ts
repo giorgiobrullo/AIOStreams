@@ -17,6 +17,7 @@ const logger = createLogger('stream-expression');
 
 export abstract class StreamExpressionEngine {
   protected parser: Parser;
+  protected _pinInstructions: Map<string, 'top' | 'bottom'> = new Map();
 
   constructor() {
     // only allow comparison and logical operators
@@ -96,6 +97,10 @@ export abstract class StreamExpressionEngine {
     this.parser.consts.latestSeason = context.latestSeason ?? -1;
     this.parser.consts.ongoingSeason =
       context.hasNextEpisode && context.season === context.latestSeason;
+  }
+
+  public getPinInstructions(): Map<string, 'top' | 'bottom'> {
+    return this._pinInstructions;
   }
 
   private setupParserFunctions() {
@@ -1148,6 +1153,29 @@ export abstract class StreamExpressionEngine {
         throw new Error('Your streams input must be an array of streams');
       }
       return streams.slice(start, end);
+    };
+
+    this.parser.functions.pin = (
+      matchedStreams: ParsedStream[],
+      position: string = 'top'
+    ) => {
+      if (
+        !Array.isArray(matchedStreams) ||
+        matchedStreams.some((stream) => !stream.type)
+      ) {
+        throw new Error(
+          'The first argument must be a filtered subset of streams to pin'
+        );
+      }
+      if (position !== 'top' && position !== 'bottom') {
+        throw new Error("Position must be 'top' or 'bottom'");
+      }
+
+      for (const stream of matchedStreams) {
+        this._pinInstructions.set(stream.id, position as 'top' | 'bottom');
+      }
+
+      return [];
     };
   }
 

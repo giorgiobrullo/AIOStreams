@@ -1,16 +1,8 @@
-import {
-  createLogger,
-  maskSensitiveInfo,
-  formatDurationAsText,
-} from './logger.js';
+import { createLogger, maskSensitiveInfo } from './logger.js';
+import { formatDurationAsText, formatMilliseconds } from './time.js';
 import { Env } from './env.js';
 
 const logger = createLogger('startup');
-
-const formatMilliseconds = (ms: number): string => {
-  if (ms < 1000) return `${ms}ms`;
-  return formatDurationAsText(ms / 1000);
-};
 
 const parseBlockedItems = (
   envVar: string | undefined
