@@ -57,7 +57,7 @@ export const PARSE_REGEX: PARSE_REGEX = {
     '576p': createRegex('(bd|hd|m)?((576|534)(p|i)?)'),
     '480p': createRegex('(bd|hd|m)?(480(p|i)?)|sd'),
     '360p': createRegex('(bd|hd|m)?(360(p|i)?)'),
-    '240p': createRegex('(bd|hd|m)?((240|266)(p|i)?)'),
+    '240p': createRegex('(bd|hd|m)?(240(p|i)?)'),
     '144p': createRegex('(bd|hd|m)?(144(p|i)?)'),
   },
   qualities: {
