@@ -2047,15 +2047,6 @@ class StreamFilterer {
       logger.info(
         `${includedWithPassthrough.length} included streams have passthrough flags and will go through filtering`
       );
-
-      for (const stream of includedWithPassthrough) {
-        const stages = Array.isArray(stream.passthrough)
-          ? stream.passthrough.join(', ')
-          : 'all';
-        logger.debug(
-          `Stream "${stream.filename || stream.id}" passthrough stages: [${stages}]`
-        );
-      }
     }
 
     // Only exclude streams without passthrough from filtering
@@ -2135,16 +2126,6 @@ class StreamFilterer {
     // Collect pin instructions from all selectors
     const pinInstructions = new Map<string, 'top' | 'bottom'>();
 
-    // Get streams that passthrough excluded SEL
-    const excludedPassthroughStreams = streams
-      .filter((stream) => shouldPassthroughStage(stream, 'excluded'))
-      .map((stream) => stream.id);
-
-    // Get streams that passthrough required SEL
-    const requiredPassthroughStreams = streams
-      .filter((stream) => shouldPassthroughStage(stream, 'required'))
-      .map((stream) => stream.id);
-
     if (
       this.userData.excludedStreamExpressions &&
       this.userData.excludedStreamExpressions.length > 0
@@ -2164,23 +2145,28 @@ class StreamFilterer {
           );
 
           // Track these stream objects for removal (except passthrough streams)
-          selectedStreams.forEach(
-            (stream) =>
-              !excludedPassthroughStreams.includes(stream.id) &&
-              streamsToRemove.add(stream.id)
-          );
+          let newlyRemoved = 0;
+          selectedStreams.forEach((stream) => {
+            if (
+              !shouldPassthroughStage(stream, 'excluded') &&
+              !streamsToRemove.has(stream.id)
+            ) {
+              streamsToRemove.add(stream.id);
+              newlyRemoved++;
+            }
+          });
 
           // Update skip reasons for this condition (only count newly selected streams)
-          if (selectedStreams.length > 0) {
+          if (newlyRemoved > 0) {
             this.filterStatistics.removed.excludedFilterCondition.total +=
-              selectedStreams.length;
+              newlyRemoved;
             const displayCondition = this.getDisplayCondition(expression);
             this.filterStatistics.removed.excludedFilterCondition.details[
               displayCondition
             ] =
               (this.filterStatistics.removed.excludedFilterCondition.details[
                 displayCondition
-              ] || 0) + selectedStreams.length;
+              ] || 0) + newlyRemoved;
           }
         } catch (error) {
           logger.error(
@@ -2208,8 +2194,8 @@ class StreamFilterer {
       this.userData.requiredStreamExpressions.length > 0
     ) {
       const selector = new StreamSelector(expressionContext);
-      const streamsToKeep = new Set<string>(); // Track actual stream objects to be removed
-      requiredPassthroughStreams.forEach((stream) => streamsToKeep.add(stream));
+      selector.mode = 'required'; // Make pin return matched streams for required SEL
+      const streamsToKeep = new Set<string>(); // Track actual stream objects to be kept
 
       for (const item of this.userData.requiredStreamExpressions) {
         const { expression, enabled } =
@@ -2217,24 +2203,34 @@ class StreamFilterer {
         if (!enabled) continue;
         try {
           const selectedStreams = await selector.select(
-            streams.filter((stream) => !streamsToKeep.has(stream.id)),
+            streams.filter(
+              (stream) =>
+                !streamsToKeep.has(stream.id) ||
+                shouldPassthroughStage(stream, 'required')
+            ),
             expression
           );
 
           // Track these stream objects to keep
-          selectedStreams.forEach((stream) => streamsToKeep.add(stream.id));
+          let newlyKept = 0;
+          selectedStreams.forEach((stream) => {
+            if (!streamsToKeep.has(stream.id)) {
+              streamsToKeep.add(stream.id);
+              newlyKept++;
+            }
+          });
 
           // Update skip reasons for this condition (only count newly selected streams)
-          if (selectedStreams.length > 0) {
+          if (newlyKept > 0) {
             this.filterStatistics.removed.requiredFilterCondition.total +=
-              selectedStreams.length;
+              newlyKept;
             const displayCondition = this.getDisplayCondition(expression);
             this.filterStatistics.removed.requiredFilterCondition.details[
               displayCondition
             ] =
               (this.filterStatistics.removed.requiredFilterCondition.details[
                 displayCondition
-              ] || 0) + selectedStreams.length;
+              ] || 0) + newlyKept;
           }
         } catch (error) {
           logger.error(
@@ -2244,8 +2240,19 @@ class StreamFilterer {
         }
       }
 
+      let passthroughCount = 0;
+      streams.forEach((stream) => {
+        if (
+          shouldPassthroughStage(stream, 'required') &&
+          !streamsToKeep.has(stream.id)
+        ) {
+          streamsToKeep.add(stream.id);
+          passthroughCount++;
+        }
+      });
+
       logger.verbose(
-        `Total streams selected by required conditions: ${streamsToKeep.size} (including ${requiredPassthroughStreams.length} passthrough streams)`
+        `Total streams selected by required conditions: ${streamsToKeep.size} (including ${passthroughCount} passthrough streams)`
       );
       // remove all streams that are not in the streamsToKeep set
       streams = streams.filter((stream) => streamsToKeep.has(stream.id));
