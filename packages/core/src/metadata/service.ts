@@ -227,11 +227,20 @@ export class MetadataService {
                   accessToken: this.config.tmdbAccessToken,
                   apiKey: this.config.tmdbApiKey,
                 });
+                let seasonNumber = Number(id.season);
+                let episodeNumber = Number(id.episode);
+                if (animeEntry) {
+                  seasonNumber = animeEntry.tmdb?.seasonNumber ?? seasonNumber;
+                  if (animeEntry.tmdb?.fromEpisode) {
+                    episodeNumber =
+                      Number(animeEntry.tmdb.fromEpisode) + episodeNumber - 1;
+                  }
+                }
                 if (tmdbId && seasons) {
                   const tmdbNextAirDate = await tmdb.getNextEpisodeAirDate(
                     Number(tmdbId),
-                    Number(id.season),
-                    Number(id.episode),
+                    seasonNumber,
+                    episodeNumber,
                     seasons
                   );
                   if (tmdbNextAirDate && this.isDateInFuture(tmdbNextAirDate)) {
