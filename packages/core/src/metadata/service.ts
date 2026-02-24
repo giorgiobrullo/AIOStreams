@@ -175,7 +175,16 @@ export class MetadataService {
               const tmdbMetadata = tmdbResult.value;
               if (tmdbMetadata.title)
                 titles.unshift({ title: tmdbMetadata.title });
-              if (tmdbMetadata.titles) titles.push(...tmdbMetadata.titles);
+              // Mark TMDB titles as trusted so their language tags are preserved
+              // during deduplication even when lower-quality sources (TVDB, Trakt,
+              // IMDb) return the same title without a language tag.
+              if (tmdbMetadata.titles)
+                titles.push(
+                  ...tmdbMetadata.titles.map((t) => ({
+                    ...t,
+                    trusted: true as const,
+                  }))
+                );
               if (tmdbMetadata.year) year = tmdbMetadata.year;
               if (tmdbMetadata.yearEnd) yearEnd = tmdbMetadata.yearEnd;
               if (tmdbMetadata.originalLanguage)

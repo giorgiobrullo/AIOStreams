@@ -13,7 +13,10 @@ import {
   SearchResponse,
   SearchResultItem,
 } from './api.js';
-import { createQueryLimit, useAllTitles } from '../../utils/general.js';
+import {
+  createQueryLimit,
+  getTitleLanguagesForUrl,
+} from '../../utils/general.js';
 import { LANGUAGES } from '../../../utils/constants.js';
 
 /**
@@ -165,7 +168,7 @@ export abstract class BaseNabAddon<
         )
           ? false
           : !queryParams.season && !queryParams.ep,
-        useAllTitles: useAllTitles(this.userData.url),
+        titleLanguages: getTitleLanguagesForUrl(this.userData.url),
       });
       searchType = 'query';
     }
