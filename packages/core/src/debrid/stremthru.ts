@@ -922,6 +922,18 @@ export class StremThruService
             magnetDownload = magnetDownloadInList;
             break;
           }
+          if (['failed', 'invalid'].includes(magnetDownloadInList.status)) {
+            throw new DebridError(
+              `Magnet download ${magnetDownloadInList.status}`,
+              {
+                statusCode: 400,
+                statusText: `Magnet download ${magnetDownloadInList.status}`,
+                code: 'UNKNOWN',
+                headers: {},
+                body: magnetDownloadInList,
+              }
+            );
+          }
         }
       }
       if (magnetDownload.status !== 'downloaded') {
@@ -1119,22 +1131,22 @@ export class StremThruService
         await new Promise((resolve) =>
           setTimeout(resolve, this.cacheAndPlayOptions.pollingInterval)
         );
-        try {
-          const polledDownload = await this.getNzb(
-            usenetDownload.id.toString()
-          );
-          logger.debug(`Polled status for ${nzb || hash}`, {
-            attempt: i + 1,
-            status: polledDownload.status,
-          });
-          if (polledDownload.status === 'downloaded') {
-            usenetDownload = polledDownload;
-            break;
-          }
-        } catch (error) {
-          logger.warn(`Failed to poll status for ${nzb || hash}`, {
-            attempt: i + 1,
-            error: (error as Error).message,
+        const polledDownload = await this.getNzb(usenetDownload.id.toString());
+        logger.debug(`Polled status for ${nzb || hash}`, {
+          attempt: i + 1,
+          status: polledDownload.status,
+        });
+        if (polledDownload.status === 'downloaded') {
+          usenetDownload = polledDownload;
+          break;
+        }
+        if (['failed', 'invalid'].includes(polledDownload.status)) {
+          throw new DebridError(`Usenet download ${polledDownload.status}`, {
+            statusCode: 400,
+            statusText: `Usenet download ${polledDownload.status}`,
+            code: 'UNKNOWN',
+            headers: {},
+            body: polledDownload,
           });
         }
       }
