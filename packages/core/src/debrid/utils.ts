@@ -706,6 +706,17 @@ export function isNotVideoFile(file: DebridFile): boolean {
     '.db',
     '.dbf',
     '.bak',
+    '.par2',
+    '.clpi',
+    '.jar',
+    '.mpls',
+    '.otf',
+    '.properties',
+    '.bdjo',
+    '.bdmv',
+    '.crt',
+    '.crl',
+    '.sig',
   ];
   const patterns = [/\.7z\.\d+$/];
   return (
