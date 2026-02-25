@@ -1154,6 +1154,7 @@ function AddonModal({
   if (configMode === 'noob') {
     dynamicOptions = dynamicOptions.filter((opt: any) => {
       if (opt?.showInSimpleMode === false) return false;
+      if (opt?.advanced === true) return false;
       return true;
     });
   }

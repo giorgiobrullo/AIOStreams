@@ -15,7 +15,7 @@ import {
 import { TextInput } from '../ui/text-input';
 import { Textarea } from '../ui/textarea';
 import * as constants from '../../../../core/src/utils/constants';
-import { StatusResponse, Template } from '@aiostreams/core';
+import { StatusResponse, Template, Option } from '@aiostreams/core';
 import MarkdownLite from './markdown-lite';
 import { BiImport } from 'react-icons/bi';
 import {
@@ -29,6 +29,10 @@ import { Tooltip } from '../ui/tooltip';
 import { cn } from '../ui/core/styling';
 import { useMenu } from '@/context/menu';
 import { APIError, fetchTemplates } from '@/lib/api';
+import { Switch } from '../ui/switch';
+import { useMode } from '@/context/mode';
+import TemplateOption from './template-option';
+import { ModeSwitch } from '../ui/mode-switch/mode-switch';
 
 const formatZodError = (error: ZodError) => {
   console.log(JSON.stringify(error, null, 2));
@@ -59,6 +63,7 @@ const TemplateSchema = z.object({
     serviceRequired: z.boolean().optional(), // whether a service is required for this template or not.
     setToSaveInstallMenu: z.boolean().optional().default(true), // whether to set the menu to save-install after importing the template
     sourceUrl: z.url().optional(), // URL from which the template was imported (for auto-updates)
+    inputs: z.array(z.any()).optional(), // template-creator-defined options
   }),
   config: z.any(),
 });
@@ -92,6 +97,10 @@ export interface ConfigTemplatesModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   openImportModal?: boolean;
+  /** If set, the modal will automatically fetch and process this URL when it opens. */
+  deepLinkUrl?: string;
+  /** If set alongside deepLinkUrl, auto-selects the template with this ID from the fetched list. */
+  deepLinkTemplateId?: string;
 }
 
 const TEMPLATE_CACHE = new Map<string, Template[]>();
@@ -100,6 +109,8 @@ export function ConfigTemplatesModal({
   open,
   onOpenChange,
   openImportModal = false,
+  deepLinkUrl,
+  deepLinkTemplateId,
 }: ConfigTemplatesModalProps) {
   const { setUserData, userData } = useUserData();
   const { status } = useStatus();
@@ -124,14 +135,27 @@ export function ConfigTemplatesModal({
     null
   );
 
+  const { mode, setMode } = useMode();
+
   // Template loading state
   const [processedTemplate, setProcessedTemplate] =
     useState<ProcessedTemplate | null>(null);
   const [currentStep, setCurrentStep] = useState<
-    'browse' | 'selectService' | 'inputs'
+    'browse' | 'templateInputs' | 'selectService' | 'inputs'
   >('browse');
   const [selectedServices, setSelectedServices] = useState<string[]>([]);
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
+  const [pendingTemplate, setPendingTemplate] = useState<Template | null>(null);
+  const [templateInputOptions, setTemplateInputOptions] = useState<Option[]>(
+    []
+  );
+  const [templateInputValues, setTemplateInputValues] = useState<
+    Record<string, any>
+  >({});
+  const [selectedPendingTemplateIndex, setSelectedPendingTemplateIndex] =
+    useState<number | null>(null);
+  const deepLinkFetchedRef = React.useRef<string | null>(null);
+  const [showDeepLinkWarning, setShowDeepLinkWarning] = useState(false);
 
   // Fetch templates from API when modal opens
   useEffect(() => {
@@ -152,6 +176,41 @@ export function ConfigTemplatesModal({
       }
     }
   }, [open]);
+
+  // Auto-fetch template from deep-link URL when the modal first opens
+  useEffect(() => {
+    if (open && deepLinkUrl && deepLinkFetchedRef.current !== deepLinkUrl) {
+      deepLinkFetchedRef.current = deepLinkUrl;
+      setShowDeepLinkWarning(true);
+      const doFetch = async () => {
+        setIsImporting(true);
+        try {
+          const response = await fetch(deepLinkUrl);
+          if (!response.ok)
+            throw new Error(`HTTP error! status: ${response.status}`);
+          const data = await response.json();
+          processImportedTemplate(data, deepLinkUrl);
+        } catch (error) {
+          toast.error(
+            'Failed to load template from link: ' + (error as Error).message
+          );
+        } finally {
+          setIsImporting(false);
+        }
+      };
+      doFetch();
+    }
+  }, [open, deepLinkUrl]);
+
+  // Auto-select a template by ID once the confirm list is populated
+  useEffect(() => {
+    if (deepLinkTemplateId && pendingImportTemplates.length > 0) {
+      const idx = pendingImportTemplates.findIndex(
+        (t) => t.metadata.id === deepLinkTemplateId
+      );
+      if (idx !== -1) setSelectedPendingTemplateIndex(idx);
+    }
+  }, [pendingImportTemplates, deepLinkTemplateId]);
 
   // Load templates from localStorage
   const getLocalStorageTemplates = (): Template[] => {
@@ -184,6 +243,32 @@ export function ConfigTemplatesModal({
       console.error('Error saving templates to localStorage:', error);
       toast.error('Failed to save templates to local storage');
     }
+  };
+
+  // localStorage helpers for remembering template input values
+  const getLocalStorageTemplateInputs = (
+    templateId: string
+  ): Record<string, any> => {
+    try {
+      const stored = localStorage.getItem('aiostreams-template-inputs');
+      if (stored) {
+        const all = JSON.parse(stored);
+        return all[templateId] ?? {};
+      }
+    } catch {}
+    return {};
+  };
+
+  const saveLocalStorageTemplateInputs = (
+    templateId: string,
+    values: Record<string, any>
+  ) => {
+    try {
+      const stored = localStorage.getItem('aiostreams-template-inputs');
+      const all = stored ? JSON.parse(stored) : {};
+      all[templateId] = values;
+      localStorage.setItem('aiostreams-template-inputs', JSON.stringify(all));
+    } catch {}
   };
 
   // Compare semver versions
@@ -484,6 +569,116 @@ export function ConfigTemplatesModal({
       }
     }
 
+    // Validate template dynamic expressions (__if, __switch, {{...}})
+    const declaredInputIds = new Set(
+      ((template.metadata as any).inputs ?? []).map((i: any) => i.id as string)
+    );
+
+    const validateExpressions = (node: any, path: string) => {
+      if (!node || typeof node !== 'object') {
+        // Check string interpolation tokens
+        if (typeof node === 'string') {
+          const tokens = [
+            ...node.matchAll(/\{\{(inputs|services)\.([^}]+)\}\}/g),
+          ];
+          for (const [, ns, key] of tokens) {
+            if (ns === 'inputs') {
+              const topKey = key.split('.')[0];
+              if (!declaredInputIds.has(topKey)) {
+                warnings.push(
+                  `${path}: interpolation {{inputs.${key}}} references undeclared input "${topKey}"`
+                );
+              }
+            }
+          }
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        node.forEach((item, i) => validateExpressions(item, `${path}[${i}]`));
+        return;
+      }
+      if ('__if' in node) {
+        const condition: string = node.__if;
+        if (typeof condition !== 'string' || !condition.trim()) {
+          errors.push(`${path}.__if: condition must be a non-empty string`);
+        } else {
+          // Extract the variable reference (strip negation and operator)
+          const bare = condition.trim().replace(/^!/, '').split(/\s+/)[0];
+          const dotIdx = bare.indexOf('.');
+          if (dotIdx === -1) {
+            errors.push(
+              `${path}.__if: "${condition}" is not a valid condition - expected "inputs.<id>" or "services.<id>"`
+            );
+          } else {
+            const ns = bare.slice(0, dotIdx);
+            const key = bare.slice(dotIdx + 1);
+            const topKey = key.split('.')[0];
+            if (ns !== 'inputs' && ns !== 'services') {
+              errors.push(
+                `${path}.__if: unknown namespace "${ns}" - must be "inputs" or "services"`
+              );
+            } else if (ns === 'inputs' && !declaredInputIds.has(topKey)) {
+              warnings.push(
+                `${path}.__if: references undeclared input "${topKey}"`
+              );
+            }
+          }
+        }
+        // Continue validating rest of object
+        const { __if: _if, ...rest } = node;
+        validateExpressions(rest, path);
+        return;
+      }
+      // __switch
+      if ('__switch' in node) {
+        const ref: string = node.__switch;
+        if (typeof ref !== 'string' || !ref.trim()) {
+          errors.push(`${path}.__switch: value must be a non-empty string`);
+        } else {
+          const dotIdx = ref.indexOf('.');
+          if (dotIdx === -1) {
+            errors.push(
+              `${path}.__switch: "${ref}" is not a valid reference - expected "inputs.<id>" or "services.<id>"`
+            );
+          } else {
+            const ns = ref.slice(0, dotIdx);
+            const key = ref.slice(dotIdx + 1);
+            const topKey = key.split('.')[0];
+            if (ns !== 'inputs' && ns !== 'services') {
+              errors.push(
+                `${path}.__switch: unknown namespace "${ns}" - must be "inputs" or "services"`
+              );
+            } else if (ns === 'inputs' && !declaredInputIds.has(topKey)) {
+              warnings.push(
+                `${path}.__switch: references undeclared input "${topKey}"`
+              );
+            }
+          }
+        }
+        if (node.cases && typeof node.cases === 'object') {
+          for (const [caseKey, caseVal] of Object.entries(node.cases)) {
+            validateExpressions(caseVal, `${path}.__switch.cases.${caseKey}`);
+          }
+        } else if (!('cases' in node)) {
+          warnings.push(
+            `${path}.__switch: missing "cases" object - switch will always resolve to default`
+          );
+        }
+        if ('default' in node) {
+          validateExpressions(node.default, `${path}.__switch.default`);
+        }
+        return;
+      }
+      for (const [k, v] of Object.entries(node)) {
+        validateExpressions(v, `${path}.${k}`);
+      }
+    };
+
+    if (template.config) {
+      validateExpressions(template.config, 'config');
+    }
+
     const isValid = errors.length === 0;
     return { isValid, warnings, errors };
   };
@@ -575,6 +770,7 @@ export function ConfigTemplatesModal({
             source: 'external',
             setToSaveInstallMenu: true,
             sourceUrl: sourceUrl, // Store the source URL if provided
+            inputs: item.metadata?.inputs, // preserve template inputs
           },
           config: item.config || item,
         };
@@ -665,7 +861,10 @@ export function ConfigTemplatesModal({
     input.click();
   };
 
-  const handleConfirmImport = (loadImmediately = false) => {
+  const handleConfirmImport = (
+    loadImmediately = false,
+    selectedIndex?: number
+  ) => {
     // Save to localStorage, overwriting templates with the same ID
     const localTemplates = getLocalStorageTemplates();
 
@@ -705,20 +904,30 @@ export function ConfigTemplatesModal({
       );
     }
 
-    // If user wants to load immediately (single template only)
-    if (loadImmediately && pendingImportTemplates.length === 1) {
+    // If user wants to load immediately
+    if (
+      loadImmediately &&
+      (pendingImportTemplates.length === 1 || selectedIndex !== undefined)
+    ) {
+      const idx = selectedIndex ?? 0;
       setShowImportConfirmModal(false);
-      handleLoadTemplate(pendingImportTemplates[0]);
+      handleLoadTemplate(pendingImportTemplates[idx]);
       setPendingImportTemplates([]);
+      setSelectedPendingTemplateIndex(null);
+      setShowDeepLinkWarning(false);
     } else {
       setShowImportConfirmModal(false);
       setPendingImportTemplates([]);
+      setSelectedPendingTemplateIndex(null);
+      setShowDeepLinkWarning(false);
     }
   };
 
   const handleCancelImport = () => {
     setShowImportConfirmModal(false);
     setPendingImportTemplates([]);
+    setSelectedPendingTemplateIndex(null);
+    setShowDeepLinkWarning(false);
   };
 
   const handleDeleteTemplate = (templateId: string) => {
@@ -996,6 +1205,205 @@ export function ConfigTemplatesModal({
     return serviceInputs;
   };
 
+  // Resolve a dot-separated key path (e.g. "subsectionId.subOptionId") against an object.
+  // Used so that subsection inputs can be referenced as inputs.<subsectionId>.<subOptionId>.
+  const getNestedInputValue = (
+    inputVals: Record<string, any>,
+    key: string
+  ): any => {
+    const parts = key.split('.');
+    let current: any = inputVals;
+    for (const part of parts) {
+      if (current === undefined || current === null) return undefined;
+      current = current[part];
+    }
+    return current;
+  };
+
+  // Evaluate a condition string like "inputs.debridio" or "!services.realdebrid"
+  const evaluateTemplateCondition = (
+    condition: string,
+    inputVals: Record<string, any>,
+    selectedSvcs: string[]
+  ): boolean => {
+    const trimmed = condition.trim();
+    const negated = trimmed.startsWith('!');
+    const expr = negated ? trimmed.slice(1).trim() : trimmed;
+
+    // Operator form: "inputs.<key> <op> <value>"  (op: ==, !=, includes)
+    const opMatch = expr.match(/^(\w+)\.(.+?)\s+(==|!=|includes)\s+(.+)$/);
+    if (opMatch) {
+      const [, ns, key, op, rawValue] = opMatch;
+      const rhs = rawValue.trim();
+      let result = false;
+      if (ns === 'inputs') {
+        const lhs = getNestedInputValue(inputVals, key);
+        if (op === '==') {
+          result = String(lhs ?? '') === rhs;
+        } else if (op === '!=') {
+          result = String(lhs ?? '') !== rhs;
+        } else if (op === 'includes') {
+          if (Array.isArray(lhs)) {
+            result = lhs.includes(rhs);
+          } else if (typeof lhs === 'string') {
+            result = lhs.includes(rhs);
+          }
+        }
+      }
+      // services.* doesn't support operators - fall through to falsy
+      return negated ? !result : result;
+    }
+
+    // Bare truthiness form: "inputs.<key>" or "services.<key>"
+    const dotIdx = expr.indexOf('.');
+    if (dotIdx === -1) return negated;
+    const ns = expr.slice(0, dotIdx);
+    const key = expr.slice(dotIdx + 1);
+    let result = false;
+    if (ns === 'inputs') {
+      const val = getNestedInputValue(inputVals, key);
+      result =
+        val !== undefined &&
+        val !== null &&
+        val !== '' &&
+        val !== false &&
+        !(Array.isArray(val) && val.length === 0);
+    } else if (ns === 'services') {
+      result = selectedSvcs.includes(key);
+    }
+    return negated ? !result : result;
+  };
+
+  // Resolve a "inputs.<id>" or "services.<id>" reference to its runtime value.
+  const resolveRef = (
+    ref: string,
+    inputVals: Record<string, any>,
+    selectedSvcs: string[]
+  ): any => {
+    const trimmed = ref.trim();
+    if (trimmed.startsWith('inputs.')) {
+      return getNestedInputValue(inputVals, trimmed.slice('inputs.'.length));
+    }
+    if (trimmed.startsWith('services.')) {
+      return selectedSvcs.includes(trimmed.slice('services.'.length));
+    }
+    return undefined;
+  };
+
+  // Recursively walk config, process __if, __switch, and {{}} interpolation
+  const applyTemplateConditionals = (
+    value: any,
+    inputVals: Record<string, any>,
+    selectedSvcs: string[]
+  ): any => {
+    if (Array.isArray(value)) {
+      return value
+        .filter((item) => {
+          if (item && typeof item === 'object' && '__if' in item) {
+            return evaluateTemplateCondition(
+              item.__if,
+              inputVals,
+              selectedSvcs
+            );
+          }
+          return true;
+        })
+        .flatMap((item) => {
+          if (item && typeof item === 'object' && '__if' in item) {
+            const { __if: _if, ...rest } = item;
+            return applyTemplateConditionals(rest, inputVals, selectedSvcs);
+          }
+          const resolved = applyTemplateConditionals(
+            item,
+            inputVals,
+            selectedSvcs
+          );
+          // If a string item (e.g. "{{inputs.languages}}") resolved to an array, spread it
+          return Array.isArray(resolved) ? resolved : [resolved];
+        });
+    }
+    if (value && typeof value === 'object') {
+      // __switch: replace the whole object with the matching case value
+      if ('__switch' in value) {
+        const switchRef: string = value.__switch;
+        const cases: Record<string, any> = value.cases ?? {};
+        const defaultVal: any = value.default ?? null;
+        const resolved = resolveRef(switchRef, inputVals, selectedSvcs);
+        const key =
+          resolved !== undefined && resolved !== null ? String(resolved) : null;
+        const chosen = key !== null && key in cases ? cases[key] : defaultVal;
+        return applyTemplateConditionals(chosen, inputVals, selectedSvcs);
+      }
+      const result: Record<string, any> = {};
+      for (const [k, v] of Object.entries(value)) {
+        result[k] = applyTemplateConditionals(v, inputVals, selectedSvcs);
+      }
+      return result;
+    }
+    // String interpolation: replace {{inputs.<id>}} and {{services.<id>}}.
+    // If the entire string is a single {{...}} token, return the raw value
+    // (preserving arrays, numbers, booleans) instead of stringifying.
+    if (typeof value === 'string') {
+      const singleToken = value.match(/^\{\{(inputs|services)\.([^}]+)\}\}$/);
+      if (singleToken) {
+        const [, ns, key] = singleToken;
+        if (ns === 'inputs') {
+          const v = getNestedInputValue(inputVals, key);
+          return v !== undefined && v !== null ? v : '';
+        }
+        if (ns === 'services') {
+          return selectedSvcs.includes(key);
+        }
+      }
+      return value.replace(
+        /\{\{(inputs|services)\.([^}]+)\}\}/g,
+        (_, ns, key) => {
+          if (ns === 'inputs') {
+            const v = getNestedInputValue(inputVals, key);
+            return v !== undefined && v !== null ? String(v) : '';
+          }
+          if (ns === 'services') {
+            return String(selectedSvcs.includes(key));
+          }
+          return '';
+        }
+      );
+    }
+    return value;
+  };
+
+  // Shared logic: process a (possibly conditionals-applied) template and navigate
+  const proceedWithTemplate = (template: Template) => {
+    const processed = processTemplate(template);
+    setProcessedTemplate(processed);
+
+    if (processed.skipServiceSelection) {
+      if (processed.services.length === 1) {
+        const serviceInputs = addServiceInputs(processed, processed.services);
+        processed.inputs = [...serviceInputs, ...processed.inputs];
+        setSelectedServices(processed.services);
+      }
+      setInputValues(
+        processed.inputs.reduce(
+          (acc, input) => ({ ...acc, [input.key]: input.value }),
+          {}
+        )
+      );
+      setCurrentStep('inputs');
+    } else if (processed.showServiceSelection) {
+      setSelectedServices([]);
+      setCurrentStep('selectService');
+    } else {
+      setInputValues(
+        processed.inputs.reduce(
+          (acc, input) => ({ ...acc, [input.key]: input.value }),
+          {}
+        )
+      );
+      setCurrentStep('inputs');
+    }
+  };
+
   const handleLoadTemplate = (template: Template) => {
     // Show validation warnings if any
     const validation = templateValidations[template.metadata.id];
@@ -1013,40 +1421,26 @@ export function ConfigTemplatesModal({
       );
     }
 
-    const processed = processTemplate(template);
-    setProcessedTemplate(processed);
-
-    // Determine which step to show
-    if (processed.skipServiceSelection) {
-      // If single required service, add its credentials to inputs (only if the template says service is required)
-      if (processed.services.length === 1) {
-        const serviceInputs = addServiceInputs(processed, processed.services);
-        processed.inputs = [...serviceInputs, ...processed.inputs];
-        setSelectedServices(processed.services);
+    const options: Option[] = (template.metadata as any).inputs || [];
+    if (options.length > 0) {
+      // Initialise with defaults
+      const defaults: Record<string, any> = {};
+      for (const opt of options) {
+        if (opt.default !== undefined) {
+          defaults[opt.id] = opt.default;
+        } else if (opt.type === 'boolean') {
+          defaults[opt.id] = false;
+        }
       }
-
-      // Go directly to inputs
-      setInputValues(
-        processed.inputs.reduce(
-          (acc, input) => ({ ...acc, [input.key]: input.value }),
-          {}
-        )
-      );
-      setCurrentStep('inputs');
-    } else if (processed.showServiceSelection) {
-      // Show service selection
-      setSelectedServices([]);
-      setCurrentStep('selectService');
-    } else {
-      // No services, go directly to inputs
-      setInputValues(
-        processed.inputs.reduce(
-          (acc, input) => ({ ...acc, [input.key]: input.value }),
-          {}
-        )
-      );
-      setCurrentStep('inputs');
+      const saved = getLocalStorageTemplateInputs(template.metadata.id);
+      setPendingTemplate(template);
+      setTemplateInputOptions(options);
+      setTemplateInputValues({ ...defaults, ...saved });
+      setCurrentStep('templateInputs');
+      return;
     }
+
+    proceedWithTemplate(template);
   };
 
   const handleServiceSelectionNext = () => {
@@ -1102,6 +1496,61 @@ export function ConfigTemplatesModal({
       )
     );
     setCurrentStep('inputs');
+  };
+
+  const handleTemplateInputsNext = () => {
+    if (!pendingTemplate) return;
+
+    // Validate required visible inputs
+    const visibleOptions =
+      mode === 'noob'
+        ? templateInputOptions.filter(
+            (opt) => opt.advanced !== true && opt.showInSimpleMode !== false
+          )
+        : templateInputOptions;
+    const missingRequired = visibleOptions.filter(
+      (opt) =>
+        opt.required &&
+        (templateInputValues[opt.id] === undefined ||
+          templateInputValues[opt.id] === null ||
+          templateInputValues[opt.id] === '')
+    );
+    if (missingRequired.length > 0) {
+      toast.error(
+        `Please fill in required fields: ${missingRequired.map((o) => o.name || o.id).join(', ')}`
+      );
+      return;
+    }
+
+    // Apply input-based conditionals (services not chosen yet - pass [])
+    const resolvedConfig = applyTemplateConditionals(
+      JSON.parse(JSON.stringify(pendingTemplate.config)),
+      templateInputValues,
+      []
+    );
+    const resolvedTemplate: Template = {
+      ...pendingTemplate,
+      config: resolvedConfig,
+    };
+
+    // Save inputs to localStorage so they are pre-filled on next import
+    saveLocalStorageTemplateInputs(
+      pendingTemplate.metadata.id,
+      templateInputValues
+    );
+
+    // Clear templateInputs state before proceeding
+    setPendingTemplate(null);
+    setTemplateInputOptions([]);
+
+    proceedWithTemplate(resolvedTemplate);
+  };
+
+  const handleBackFromTemplateInputs = () => {
+    setPendingTemplate(null);
+    setTemplateInputOptions([]);
+    setTemplateInputValues({});
+    setCurrentStep('browse');
   };
 
   const applyInputValue = (obj: any, path: string, value: any) => {
@@ -1266,10 +1715,69 @@ export function ConfigTemplatesModal({
 
   const handleCancel = () => {
     setProcessedTemplate(null);
+    setPendingTemplate(null);
+    setTemplateInputOptions([]);
+    setTemplateInputValues({});
     setCurrentStep('browse');
     setSelectedServices([]);
     setInputValues({});
     onOpenChange(false);
+  };
+
+  // Render template-creator-defined option inputs
+  const renderTemplateInputs = () => {
+    const visibleOptions =
+      mode === 'noob'
+        ? templateInputOptions.filter(
+            (opt) => opt.advanced !== true && opt.showInSimpleMode !== false
+          )
+        : templateInputOptions;
+
+    return (
+      <>
+        <ModeSwitch
+          value={mode}
+          onChange={setMode}
+          size="sm"
+          className="w-full"
+        />
+
+        <div className="space-y-3 max-h-[400px] overflow-y-auto pr-1">
+          {visibleOptions.length === 0 ? (
+            <div className="text-center py-6 text-gray-400 text-sm">
+              No options available in simple mode. Switch to Advanced to see all
+              options.
+            </div>
+          ) : (
+            visibleOptions.map((opt) => (
+              <TemplateOption
+                key={opt.id}
+                option={opt}
+                value={templateInputValues[opt.id] ?? opt.default}
+                onChange={(v) =>
+                  setTemplateInputValues((prev) => ({
+                    ...prev,
+                    [opt.id]: v,
+                  }))
+                }
+              />
+            ))
+          )}
+        </div>
+
+        <div className="flex justify-between gap-2 pt-2 border-t border-gray-700">
+          <Button
+            intent="primary-outline"
+            onClick={handleBackFromTemplateInputs}
+          >
+            Back
+          </Button>
+          <Button intent="white" rounded onClick={handleTemplateInputsNext}>
+            Next
+          </Button>
+        </div>
+      </>
+    );
   };
 
   // Render different steps
@@ -1772,6 +2280,18 @@ export function ConfigTemplatesModal({
         </div>
       </Modal>
 
+      {/* Template Inputs Modal */}
+      <Modal
+        open={open && currentStep === 'templateInputs'}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) handleCancel();
+        }}
+        title="Template Options"
+        description="Customise this template to your needs"
+      >
+        <div className="space-y-4">{renderTemplateInputs()}</div>
+      </Modal>
+
       {/* Service Selection Modal */}
       <Modal
         open={open && currentStep === 'selectService'}
@@ -1856,6 +2376,14 @@ export function ConfigTemplatesModal({
         }
       >
         <div className="space-y-4">
+          {showDeepLinkWarning && (
+            <Alert
+              intent="warning"
+              isClosable={false}
+              title="Externally Linked Template"
+              description="This template is being loaded from an external URL that was passed via a link. Only proceed if you recognise the source and trust where this link came from. If you did not expect to see this, click Cancel."
+            />
+          )}
           {pendingImportTemplates.length === 1 ? (
             // Show detailed metadata for single template
             <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-4 space-y-3">
@@ -1910,14 +2438,36 @@ export function ConfigTemplatesModal({
                 )}
             </div>
           ) : (
-            // Show simple list for multiple templates
+            // Show selectable list for multiple templates
             <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-4">
-              <div className="space-y-2 max-h-[300px] overflow-y-auto">
+              <p className="text-xs text-gray-400 mb-3">
+                Click a template to select it, then use &ldquo;Use Selected
+                Template&rdquo; to apply it - or import them all at once.
+              </p>
+              <div className="space-y-1 max-h-[300px] overflow-y-auto">
                 {pendingImportTemplates.map((template, idx) => (
                   <div
                     key={idx}
-                    className="flex items-center justify-between py-2 border-b border-gray-700 last:border-0"
+                    onClick={() =>
+                      setSelectedPendingTemplateIndex(
+                        idx === selectedPendingTemplateIndex ? null : idx
+                      )
+                    }
+                    className={cn(
+                      'flex items-center gap-3 py-2 px-2 rounded cursor-pointer transition-colors border',
+                      selectedPendingTemplateIndex === idx
+                        ? 'bg-white/10 border-white/20'
+                        : 'border-transparent hover:bg-gray-700/50'
+                    )}
                   >
+                    <div
+                      className={cn(
+                        'w-3 h-3 rounded-full border-2 flex-shrink-0 transition-colors',
+                        selectedPendingTemplateIndex === idx
+                          ? 'bg-white border-white'
+                          : 'border-gray-500'
+                      )}
+                    />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium text-white truncate">
                         {template.metadata.name}
@@ -1960,13 +2510,25 @@ export function ConfigTemplatesModal({
                   </Button>
                 </>
               ) : (
-                <Button
-                  intent="white"
-                  rounded
-                  onClick={() => handleConfirmImport(false)}
-                >
-                  Confirm Import
-                </Button>
+                <>
+                  <Button
+                    intent="gray-outline"
+                    onClick={() => handleConfirmImport(false)}
+                  >
+                    Import All
+                  </Button>
+                  {selectedPendingTemplateIndex !== null && (
+                    <Button
+                      intent="white"
+                      rounded
+                      onClick={() =>
+                        handleConfirmImport(true, selectedPendingTemplateIndex)
+                      }
+                    >
+                      Use Selected Template
+                    </Button>
+                  )}
+                </>
               )}
             </div>
           </div>

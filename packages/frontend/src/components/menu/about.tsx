@@ -142,6 +142,28 @@ AIOStreams consolidates multiple Stremio addons and debrid services - including 
   const setupChoiceModal = useDisclosure(false);
   const customHtml = status?.settings?.customHtml;
   const pathname = usePathname();
+  const [deepLinkUrl, setDeepLinkUrl] = React.useState<string | undefined>(
+    undefined
+  );
+  const [deepLinkTemplateId, setDeepLinkTemplateId] = React.useState<
+    string | undefined
+  >(undefined);
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    const templateUrl = url.searchParams.get('template');
+    const templateId = url.searchParams.get('templateId') ?? undefined;
+    if (templateUrl) {
+      setDeepLinkUrl(templateUrl);
+      setDeepLinkTemplateId(templateId);
+      templatesModal.open();
+      // Clean up the params so they don't persist on back/forward
+      url.searchParams.delete('template');
+      url.searchParams.delete('templateId');
+      window.history.replaceState({}, '', url.toString());
+    }
+  }, []);
   const confirmClearConfig = useConfirmationDialog({
     title: 'Sign Out',
     description: 'Are you sure you want to sign out?',
@@ -435,6 +457,8 @@ AIOStreams consolidates multiple Stremio addons and debrid services - including 
       <ConfigTemplatesModal
         open={templatesModal.isOpen}
         onOpenChange={templatesModal.toggle}
+        deepLinkUrl={deepLinkUrl}
+        deepLinkTemplateId={deepLinkTemplateId}
       />
       <SetupChoiceModal
         open={setupChoiceModal.isOpen}

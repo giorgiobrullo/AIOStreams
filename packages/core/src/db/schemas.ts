@@ -204,6 +204,7 @@ const OptionDefinition = z.object({
   name: z.string().min(1),
   description: z.string().min(1),
   showInSimpleMode: z.boolean().optional(),
+  advanced: z.boolean().optional(),
   emptyIsUndefined: z.boolean().optional(),
   type: z.enum([
     'string',
@@ -1305,6 +1306,7 @@ export const TemplateSchema = z.object({
     serviceRequired: z.boolean().optional(), // whether a service is required for this template or not.
     setToSaveInstallMenu: z.boolean().optional().default(true), // whether to set the menu to save-install after importing the template
     sourceUrl: z.url().optional(), // URL from which the template was imported (for auto-updates)
+    inputs: z.array(OptionDefinition).optional(), // template-creator-defined options shown to the user before loading
   }),
   config: UserDataSchema.partial(),
 });

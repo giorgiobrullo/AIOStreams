@@ -138,7 +138,7 @@ const TemplateOption: React.FC<TemplateOptionProps> = ({
             value={forcedValue ?? value ?? defaultValue}
             label={name}
             onValueChange={(value: number, valueAsString: string) =>
-              onChange(value)
+              onChange(isNaN(value) ? undefined : value)
             }
             required={required}
             step={
@@ -149,6 +149,7 @@ const TemplateOption: React.FC<TemplateOptionProps> = ({
                 : 1
             }
             disabled={isDisabled}
+            clampValueOnBlur={false}
             min={
               constraints?.forceInUi !== false ? constraints?.min : undefined
             }
