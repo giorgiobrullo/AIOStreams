@@ -426,12 +426,21 @@ export function SaveProvider({ children }: { children: React.ReactNode }) {
             isClosable={false}
             description="Please re-install the addon in your client to apply the changes. Your current installation will continue to work, but certain changes will not take effect until you re-install with the new manifest. "
           />
-          <Switch
-            id="dont-show-manifest-again"
-            label="Don't show this again"
-            value={dontShowManifestAgain}
-            onValueChange={setDontShowManifestAgain}
-          />
+          <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+            <div className="flex-1">
+              <div className="text-sm font-medium text-white">
+                Don&apos;t show this again
+              </div>
+              <div className="text-xs text-gray-400 mt-1">
+                Skip this notice for future manifest changes
+              </div>
+            </div>
+            <Switch
+              id="dont-show-manifest-again"
+              value={dontShowManifestAgain}
+              onValueChange={setDontShowManifestAgain}
+            />
+          </div>
           <div className="flex justify-end">
             <Button intent="white" onClick={handleManifestDismiss}>
               OK
