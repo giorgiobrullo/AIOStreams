@@ -1279,6 +1279,20 @@ export function ConfigTemplatesModal({
         }
       }
       const saved = getLocalStorageTemplateInputs(template.metadata.id);
+
+      // show service selection step if needed, otherwise go straight to template inputs
+      const processed = processTemplate(template);
+      if (processed.showServiceSelection) {
+        setProcessedTemplate(processed);
+        setPendingTemplate(template);
+        setTemplateInputOptions(options);
+        setTemplateInputValues({ ...defaults, ...saved });
+        setSelectedServices([]);
+        setCurrentStep('selectService');
+        return;
+      }
+
+      setProcessedTemplate(null);
       setPendingTemplate(template);
       setTemplateInputOptions(options);
       setTemplateInputValues({ ...defaults, ...saved });
@@ -1316,6 +1330,12 @@ export function ConfigTemplatesModal({
       }
       return prev;
     });
+    // If there are template inputs still to be filled, go there next.
+    if (pendingTemplate !== null) {
+      setCurrentStep('templateInputs');
+      return;
+    }
+
     // Initialize input values
     setInputValues(
       allInputs.reduce(
@@ -1335,6 +1355,13 @@ export function ConfigTemplatesModal({
     }
 
     setSelectedServices([]);
+
+    // If there are template inputs still to be filled, go there next.
+    if (pendingTemplate !== null) {
+      setCurrentStep('templateInputs');
+      return;
+    }
+
     setInputValues(
       processedTemplate.inputs.reduce(
         (acc, input) => ({ ...acc, [input.key]: input.value }),
@@ -1368,11 +1395,11 @@ export function ConfigTemplatesModal({
       return;
     }
 
-    // Apply input-based conditionals (services not chosen yet - pass [])
+    // Apply input-based conditionals
     const resolvedConfig = applyTemplateConditionals(
       JSON.parse(JSON.stringify(pendingTemplate.config)),
       templateInputValues,
-      []
+      selectedServices
     );
     const resolvedTemplate: Template = {
       ...pendingTemplate,
@@ -1389,13 +1416,52 @@ export function ConfigTemplatesModal({
     setPendingTemplate(null);
     setTemplateInputOptions([]);
 
-    proceedWithTemplate(resolvedTemplate);
+    if (processedTemplate !== null) {
+      // Service selection was already done before this step. Re-process the now-resolved
+      // config to get correct placeholder inputs
+      const freshProcessed = processTemplate(resolvedTemplate);
+      const serviceCredInputs = processedTemplate.inputs.filter((input) =>
+        Array.isArray(input.path)
+          ? input.path.some((p) => p.startsWith('services.'))
+          : input.path.startsWith('services.')
+      );
+      freshProcessed.inputs = [...serviceCredInputs, ...freshProcessed.inputs];
+      setProcessedTemplate(freshProcessed);
+      setInputValues(
+        freshProcessed.inputs.reduce(
+          (acc, input) => ({ ...acc, [input.key]: input.value }),
+          {}
+        )
+      );
+      setCurrentStep('inputs');
+    } else {
+      proceedWithTemplate(resolvedTemplate);
+    }
   };
 
   const handleBackFromTemplateInputs = () => {
-    setPendingTemplate(null);
     setTemplateInputOptions([]);
     setTemplateInputValues({});
+
+    if (processedTemplate !== null) {
+      // Strip service credential inputs so they don't get added twice on re-entry.
+      setProcessedTemplate((prev) => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          inputs: prev.inputs.filter((input) =>
+            Array.isArray(input.path)
+              ? !input.path.some((p) => p.startsWith('services.'))
+              : !input.path.startsWith('services.')
+          ),
+        };
+      });
+      // Keep pendingTemplate set so service selection knows to return here
+      setCurrentStep('selectService');
+      return;
+    }
+
+    setPendingTemplate(null);
     setCurrentStep('browse');
   };
 
