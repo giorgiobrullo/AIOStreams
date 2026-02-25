@@ -109,7 +109,7 @@ function Content() {
   const exportMenuModal = useDisclosure(false);
   const importMenuModal = useDisclosure(false);
   const [filterCredentialsInExport, setFilterCredentialsInExport] =
-    React.useState(false);
+    React.useState(true);
   const [installProtocol, setInstallProtocol] = React.useState('stremio');
   const { handleSave: handleSaveContext, loading: saveLoading } = useSave();
   const confirmResetProps = useConfirmationDialog({
@@ -668,22 +668,6 @@ function Content() {
           description="Choose how to export your configuration"
         >
           <div className="space-y-4">
-            {/* Exclude Credentials Option */}
-            <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
-              <div className="flex-1">
-                <div className="text-sm font-medium text-white">
-                  Exclude Credentials
-                </div>
-                <div className="text-xs text-gray-400 mt-1">
-                  Remove sensitive information from export
-                </div>
-              </div>
-              <Switch
-                value={filterCredentialsInExport}
-                onValueChange={setFilterCredentialsInExport}
-              />
-            </div>
-
             <div className="grid grid-cols-2 gap-4">
               <ModalOptionButton
                 onClick={handleExport}
@@ -699,6 +683,28 @@ function Content() {
                 icon={<PlusIcon className="h-8 w-8" />}
                 title="Export as Template"
                 description="Create reusable template with custom metadata"
+              />
+            </div>
+
+            <div className="flex flex-col gap-3 mt-6 p-3 bg-gray-800/50 rounded-lg">
+              <div className="flex items-center justify-between">
+                <div className="flex-1">
+                  <div className="text-sm font-medium text-white">
+                    Exclude Credentials
+                  </div>
+                  <div className="text-xs text-gray-400 mt-1">
+                    Remove sensitive API keys and passwords from the export
+                  </div>
+                </div>
+                <Switch
+                  value={filterCredentialsInExport}
+                  onValueChange={setFilterCredentialsInExport}
+                />
+              </div>
+              <Alert
+                intent="warning"
+                isClosable={false}
+                description="While excluding credentials removes your API keys, any custom addon URLs or manually overridden URLs in your config are not removed. These may contain sensitive information - double-check before sharing."
               />
             </div>
           </div>
