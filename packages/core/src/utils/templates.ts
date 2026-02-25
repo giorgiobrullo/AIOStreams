@@ -338,8 +338,12 @@ export class TemplateManager {
       ...(t.config.excludedRegexPatterns || []),
       ...(t.config.includedRegexPatterns || []),
       ...(t.config.requiredRegexPatterns || []),
-      ...(t.config.preferredRegexPatterns || []).map((p) => p.pattern),
-      ...(t.config.rankedRegexPatterns || []).map((p) => p.pattern),
+      ...(t.config.preferredRegexPatterns || []).map(
+        (p: { pattern: string }) => p.pattern
+      ),
+      ...(t.config.rankedRegexPatterns || []).map(
+        (p: { pattern: string }) => p.pattern
+      ),
     ]);
 
     const syncedSelUrls = templates.flatMap((t) => [

@@ -514,7 +514,7 @@ export function ConfigTemplatesModal({
         }
       });
       template.config.presets = template.config.presets.filter(
-        (p) => !presetsToRemove.includes(p.type)
+        (p: any) => !presetsToRemove.includes(p.type)
       );
     }
 
@@ -535,7 +535,7 @@ export function ConfigTemplatesModal({
     const includedRegexes = template.config.includedRegexPatterns || [];
     const requiredRegexes = template.config.requiredRegexPatterns || [];
     const preferredRegexes = (template.config.preferredRegexPatterns || []).map(
-      (r) => (typeof r === 'string' ? r : r.pattern)
+      (r: any) => (typeof r === 'string' ? r : r.pattern)
     );
 
     const allRegexes = [
@@ -1044,7 +1044,8 @@ export function ConfigTemplatesModal({
 
     // Parse proxy fields
     if (template.config?.proxy && template.config.proxy.id) {
-      const id = template.config.proxy.id;
+      const id = template.config.proxy
+        .id as keyof typeof constants.PROXY_SERVICE_DETAILS;
       const proxyDetails = constants.PROXY_SERVICE_DETAILS[id];
       const proxyFields = [
         'url',
@@ -1804,9 +1805,9 @@ export function ConfigTemplatesModal({
             const hasErrors = validation && validation.errors.length > 0;
 
             const addons = Array.from(
-              new Set(
+              new Set<string>(
                 template.config.presets?.map(
-                  (preset: any) => preset.options?.name
+                  (preset: any) => preset.options?.name as string
                 )
               )
             );

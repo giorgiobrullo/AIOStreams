@@ -1308,7 +1308,7 @@ export const TemplateSchema = z.object({
     sourceUrl: z.url().optional(), // URL from which the template was imported (for auto-updates)
     inputs: z.array(OptionDefinition).optional(), // template-creator-defined options shown to the user before loading
   }),
-  config: UserDataSchema.partial(),
+  config: z.any(),
 });
 
 export type Template = z.infer<typeof TemplateSchema>;
