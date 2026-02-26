@@ -76,7 +76,7 @@ class StreamParser {
       type: 'http',
       proxied: this.isProxied(stream),
       url: this.applyUrlModifications(stream.url ?? undefined),
-      nzbUrl: stream.nzbUrl ?? undefined,
+      nzbUrl: stream.nzbUrl || undefined,
       tarUrls: stream.tarUrls ?? undefined,
       tgzUrls: stream.tgzUrls ?? undefined,
       '7zipUrls': stream['7zipUrls'] ?? undefined,

@@ -197,6 +197,13 @@ const DeduplicatorOptions = z.object({
   live: DeduplicatorMode.optional(),
   youtube: DeduplicatorMode.optional(),
   external: DeduplicatorMode.optional(),
+  smartDetectAttributes: z
+    .array(z.enum(constants.SMART_DETECT_ATTRIBUTES))
+    .optional(),
+  smartDetectRounding: z.number().min(1).max(50).optional(),
+  libraryBehaviour: z
+    .enum(constants.DEDUPLICATOR_LIBRARY_BEHAVIOURS)
+    .optional(),
 });
 
 const OptionDefinition = z.object({
@@ -1142,7 +1149,8 @@ export const AIOStream = StreamSchema.extend({
       type: StreamTypes.optional(),
       indexer: z.string().optional(),
       age: z.number().or(z.string()).optional(), // Age in hours since upload
-      torrent: z
+      nzbUrl: z.string().or(z.null()).optional(),
+      torrent: z  
         .object({
           infoHash: z.string().min(1).optional(),
           fileIdx: z.number().optional(),
