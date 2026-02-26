@@ -4,6 +4,7 @@ import {
   evaluateTemplateCondition,
   resolveRef,
   applyTemplateConditionals,
+  resolveCredentialRefs,
 } from '../template-processor';
 
 // ---------------------------------------------------------------------------
@@ -743,7 +744,71 @@ describe('applyTemplateConditionals — interpolation', () => {
       applyTemplateConditionals('svc={{services.torbox}}', {}, ['torbox'])
     ).toBe('svc=true');
   });
-});
+
+  // --- credential refs: {{services.X.Y}} ---
+
+  it('sole token: services credential ref is preserved unchanged (service selected)', () => {
+    expect(
+      applyTemplateConditionals('{{services.torbox.apiKey}}', {}, ['torbox'])
+    ).toBe('{{services.torbox.apiKey}}');
+  });
+
+  it('sole token: services credential ref is preserved unchanged (service NOT selected)', () => {
+    expect(
+      applyTemplateConditionals('{{services.torbox.apiKey}}', {}, [])
+    ).toBe('{{services.torbox.apiKey}}');
+  });
+
+  it('multi-token: services credential ref is preserved inside a larger string', () => {
+    expect(
+      applyTemplateConditionals('key={{services.torbox.apiKey}}&other=1', {}, [
+        'torbox',
+      ])
+    ).toBe('key={{services.torbox.apiKey}}&other=1');
+  });
+
+  it('sole token: services boolean ref (no credential) still returns boolean', () => {
+    expect(
+      applyTemplateConditionals('{{services.torbox}}', {}, ['torbox'])
+    ).toBe(true);
+    expect(applyTemplateConditionals('{{services.torbox}}', {}, [])).toBe(
+      false
+    );
+  });
+
+  it('object with credential ref field is preserved through full traversal', () => {
+    // __if (without __value) is only evaluated for array items, so wrap in array.
+    const config = [
+      {
+        __if: 'services.torbox',
+        type: 'newznab',
+        options: { apiKey: '{{services.torbox.apiKey}}' },
+      },
+    ];
+    const result = applyTemplateConditionals(config, {}, ['torbox']);
+    // __if passes (torbox selected), apiKey ref preserved for later resolution
+    expect(result).toEqual([
+      {
+        type: 'newznab',
+        options: { apiKey: '{{services.torbox.apiKey}}' },
+      },
+    ]);
+  });
+
+  it('credential ref inside a __switch case is preserved', () => {
+    const config = {
+      __switch: 'inputs.service',
+      cases: {
+        torbox: { apiKey: '{{services.torbox.apiKey}}' },
+      },
+      default: { apiKey: '' },
+    };
+    const result = applyTemplateConditionals(config, { service: 'torbox' }, [
+      'torbox',
+    ]);
+    expect(result).toEqual({ apiKey: '{{services.torbox.apiKey}}' });
+  });
+}); // applyTemplateConditionals — interpolation
 
 // ---------------------------------------------------------------------------
 // applyTemplateConditionals — general traversal
@@ -3006,5 +3071,601 @@ describe('practical: conditional config fields via __if+__value and __remove', (
     );
     expect('formatter' in r3).toBe(false);
     expect(r3.presets).toEqual([{ type: 'comet' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sortCriteria — input-driven sort criteria
+// ---------------------------------------------------------------------------
+
+/**
+ * Helpers — mirrors the Tamtaro sort criteria layout used in the real template.
+ *
+ * A sort-criteria entry is always:  { key: string, direction: "asc" | "desc" }
+ *
+ * Template structure:
+ *   sortCriteria.cached  — ordered list of criteria applied to cached streams
+ *   sortCriteria.uncached — ordered list of criteria applied to uncached streams
+ *   sortCriteria.global  — prepended to every sub-list (e.g. "cached" gate)
+ */
+
+describe('sortCriteria — include / exclude library criterion', () => {
+  const noSvcs: string[] = [];
+
+  // Template fragment: the `cached` sort list includes `library` only when
+  // the `includeLibrary` boolean input is true.
+  const cachedCriteriaTemplate = [
+    { key: 'resolution', direction: 'desc' },
+    { key: 'quality', direction: 'desc' },
+    {
+      __if: 'inputs.includeLibrary',
+      key: 'library',
+      direction: 'desc',
+    },
+    { key: 'streamExpressionScore', direction: 'desc' },
+    { key: 'bitrate', direction: 'desc' },
+  ];
+
+  it('includes library criterion when includeLibrary is true', () => {
+    const result = applyTemplateConditionals(
+      cachedCriteriaTemplate,
+      { includeLibrary: true },
+      noSvcs
+    );
+    expect(result).toEqual([
+      { key: 'resolution', direction: 'desc' },
+      { key: 'quality', direction: 'desc' },
+      { key: 'library', direction: 'desc' },
+      { key: 'streamExpressionScore', direction: 'desc' },
+      { key: 'bitrate', direction: 'desc' },
+    ]);
+  });
+
+  it('excludes library criterion when includeLibrary is false', () => {
+    const result = applyTemplateConditionals(
+      cachedCriteriaTemplate,
+      { includeLibrary: false },
+      noSvcs
+    );
+    expect(result).toEqual([
+      { key: 'resolution', direction: 'desc' },
+      { key: 'quality', direction: 'desc' },
+      { key: 'streamExpressionScore', direction: 'desc' },
+      { key: 'bitrate', direction: 'desc' },
+    ]);
+  });
+
+  it('excludes library criterion when includeLibrary is absent (default-off)', () => {
+    const result = applyTemplateConditionals(
+      cachedCriteriaTemplate,
+      {},
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys).not.toContain('library');
+    expect(keys).toContain('resolution');
+    expect(keys).toContain('bitrate');
+  });
+});
+
+describe('sortCriteria — de-prioritise library (move to end)', () => {
+  const noSvcs: string[] = [];
+
+  // Template: when `deprioritiseLibrary` is true the library criterion goes at
+  // the bottom of the list (after bitrate/seeders); when false it sits in the
+  // "normal" position, right after quality.
+  const cachedTemplate = [
+    { key: 'resolution', direction: 'desc' },
+    { key: 'quality', direction: 'desc' },
+    {
+      __if: '!inputs.deprioritiseLibrary',
+      key: 'library',
+      direction: 'desc',
+    },
+    { key: 'streamExpressionScore', direction: 'desc' },
+    { key: 'bitrate', direction: 'desc' },
+    { key: 'seeders', direction: 'desc' },
+    {
+      __if: 'inputs.deprioritiseLibrary',
+      key: 'library',
+      direction: 'desc',
+    },
+  ];
+
+  it('library is in normal position when deprioritiseLibrary is false', () => {
+    const result = applyTemplateConditionals(
+      cachedTemplate,
+      { deprioritiseLibrary: false },
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys).toEqual([
+      'resolution',
+      'quality',
+      'library',
+      'streamExpressionScore',
+      'bitrate',
+      'seeders',
+    ]);
+    // library must come BEFORE streamExpressionScore
+    expect(keys.indexOf('library')).toBeLessThan(
+      keys.indexOf('streamExpressionScore')
+    );
+  });
+
+  it('library is moved to the end when deprioritiseLibrary is true', () => {
+    const result = applyTemplateConditionals(
+      cachedTemplate,
+      { deprioritiseLibrary: true },
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys).toEqual([
+      'resolution',
+      'quality',
+      'streamExpressionScore',
+      'bitrate',
+      'seeders',
+      'library',
+    ]);
+    // library must come AFTER seeders
+    expect(keys.indexOf('library')).toBeGreaterThan(keys.indexOf('seeders'));
+  });
+});
+
+describe('sortCriteria — sort direction driven by input', () => {
+  const noSvcs: string[] = [];
+
+  // Template: the user can choose whether seeders sort ascending (fewest first —
+  // obscure torrents) or descending (most popular first).  Use __switch on a
+  // select input: "desc" | "asc".
+  const seedersCriterionTemplate = {
+    key: 'seeders',
+    direction: {
+      __switch: 'inputs.seedersDirection',
+      cases: { asc: 'asc', desc: 'desc' },
+      default: 'desc',
+    },
+  };
+
+  it('direction is desc when seedersDirection == desc', () => {
+    const result = applyTemplateConditionals(
+      seedersCriterionTemplate,
+      { seedersDirection: 'desc' },
+      noSvcs
+    );
+    expect(result).toEqual({ key: 'seeders', direction: 'desc' });
+  });
+
+  it('direction is asc when seedersDirection == asc', () => {
+    const result = applyTemplateConditionals(
+      seedersCriterionTemplate,
+      { seedersDirection: 'asc' },
+      noSvcs
+    );
+    expect(result).toEqual({ key: 'seeders', direction: 'asc' });
+  });
+
+  it('falls back to desc when seedersDirection is not set', () => {
+    const result = applyTemplateConditionals(
+      seedersCriterionTemplate,
+      {},
+      noSvcs
+    );
+    expect(result).toEqual({ key: 'seeders', direction: 'desc' });
+  });
+});
+
+describe('sortCriteria — seadex criterion toggled by boolean input', () => {
+  const noSvcs: string[] = [];
+
+  const cachedTemplate = [
+    {
+      __if: 'inputs.enableSeadex',
+      key: 'seadex',
+      direction: 'desc',
+    },
+    { key: 'resolution', direction: 'desc' },
+    { key: 'quality', direction: 'desc' },
+    { key: 'streamExpressionScore', direction: 'desc' },
+  ];
+
+  it('seadex leads the list when enableSeadex is true', () => {
+    const result = applyTemplateConditionals(
+      cachedTemplate,
+      { enableSeadex: true },
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys[0]).toBe('seadex');
+    expect(keys).toContain('resolution');
+  });
+
+  it('seadex is absent when enableSeadex is false', () => {
+    const result = applyTemplateConditionals(
+      cachedTemplate,
+      { enableSeadex: false },
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys).not.toContain('seadex');
+    expect(keys[0]).toBe('resolution');
+  });
+});
+
+describe('sortCriteria — full sortCriteria object with global + sub-lists', () => {
+  const noSvcs: string[] = [];
+
+  // Mirrors the real Tamtaro shape:
+  //   global  — always [cached gate]
+  //   cached  — full list, library + seadex toggled by inputs
+  //   uncached — always [resolution, quality, seeders]
+  const sortCriteriaTemplate = {
+    global: [{ key: 'cached', direction: 'desc' }],
+    cached: [
+      {
+        __if: 'inputs.enableSeadex',
+        key: 'seadex',
+        direction: 'desc',
+      },
+      { key: 'resolution', direction: 'desc' },
+      { key: 'quality', direction: 'desc' },
+      {
+        __if: '!inputs.deprioritiseLibrary',
+        key: 'library',
+        direction: 'desc',
+      },
+      { key: 'streamExpressionMatched', direction: 'desc' },
+      { key: 'streamExpressionScore', direction: 'desc' },
+      { key: 'language', direction: 'desc' },
+      { key: 'visualTag', direction: 'desc' },
+      { key: 'audioTag', direction: 'desc' },
+      { key: 'encode', direction: 'desc' },
+      { key: 'bitrate', direction: 'desc' },
+      { key: 'seeders', direction: 'desc' },
+      {
+        __if: 'inputs.deprioritiseLibrary',
+        key: 'library',
+        direction: 'desc',
+      },
+    ],
+    uncached: [
+      { key: 'resolution', direction: 'desc' },
+      { key: 'quality', direction: 'desc' },
+      { key: 'seeders', direction: 'desc' },
+    ],
+    series: [],
+    anime: [],
+  };
+
+  it('default (seadex on, library normal position)', () => {
+    const result = applyTemplateConditionals(
+      sortCriteriaTemplate,
+      { enableSeadex: true, deprioritiseLibrary: false },
+      noSvcs
+    );
+    expect(result.global).toEqual([{ key: 'cached', direction: 'desc' }]);
+    const cachedKeys = result.cached.map((c: any) => c.key);
+    expect(cachedKeys[0]).toBe('seadex');
+    expect(cachedKeys.indexOf('library')).toBeLessThan(
+      cachedKeys.indexOf('streamExpressionMatched')
+    );
+    expect(result.uncached).toEqual([
+      { key: 'resolution', direction: 'desc' },
+      { key: 'quality', direction: 'desc' },
+      { key: 'seeders', direction: 'desc' },
+    ]);
+  });
+
+  it('seadex off, library de-prioritised', () => {
+    const result = applyTemplateConditionals(
+      sortCriteriaTemplate,
+      { enableSeadex: false, deprioritiseLibrary: true },
+      noSvcs
+    );
+    const cachedKeys = result.cached.map((c: any) => c.key);
+    expect(cachedKeys).not.toContain('seadex');
+    // library must be the last key in the cached list
+    expect(cachedKeys[cachedKeys.length - 1]).toBe('library');
+  });
+
+  it('seadex off, library in normal position', () => {
+    const result = applyTemplateConditionals(
+      sortCriteriaTemplate,
+      { enableSeadex: false, deprioritiseLibrary: false },
+      noSvcs
+    );
+    const cachedKeys = result.cached.map((c: any) => c.key);
+    expect(cachedKeys).not.toContain('seadex');
+    expect(cachedKeys[0]).toBe('resolution');
+    expect(cachedKeys.indexOf('library')).toBeLessThan(
+      cachedKeys.indexOf('streamExpressionMatched')
+    );
+  });
+
+  it('global and uncached lists are unaffected by any input', () => {
+    for (const inputs of [
+      { enableSeadex: true, deprioritiseLibrary: true },
+      { enableSeadex: false, deprioritiseLibrary: false },
+      {},
+    ]) {
+      const result = applyTemplateConditionals(
+        sortCriteriaTemplate,
+        inputs,
+        noSvcs
+      );
+      expect(result.global).toEqual([{ key: 'cached', direction: 'desc' }]);
+      expect(result.uncached).toEqual([
+        { key: 'resolution', direction: 'desc' },
+        { key: 'quality', direction: 'desc' },
+        { key: 'seeders', direction: 'desc' },
+      ]);
+      expect(result.series).toEqual([]);
+      expect(result.anime).toEqual([]);
+    }
+  });
+
+  it('library appears exactly once regardless of input combination', () => {
+    for (const deprioritiseLibrary of [true, false]) {
+      const result = applyTemplateConditionals(
+        sortCriteriaTemplate,
+        { enableSeadex: true, deprioritiseLibrary },
+        noSvcs
+      );
+      const libraryOccurrences = result.cached.filter(
+        (c: any) => c.key === 'library'
+      );
+      expect(libraryOccurrences).toHaveLength(1);
+    }
+  });
+});
+
+describe('sortCriteria — service-gated criteria', () => {
+  // Some sort keys (e.g. "cached") only make sense when a debrid service is
+  // selected.  Model this with a services.* condition.
+
+  const globalTemplate = [
+    {
+      __if: 'services.realdebrid or services.torbox or services.alldebrid',
+      key: 'cached',
+      direction: 'desc',
+    },
+    { key: 'resolution', direction: 'desc' },
+    { key: 'quality', direction: 'desc' },
+  ];
+
+  it('cached criterion present when a debrid service is selected', () => {
+    const result = applyTemplateConditionals(globalTemplate, {}, ['torbox']);
+    const keys = result.map((c: any) => c.key);
+    expect(keys).toContain('cached');
+    expect(keys[0]).toBe('cached');
+  });
+
+  it('cached criterion absent when no debrid service is selected', () => {
+    const result = applyTemplateConditionals(globalTemplate, {}, []);
+    const keys = result.map((c: any) => c.key);
+    expect(keys).not.toContain('cached');
+    expect(keys[0]).toBe('resolution');
+  });
+
+  it('cached criterion present for realdebrid', () => {
+    const result = applyTemplateConditionals(globalTemplate, {}, [
+      'realdebrid',
+    ]);
+    expect(result[0]).toEqual({ key: 'cached', direction: 'desc' });
+  });
+
+  it('cached criterion present for alldebrid', () => {
+    const result = applyTemplateConditionals(globalTemplate, {}, ['alldebrid']);
+    expect(result[0]).toEqual({ key: 'cached', direction: 'desc' });
+  });
+});
+
+describe('sortCriteria — prioritise language criterion via select input', () => {
+  const noSvcs: string[] = [];
+
+  // languagePriority: "top" → language sorts high (after seadex/resolution/quality),
+  //                   "bottom" → language sorts at the bottom,
+  //                   "none" → language criterion omitted entirely.
+  const cachedTemplate = [
+    { key: 'seadex', direction: 'desc' },
+    { key: 'resolution', direction: 'desc' },
+    { key: 'quality', direction: 'desc' },
+    {
+      __if: 'inputs.languagePriority == top',
+      key: 'language',
+      direction: 'desc',
+    },
+    { key: 'streamExpressionScore', direction: 'desc' },
+    { key: 'bitrate', direction: 'desc' },
+    { key: 'seeders', direction: 'desc' },
+    {
+      __if: 'inputs.languagePriority == bottom',
+      key: 'language',
+      direction: 'desc',
+    },
+  ];
+
+  it('language is high-priority when languagePriority == top', () => {
+    const result = applyTemplateConditionals(
+      cachedTemplate,
+      { languagePriority: 'top' },
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys).toContain('language');
+    expect(keys.indexOf('language')).toBeLessThan(
+      keys.indexOf('streamExpressionScore')
+    );
+  });
+
+  it('language is low-priority when languagePriority == bottom', () => {
+    const result = applyTemplateConditionals(
+      cachedTemplate,
+      { languagePriority: 'bottom' },
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys).toContain('language');
+    expect(keys[keys.length - 1]).toBe('language');
+  });
+
+  it('language is omitted when languagePriority == none', () => {
+    const result = applyTemplateConditionals(
+      cachedTemplate,
+      { languagePriority: 'none' },
+      noSvcs
+    );
+    const keys = result.map((c: any) => c.key);
+    expect(keys).not.toContain('language');
+  });
+
+  it('language appears exactly once for both top and bottom', () => {
+    for (const prio of ['top', 'bottom']) {
+      const result = applyTemplateConditionals(
+        cachedTemplate,
+        { languagePriority: prio },
+        noSvcs
+      );
+      const count = result.filter((c: any) => c.key === 'language').length;
+      expect(count).toBe(1);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveCredentialRefs
+// ---------------------------------------------------------------------------
+describe('resolveCredentialRefs', () => {
+  // ---- string inputs -------------------------------------------------------
+
+  it('replaces a single credential placeholder with the mapped value', () => {
+    expect(
+      resolveCredentialRefs('{{services.torbox.apiKey}}', {
+        service_torbox_apiKey: 'MY_API_KEY',
+      })
+    ).toBe('MY_API_KEY');
+  });
+
+  it('replaces a placeholder embedded in a larger string', () => {
+    expect(
+      resolveCredentialRefs('key={{services.torbox.apiKey}}&extra=1', {
+        service_torbox_apiKey: 'ABC123',
+      })
+    ).toBe('key=ABC123&extra=1');
+  });
+
+  it('replaces multiple placeholders in one string', () => {
+    expect(
+      resolveCredentialRefs(
+        '{{services.torbox.apiKey}}:{{services.torbox.userId}}',
+        { service_torbox_apiKey: 'K1', service_torbox_userId: 'U1' }
+      )
+    ).toBe('K1:U1');
+  });
+
+  it('replaces placeholders for different services in one string', () => {
+    expect(
+      resolveCredentialRefs(
+        '{{services.torbox.apiKey}}/{{services.realdebrid.token}}',
+        {
+          service_torbox_apiKey: 'TB_KEY',
+          service_realdebrid_token: 'RD_TOKEN',
+        }
+      )
+    ).toBe('TB_KEY/RD_TOKEN');
+  });
+
+  it('uses empty string when credential key is missing from the map', () => {
+    expect(resolveCredentialRefs('{{services.torbox.apiKey}}', {})).toBe('');
+  });
+
+  it('leaves unrelated text unchanged', () => {
+    expect(
+      resolveCredentialRefs('hello world', { service_torbox_apiKey: 'X' })
+    ).toBe('hello world');
+  });
+
+  it('leaves non-credential {{inputs.*}} placeholders unchanged', () => {
+    // resolveCredentialRefs only targets services.<id>.<key> refs
+    expect(
+      resolveCredentialRefs('{{inputs.someField}}', {
+        service_torbox_apiKey: 'X',
+      })
+    ).toBe('{{inputs.someField}}');
+  });
+
+  it('returns primitives other than strings unchanged', () => {
+    expect(resolveCredentialRefs(42, {})).toBe(42);
+    expect(resolveCredentialRefs(true, {})).toBe(true);
+    expect(resolveCredentialRefs(null, {})).toBeNull();
+  });
+
+  // ---- array inputs --------------------------------------------------------
+
+  it('resolves placeholders inside each array element string', () => {
+    const result = resolveCredentialRefs(
+      ['{{services.torbox.apiKey}}', 'static', '{{services.torbox.userId}}'],
+      { service_torbox_apiKey: 'K', service_torbox_userId: 'U' }
+    );
+    expect(result).toEqual(['K', 'static', 'U']);
+  });
+
+  it('recurses into nested arrays', () => {
+    const result = resolveCredentialRefs([['{{services.torbox.apiKey}}']], {
+      service_torbox_apiKey: 'NESTED',
+    });
+    expect(result).toEqual([['NESTED']]);
+  });
+
+  // ---- object inputs -------------------------------------------------------
+
+  it('resolves a credential ref in an object field', () => {
+    const obj = { apiKey: '{{services.torbox.apiKey}}', type: 'newznab' };
+    const result = resolveCredentialRefs(obj, {
+      service_torbox_apiKey: 'MY_KEY',
+    });
+    expect(result).toEqual({ apiKey: 'MY_KEY', type: 'newznab' });
+  });
+
+  it('mutates the object in place', () => {
+    const obj = { apiKey: '{{services.torbox.apiKey}}' };
+    resolveCredentialRefs(obj, { service_torbox_apiKey: 'MUTATED' });
+    expect(obj.apiKey).toBe('MUTATED');
+  });
+
+  it('recurses into nested objects', () => {
+    const obj = {
+      presets: [
+        {
+          type: 'newznab',
+          options: { apiKey: '{{services.torbox.apiKey}}', url: 'https://x' },
+        },
+      ],
+    };
+    resolveCredentialRefs(obj, { service_torbox_apiKey: 'DEEP_KEY' });
+    expect(obj).toEqual({
+      presets: [
+        { type: 'newznab', options: { apiKey: 'DEEP_KEY', url: 'https://x' } },
+      ],
+    });
+  });
+
+  it('handles multiple services across a nested structure', () => {
+    const obj = {
+      a: { key: '{{services.torbox.apiKey}}' },
+      b: { token: '{{services.realdebrid.token}}' },
+    };
+    resolveCredentialRefs(obj, {
+      service_torbox_apiKey: 'TB',
+      service_realdebrid_token: 'RD',
+    });
+    expect(obj).toEqual({ a: { key: 'TB' }, b: { token: 'RD' } });
+  });
+
+  it('leaves keys with no matching credential as empty string', () => {
+    const obj = { apiKey: '{{services.torbox.apiKey}}', other: 'keep' };
+    resolveCredentialRefs(obj, {});
+    expect(obj).toEqual({ apiKey: '', other: 'keep' });
   });
 });
