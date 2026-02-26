@@ -31,6 +31,7 @@ import { useMenu } from '@/context/menu';
 import {
   applyTemplateConditionals,
   resolveCredentialRefs,
+  asConfigArray,
 } from '@/lib/template-processor';
 import { APIError, fetchTemplates } from '@/lib/api';
 import { Switch } from '../ui/switch';
@@ -97,6 +98,19 @@ interface ProcessedTemplate {
   inputs: TemplateInput[]; // All inputs needed
 }
 
+type WizardStep = 'browse' | 'templateInputs' | 'selectService' | 'inputs';
+
+/** Snapshot of all wizard state saved before each forward navigation step. */
+interface WizardSnapshot {
+  step: WizardStep;
+  processedTemplate: ProcessedTemplate | null;
+  pendingTemplate: Template | null;
+  templateInputOptions: Option[];
+  templateInputValues: Record<string, any>;
+  selectedServices: string[];
+  inputValues: Record<string, string>;
+}
+
 export interface ConfigTemplatesModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -144,9 +158,7 @@ export function ConfigTemplatesModal({
   // Template loading state
   const [processedTemplate, setProcessedTemplate] =
     useState<ProcessedTemplate | null>(null);
-  const [currentStep, setCurrentStep] = useState<
-    'browse' | 'templateInputs' | 'selectService' | 'inputs'
-  >('browse');
+  const [currentStep, setCurrentStep] = useState<WizardStep>('browse');
   const [selectedServices, setSelectedServices] = useState<string[]>([]);
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const [pendingTemplate, setPendingTemplate] = useState<Template | null>(null);
@@ -156,6 +168,8 @@ export function ConfigTemplatesModal({
   const [templateInputValues, setTemplateInputValues] = useState<
     Record<string, any>
   >({});
+  /** Navigation history — each forward step pushes a snapshot so Back can restore it exactly. */
+  const [wizardHistory, setWizardHistory] = useState<WizardSnapshot[]>([]);
   const [selectedPendingTemplateIndex, setSelectedPendingTemplateIndex] =
     useState<number | null>(null);
   const deepLinkFetchedRef = React.useRef<string | null>(null);
@@ -503,9 +517,10 @@ export function ConfigTemplatesModal({
     }
 
     // Check if addons exist on instance
-    if (template.config.presets) {
+    const presetsArray = asConfigArray(template.config.presets);
+    if (presetsArray.length > 0) {
       const presetsToRemove: string[] = [];
-      template.config.presets.forEach((preset: any) => {
+      presetsArray.forEach((preset: any) => {
         const presetMeta = statusData.settings?.presets?.find(
           (p) => p.ID === preset.type
         );
@@ -516,30 +531,38 @@ export function ConfigTemplatesModal({
           presetsToRemove.push(preset.type);
         }
       });
-      template.config.presets = template.config.presets.filter(
-        (p: any) => !presetsToRemove.includes(p.type)
-      );
+      // Only mutate if presets is a plain array, not a conditional directive
+      if (
+        Array.isArray(template.config.presets) &&
+        presetsToRemove.length > 0
+      ) {
+        template.config.presets = template.config.presets.filter(
+          (p: any) => !presetsToRemove.includes(p.type)
+        );
+      }
     }
 
     // Check if services exist on instance
     const availableServices = Object.keys(statusData.settings?.services || {});
-    if (template.config.services) {
-      template.config.services.forEach((service: any) => {
-        if (!availableServices.includes(service.id)) {
-          warnings.push(
-            `Service "${service.id}" not available on this instance`
-          );
-        }
-      });
-    }
+    asConfigArray(template.config.services).forEach((service: any) => {
+      if (!availableServices.includes(service.id)) {
+        warnings.push(`Service "${service.id}" not available on this instance`);
+      }
+    });
 
     // Check regex patterns against allowed patterns
-    const excludedRegexes = template.config.excludedRegexPatterns || [];
-    const includedRegexes = template.config.includedRegexPatterns || [];
-    const requiredRegexes = template.config.requiredRegexPatterns || [];
-    const preferredRegexes = (template.config.preferredRegexPatterns || []).map(
-      (r: any) => (typeof r === 'string' ? r : r.pattern)
+    const excludedRegexes = asConfigArray(
+      template.config.excludedRegexPatterns
     );
+    const includedRegexes = asConfigArray(
+      template.config.includedRegexPatterns
+    );
+    const requiredRegexes = asConfigArray(
+      template.config.requiredRegexPatterns
+    );
+    const preferredRegexes = asConfigArray(
+      template.config.preferredRegexPatterns
+    ).map((r: any) => (typeof r === 'string' ? r : r.pattern));
 
     const allRegexes = [
       ...excludedRegexes,
@@ -1119,64 +1142,70 @@ export function ConfigTemplatesModal({
     });
 
     // Parse preset options
-    template.config?.presets?.forEach((preset: any, presetIndex: number) => {
-      const presetMeta = status?.settings?.presets?.find(
-        (p: any) => p.ID === preset.type
-      );
+    asConfigArray(template.config?.presets).forEach(
+      (preset: any, presetIndex: number) => {
+        const presetMeta = status?.settings?.presets?.find(
+          (p: any) => p.ID === preset.type
+        );
 
-      if (!presetMeta) return;
+        if (!presetMeta) return;
 
-      // Check all string/password options
-      presetMeta.OPTIONS?.forEach((option: any) => {
-        if (option.type === 'string' || option.type === 'password') {
-          const currentValue = preset.options?.[option.id];
-          const placeholder = parsePlaceholder(currentValue);
+        // Check all string/password options
+        presetMeta.OPTIONS?.forEach((option: any) => {
+          if (option.type === 'string' || option.type === 'password') {
+            const currentValue = preset.options?.[option.id];
+            const placeholder = parsePlaceholder(currentValue);
 
-          if (placeholder.isPlaceholder || (option.required && !currentValue)) {
-            if (option.id === 'debridioApiKey') {
-              const debridioApiKeyInput = inputs.find(
-                (input) => input.key === 'debridioApiKey'
-              );
-              if (debridioApiKeyInput) {
-                if (Array.isArray(debridioApiKeyInput.path)) {
-                  debridioApiKeyInput.path.push(
-                    `presets.${presetIndex}.options.${option.id}`
-                  );
+            if (
+              placeholder.isPlaceholder ||
+              (option.required && !currentValue)
+            ) {
+              if (option.id === 'debridioApiKey') {
+                const debridioApiKeyInput = inputs.find(
+                  (input) => input.key === 'debridioApiKey'
+                );
+                if (debridioApiKeyInput) {
+                  if (Array.isArray(debridioApiKeyInput.path)) {
+                    debridioApiKeyInput.path.push(
+                      `presets.${presetIndex}.options.${option.id}`
+                    );
+                  } else {
+                    debridioApiKeyInput.path = [
+                      debridioApiKeyInput.path,
+                      `presets.${presetIndex}.options.${option.id}`,
+                    ];
+                  }
                 } else {
-                  debridioApiKeyInput.path = [
-                    debridioApiKeyInput.path,
-                    `presets.${presetIndex}.options.${option.id}`,
-                  ];
+                  inputs.push({
+                    key: 'debridioApiKey',
+                    path: `presets.${presetIndex}.options.${option.id}`,
+                    label: 'Debridio API Key',
+                    description: option.description,
+                    type: 'password',
+                    required: true,
+                    value:
+                      userData?.presets?.[presetIndex]?.options?.[option.id] ||
+                      '',
+                  });
                 }
               } else {
                 inputs.push({
-                  key: 'debridioApiKey',
+                  key: `preset_${preset.instanceId}_${option.id}`,
                   path: `presets.${presetIndex}.options.${option.id}`,
-                  label: 'Debridio API Key',
+                  label: `${preset.options?.name || preset.type} - ${option.name || option.id}`,
                   description: option.description,
-                  type: 'password',
-                  required: true,
+                  type: option.type === 'password' ? 'password' : 'string',
+                  required: placeholder.required || option.required || false,
                   value:
                     userData?.presets?.[presetIndex]?.options?.[option.id] ||
                     '',
                 });
               }
-            } else {
-              inputs.push({
-                key: `preset_${preset.instanceId}_${option.id}`,
-                path: `presets.${presetIndex}.options.${option.id}`,
-                label: `${preset.options?.name || preset.type} - ${option.name || option.id}`,
-                description: option.description,
-                type: option.type === 'password' ? 'password' : 'string',
-                required: placeholder.required || option.required || false,
-                value:
-                  userData?.presets?.[presetIndex]?.options?.[option.id] || '',
-              });
             }
           }
-        }
-      });
-    });
+        });
+      }
+    );
 
     return {
       template,
@@ -1222,8 +1251,31 @@ export function ConfigTemplatesModal({
     return serviceInputs;
   };
 
+  // Remove presets that are unavailable or disabled on this instance.
+  const filterUnavailablePresets = (config: any): void => {
+    if (!Array.isArray(config.presets)) return;
+    const availablePresetIds = new Set(
+      (status?.settings?.presets || [])
+        .filter((p: any) => !p.DISABLED?.disabled)
+        .map((p: any) => p.ID as string)
+    );
+    const removed = config.presets.filter(
+      (preset: any) => !availablePresetIds.has(preset.type)
+    );
+    if (removed.length > 0) {
+      toast.warning(
+        `Removed ${removed.length} preset${removed.length !== 1 ? 's' : ''} not available on this instance: ${removed.map((p: any) => p.type).join(', ')}`,
+        { duration: 5000 }
+      );
+      config.presets = config.presets.filter((preset: any) =>
+        availablePresetIds.has(preset.type)
+      );
+    }
+  };
+
   // Shared logic: process a (possibly conditionals-applied) template and navigate
   const proceedWithTemplate = (template: Template) => {
+    filterUnavailablePresets(template.config);
     const processed = processTemplate(template);
     setProcessedTemplate(processed);
 
@@ -1270,6 +1322,7 @@ export function ConfigTemplatesModal({
         }
       );
     }
+    pushHistory();
 
     const options: Option[] = template.metadata.inputs || [];
     if (options.length > 0) {
@@ -1316,6 +1369,8 @@ export function ConfigTemplatesModal({
       return;
     }
 
+    pushHistory();
+
     // Add service inputs
     const serviceInputs = addServiceInputs(processedTemplate, selectedServices);
     const allInputs = [...serviceInputs, ...processedTemplate.inputs];
@@ -1325,7 +1380,7 @@ export function ConfigTemplatesModal({
     setProcessedTemplate((prev) => {
       if (!prev) return null;
       for (const serviceId of selectedServices) {
-        const service = prev.template.config.services?.find(
+        const service = asConfigArray(prev.template.config.services).find(
           (s: any) => s.id === serviceId
         );
         if (service) {
@@ -1357,6 +1412,8 @@ export function ConfigTemplatesModal({
       toast.error('Service selection cannot be skipped for this template');
       return;
     }
+
+    pushHistory();
 
     setSelectedServices([]);
 
@@ -1399,12 +1456,19 @@ export function ConfigTemplatesModal({
       return;
     }
 
+    // Snapshot wizard state BEFORE applying conditionals or clearing inputs,
+    // so Back restores the templateInputs step correctly.
+    pushHistory();
+
     // Apply input-based conditionals
     const resolvedConfig = applyTemplateConditionals(
       JSON.parse(JSON.stringify(pendingTemplate.config)),
       templateInputValues,
       selectedServices
     );
+
+    filterUnavailablePresets(resolvedConfig);
+
     const resolvedTemplate: Template = {
       ...pendingTemplate,
       config: resolvedConfig,
@@ -1443,30 +1507,42 @@ export function ConfigTemplatesModal({
     }
   };
 
-  const handleBackFromTemplateInputs = () => {
-    setTemplateInputOptions([]);
-    setTemplateInputValues({});
+  /**
+   * Push a deep snapshot of the current wizard state onto the history stack
+   * before every forward navigation.
+   */
+  const pushHistory = () => {
+    const snapshot: WizardSnapshot = {
+      step: currentStep,
+      processedTemplate: processedTemplate
+        ? (JSON.parse(JSON.stringify(processedTemplate)) as ProcessedTemplate)
+        : null,
+      pendingTemplate: pendingTemplate
+        ? (JSON.parse(JSON.stringify(pendingTemplate)) as Template)
+        : null,
+      templateInputOptions: JSON.parse(JSON.stringify(templateInputOptions)),
+      templateInputValues: JSON.parse(JSON.stringify(templateInputValues)),
+      selectedServices: [...selectedServices],
+      inputValues: { ...inputValues },
+    };
+    setWizardHistory((prev) => [...prev, snapshot]);
+  };
 
-    if (processedTemplate !== null) {
-      // Strip service credential inputs so they don't get added twice on re-entry.
-      setProcessedTemplate((prev) => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          inputs: prev.inputs.filter((input) =>
-            Array.isArray(input.path)
-              ? !input.path.some((p) => p.startsWith('services.'))
-              : !input.path.startsWith('services.')
-          ),
-        };
-      });
-      // Keep pendingTemplate set so service selection knows to return here
-      setCurrentStep('selectService');
-      return;
-    }
-
-    setPendingTemplate(null);
-    setCurrentStep('browse');
+  /**
+   * Go back one step by popping the last snapshot and restoring all wizard
+   * state from it.
+   */
+  const handleBack = () => {
+    if (wizardHistory.length === 0) return;
+    const snapshot = wizardHistory[wizardHistory.length - 1];
+    setWizardHistory(wizardHistory.slice(0, -1));
+    setCurrentStep(snapshot.step);
+    setProcessedTemplate(snapshot.processedTemplate);
+    setPendingTemplate(snapshot.pendingTemplate);
+    setTemplateInputOptions(snapshot.templateInputOptions);
+    setTemplateInputValues(snapshot.templateInputValues);
+    setSelectedServices(snapshot.selectedServices);
+    setInputValues(snapshot.inputValues);
   };
 
   const applyInputValue = (obj: any, path: string, value: any) => {
@@ -1598,6 +1674,7 @@ export function ConfigTemplatesModal({
       setCurrentStep('browse');
       setSelectedServices([]);
       setInputValues({});
+      setWizardHistory([]);
       if (processedTemplate?.template.metadata.setToSaveInstallMenu) {
         setSelectedMenu('save-install');
       }
@@ -1610,28 +1687,6 @@ export function ConfigTemplatesModal({
     }
   };
 
-  const handleBackFromInputs = () => {
-    if (!processedTemplate) return;
-
-    if (processedTemplate.showServiceSelection) {
-      // Go back to service selection
-      // Remove service inputs from the list
-      const nonServiceInputs = processedTemplate.inputs.filter((input) =>
-        Array.isArray(input.path)
-          ? !input.path.some((p) => p.startsWith('services.'))
-          : !input.path.startsWith('services.')
-      );
-      processedTemplate.inputs = nonServiceInputs;
-      setCurrentStep('selectService');
-    } else {
-      // Go back to browse
-      setProcessedTemplate(null);
-      setCurrentStep('browse');
-      setSelectedServices([]);
-      setInputValues({});
-    }
-  };
-
   const handleCancel = () => {
     setProcessedTemplate(null);
     setPendingTemplate(null);
@@ -1640,6 +1695,7 @@ export function ConfigTemplatesModal({
     setCurrentStep('browse');
     setSelectedServices([]);
     setInputValues({});
+    setWizardHistory([]);
     onOpenChange(false);
   };
 
@@ -1685,10 +1741,7 @@ export function ConfigTemplatesModal({
         </div>
 
         <div className="flex justify-between gap-2 pt-2 border-t border-gray-700">
-          <Button
-            intent="primary-outline"
-            onClick={handleBackFromTemplateInputs}
-          >
+          <Button intent="primary-outline" onClick={handleBack}>
             Back
           </Button>
           <Button intent="white" rounded onClick={handleTemplateInputsNext}>
@@ -1810,13 +1863,9 @@ export function ConfigTemplatesModal({
             const hasWarnings = validation && validation.warnings.length > 0;
             const hasErrors = validation && validation.errors.length > 0;
 
-            const addons = Array.from(
-              new Set<string>(
-                template.config.presets?.map(
-                  (preset: any) => preset.options?.name as string
-                )
-              )
-            );
+            const addons = asConfigArray(template.config?.presets)
+              .map((preset: any) => preset.options?.name)
+              .filter((name: any) => typeof name === 'string');
 
             return (
               <div
@@ -2088,8 +2137,8 @@ export function ConfigTemplatesModal({
         </div>
 
         <div className="flex justify-between gap-2 pt-2 border-t border-gray-700">
-          <Button intent="primary-outline" onClick={handleCancel}>
-            Cancel
+          <Button intent="primary-outline" onClick={handleBack}>
+            Back
           </Button>
           <div className="flex gap-2">
             {processedTemplate.allowSkipService && (
@@ -2165,7 +2214,7 @@ export function ConfigTemplatesModal({
         </form>
 
         <div className="flex justify-between gap-2 pt-2 border-t border-gray-700">
-          <Button intent="primary-outline" onClick={handleBackFromInputs}>
+          <Button intent="primary-outline" onClick={handleBack}>
             Back
           </Button>
           <Button

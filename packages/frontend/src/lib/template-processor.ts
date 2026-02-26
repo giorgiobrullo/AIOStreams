@@ -306,6 +306,22 @@ export function applyTemplateConditionals(
 }
 
 /**
+ * Safely extract an array from a template config field that may be either
+ * a resolved array or an unresolved template directive
+ */
+export function asConfigArray<T = any>(value: any): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    Array.isArray(value.__value)
+  ) {
+    return value.__value as T[];
+  }
+  return [];
+}
+
+/**
  * Replace all `{{services.<serviceId>.<credKey>}}` placeholders that were
  * **preserved** (not resolved) by `applyTemplateConditionals` with the actual
  * credential values from the provided lookup map.
