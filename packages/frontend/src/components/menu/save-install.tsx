@@ -448,7 +448,7 @@ function Content() {
 
             {/* <SettingsCard
               title="Install"
-              description="Choose how you want to install your personalized addon. There is no need to reinstall the addon after updating your configuration above, unless you've updated your upstream addons."
+              description="Choose how you want to install your personalized addon. If a reinstall is necessary, a pop-up will tell you - otherwise, you do not need to reinstall."
             >
               <div className="flex flex-wrap gap-3">
                 <Button
@@ -475,7 +475,7 @@ function Content() {
 
             <SettingsCard
               title="Install"
-              description="Install your addon using your preferred method. There usually isn't a need to reinstall the addon after updating your configuration above, unless you use catalogs and you've changed the order of them or the addons that provide them"
+              description="Install your addon using your preferred method. If a reinstall is necessary, a pop-up will tell you - otherwise, you do not need to reinstall."
             >
               <div className="flex justify-between items-center">
                 <Button intent="white" rounded onClick={installModal.open}>
