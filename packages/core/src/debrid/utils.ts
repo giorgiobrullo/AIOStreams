@@ -496,13 +496,23 @@ export async function selectFileInTorrentOrNZB(
           fileReport.scoreBreakdown.episodeMatchType = 'exactRelativeAbsolute';
           fileReport.scoreBreakdown.episodeScore = 400;
         } else if (matchesRelativeAbsolute && isBatchMatch) {
-          score += 100;
+          score += 300;
           fileReport.scoreBreakdown.episodeMatchType = 'batchRelativeAbsolute';
-          fileReport.scoreBreakdown.episodeScore = 100;
+          fileReport.scoreBreakdown.episodeScore = 300;
         } else if (matchesRegular && isExactMatch) {
-          score += 200;
-          fileReport.scoreBreakdown.episodeMatchType = 'exactRegular';
-          fileReport.scoreBreakdown.episodeScore = 200;
+          // If absoluteEpisode differs from episode and no absolute match was found,
+          // this file likely belongs to a different season (e.g., "- 02.mkv" matching
+          // episode 2 when we actually need absolute episode 27 for S02E02).
+          // Give a reduced score to deprioritize these ambiguous matches.
+          if (metadata.absoluteEpisode !== metadata.episode) {
+            score += 50;
+            fileReport.scoreBreakdown.episodeMatchType = 'exactRegularAmbiguous';
+            fileReport.scoreBreakdown.episodeScore = 50;
+          } else {
+            score += 300;
+            fileReport.scoreBreakdown.episodeMatchType = 'exactRegular';
+            fileReport.scoreBreakdown.episodeScore = 300;
+          }
         } else if (matchesRegular && isBatchMatch) {
           score += 75;
           fileReport.scoreBreakdown.episodeMatchType = 'batchRegular';
@@ -647,6 +657,20 @@ export async function selectFileInTorrentOrNZB(
     parsedTitle &&
     !options?.skipSeasonEpisodeCheck
   ) {
+    // If the best file has an explicit wrong season, reject it.
+    // This catches multi-season packs where no file matches the requested season.
+    if (
+      parsedFile.seasons?.length &&
+      isSeasonWrong(parsedFile, metadata)
+    ) {
+      logger.debug(
+        `Season ${metadata.season} not found in best file ${bestMatch.file.name} from ${torrentOrNZB.title}, skipping...`
+      );
+      report.skipped = true;
+      report.skipReason = `Wrong season - Expected S${metadata.season}, best file is S${parsedFile.seasons?.join(',')}`;
+      await handleReport();
+      return undefined;
+    }
     if (
       isEpisodeWrong(parsedFile, metadata) ||
       isEpisodeWrong(parsedTitle, metadata)
