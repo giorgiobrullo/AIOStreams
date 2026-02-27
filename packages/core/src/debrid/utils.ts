@@ -168,19 +168,28 @@ interface SelectionReport {
 // helpers
 export const isSeasonWrong = (
   parsed: { seasons?: number[]; episodes?: number[] },
-  metadata?: { season?: number; absoluteEpisode?: number }
+  metadata?: {
+    season?: number;
+    episode?: number;
+    absoluteEpisode?: number;
+  }
 ) => {
   if (
     parsed.seasons?.length &&
     metadata?.season &&
     !parsed.seasons.includes(metadata.season)
   ) {
-    // allow if season is "wrong" with value of 1 but absolute episode is correct
+    // Allow S01 files when they use absolute episode numbering.
+    // Only applies when the absolute episode differs from the relative episode,
+    // which proves the torrent is genuinely using absolute numbering
+    // (e.g., S01E27 for SAO S02E02 where absolute ep is 27).
     if (
       parsed.seasons.length === 1 &&
       parsed.seasons[0] === 1 &&
       parsed.episodes?.length &&
       metadata.absoluteEpisode &&
+      metadata.episode &&
+      metadata.absoluteEpisode !== metadata.episode &&
       parsed.episodes.includes(metadata.absoluteEpisode)
     ) {
       return false;
