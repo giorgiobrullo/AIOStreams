@@ -142,6 +142,16 @@ export function ConfigTemplatesModal({
   const [templateValidations, setTemplateValidations] = useState<
     Record<string, TemplateValidation>
   >({});
+  const [showValidationModal, setShowValidationModal] = useState(false);
+  const [validationModalTemplate, setValidationModalTemplate] =
+    useState<Template | null>(null);
+  const [validationModalData, setValidationModalData] =
+    useState<TemplateValidation | null>(null);
+  const [validationModalOnProceed, setValidationModalOnProceed] = useState<
+    (() => void) | null
+  >(null);
+  const [validationModalProceedLabel, setValidationModalProceedLabel] =
+    useState<string>('Proceed');
   const [showImportModal, setShowImportModal] = useState(false);
   const [importUrl, setImportUrl] = useState('');
   const [isImporting, setIsImporting] = useState(false);
@@ -168,7 +178,7 @@ export function ConfigTemplatesModal({
   const [templateInputValues, setTemplateInputValues] = useState<
     Record<string, any>
   >({});
-  /** Navigation history — each forward step pushes a snapshot so Back can restore it exactly. */
+  /** Navigation history - each forward step pushes a snapshot so Back can restore it exactly. */
   const [wizardHistory, setWizardHistory] = useState<WizardSnapshot[]>([]);
   const [selectedPendingTemplateIndex, setSelectedPendingTemplateIndex] =
     useState<number | null>(null);
@@ -600,6 +610,8 @@ export function ConfigTemplatesModal({
     const declaredInputIds = new Set(
       ((template.metadata as any).inputs ?? []).map((i: any) => i.id as string)
     );
+    // Track which declared input IDs are actually referenced in the config
+    const usedInputIds = new Set<string>();
 
     const validateExpressions = (node: any, path: string) => {
       if (!node || typeof node !== 'object') {
@@ -611,6 +623,11 @@ export function ConfigTemplatesModal({
           for (const [, ns, key] of tokens) {
             if (ns === 'inputs') {
               const topKey = key.split('.')[0];
+              usedInputIds.add(topKey);
+              // Also record compound path for sub-option tracking (e.g. "filterLimit.top1ResQual")
+              if (key.includes('.')) {
+                usedInputIds.add(key.split('.').slice(0, 2).join('.'));
+              }
               if (!declaredInputIds.has(topKey)) {
                 warnings.push(
                   `${path}: interpolation {{inputs.${key}}} references undeclared input "${topKey}"`
@@ -648,10 +665,17 @@ export function ConfigTemplatesModal({
                 errors.push(
                   `${path}.__if: unknown namespace "${ns}" - must be "inputs" or "services"`
                 );
-              } else if (ns === 'inputs' && !declaredInputIds.has(topKey)) {
-                warnings.push(
-                  `${path}.__if: references undeclared input "${topKey}"`
-                );
+              } else if (ns === 'inputs') {
+                usedInputIds.add(topKey);
+                // Also record compound path for sub-option tracking (e.g. "filterLimit.top1ResQual")
+                if (key.includes('.')) {
+                  usedInputIds.add(key.split('.').slice(0, 2).join('.'));
+                }
+                if (!declaredInputIds.has(topKey)) {
+                  warnings.push(
+                    `${path}.__if: references undeclared input "${topKey}"`
+                  );
+                }
               }
             }
           }
@@ -680,10 +704,17 @@ export function ConfigTemplatesModal({
               errors.push(
                 `${path}.__switch: unknown namespace "${ns}" - must be "inputs" or "services"`
               );
-            } else if (ns === 'inputs' && !declaredInputIds.has(topKey)) {
-              warnings.push(
-                `${path}.__switch: references undeclared input "${topKey}"`
-              );
+            } else if (ns === 'inputs') {
+              usedInputIds.add(topKey);
+              // Also record compound path for sub-option tracking (e.g. "filterLimit.top1ResQual")
+              if (key.includes('.')) {
+                usedInputIds.add(key.split('.').slice(0, 2).join('.'));
+              }
+              if (!declaredInputIds.has(topKey)) {
+                warnings.push(
+                  `${path}.__switch: references undeclared input "${topKey}"`
+                );
+              }
             }
           }
         }
@@ -705,7 +736,7 @@ export function ConfigTemplatesModal({
         validateExpressions(node.__value, `${path}.__value`);
         return;
       }
-      // __remove: true — marks key for removal, nothing to recurse into
+      // __remove: true - marks key for removal, nothing to recurse into
       if ('__remove' in node) {
         return;
       }
@@ -714,8 +745,332 @@ export function ConfigTemplatesModal({
       }
     };
 
+    const VALID_INPUT_TYPES = new Set([
+      'string',
+      'password',
+      'number',
+      'boolean',
+      'select',
+      'select-with-custom',
+      'multi-select',
+      'url',
+      'alert',
+      'socials',
+      'oauth',
+      'subsection',
+      'custom-nntp-servers',
+    ]);
+    const VALID_SOCIAL_IDS = new Set([
+      'website',
+      'github',
+      'discord',
+      'ko-fi',
+      'patreon',
+      'buymeacoffee',
+      'github-sponsors',
+      'donate',
+    ]);
+    const VALID_ALERT_INTENTS = new Set([
+      'alert',
+      'info',
+      'success',
+      'warning',
+      'info-basic',
+      'success-basic',
+      'warning-basic',
+      'alert-basic',
+    ]);
+
+    const validateInputs = (
+      inputs: any,
+      parentPath = 'metadata.inputs',
+      allIds = new Set<string>()
+    ) => {
+      if (!Array.isArray(inputs)) {
+        errors.push(`${parentPath} must be an array`);
+        return;
+      }
+      inputs.forEach((input: any, idx: number) => {
+        const basePath = `${parentPath}[${idx}]`;
+        if (typeof input !== 'object' || input === null) {
+          errors.push(`${basePath}: must be an object`);
+          return;
+        }
+
+        if (typeof input.id !== 'string' || !input.id.trim()) {
+          errors.push(`${basePath}.id: must be a non-empty string`);
+        } else if (allIds.has(input.id)) {
+          errors.push(`${basePath}.id: duplicate input id "${input.id}"`);
+        } else {
+          allIds.add(input.id);
+        }
+
+        if (!input.type || !VALID_INPUT_TYPES.has(input.type)) {
+          errors.push(
+            `${basePath}.type: "${input.type}" is not a valid input type`
+          );
+          return;
+        }
+
+        const nameAllowEmpty =
+          input.type === 'socials' || input.type === 'alert';
+        if (!nameAllowEmpty) {
+          if (typeof input.name !== 'string' || !input.name.trim()) {
+            errors.push(`${basePath}.name: must be a non-empty string`);
+          }
+        } else if (input.name !== undefined && typeof input.name !== 'string') {
+          errors.push(`${basePath}.name: must be a string`);
+        }
+
+        switch (input.type as string) {
+          case 'select':
+          case 'select-with-custom':
+          case 'multi-select': {
+            if (
+              input.default !== undefined &&
+              (input.type !== 'multi-select'
+                ? typeof input.default !== 'string' || !input.default.trim() // must be a non-empty string for single-select types
+                : typeof input.default !== 'object' || // must be an array for multi-select
+                  !Array.isArray(input.default))
+            ) {
+              errors.push(
+                `${basePath}.default: must be a ${input.type === 'multi-select' ? 'array' : 'non-empty string'}`
+              );
+            }
+            if (!Array.isArray(input.options) || input.options.length === 0) {
+              errors.push(
+                `${basePath}.options: "${input.type}" requires a non-empty options array`
+              );
+            } else {
+              const seenValues = new Set();
+              input.options.forEach((opt: any, oidx: number) => {
+                const oPath = `${basePath}.options[${oidx}]`;
+                if (typeof opt !== 'object' || opt === null) {
+                  errors.push(
+                    `${oPath}: must be an object with "label" and "value"`
+                  );
+                  return;
+                }
+                if (typeof opt.label !== 'string' || !opt.label.trim()) {
+                  errors.push(`${oPath}.label: must be a non-empty string`);
+                }
+                if (
+                  opt.value === undefined ||
+                  opt.value === null ||
+                  opt.value === '' ||
+                  typeof opt.value !== 'string'
+                ) {
+                  errors.push(`${oPath}.value: must be a non-empty string`);
+                } else if (seenValues.has(opt.value)) {
+                  warnings.push(
+                    `${oPath}.value: duplicate option value "${opt.value}"`
+                  );
+                } else {
+                  seenValues.add(opt.value);
+                }
+              });
+            }
+            break;
+          }
+          case 'socials': {
+            if (!Array.isArray(input.socials) || input.socials.length === 0) {
+              errors.push(
+                `${basePath}.socials: "socials" type requires a non-empty socials array`
+              );
+            } else {
+              input.socials.forEach((social: any, sidx: number) => {
+                const sPath = `${basePath}.socials[${sidx}]`;
+                if (!VALID_SOCIAL_IDS.has(social.id)) {
+                  errors.push(
+                    `${sPath}.id: "${social.id}" is not a valid social id`
+                  );
+                }
+                if (typeof social.url !== 'string' || !social.url.trim()) {
+                  errors.push(`${sPath}.url: must be a non-empty string`);
+                } else {
+                  try {
+                    new URL(social.url);
+                  } catch {
+                    errors.push(
+                      `${sPath}.url: "${social.url}" is not a valid URL`
+                    );
+                  }
+                }
+              });
+            }
+            break;
+          }
+          case 'alert': {
+            if (input.intent && !VALID_ALERT_INTENTS.has(input.intent)) {
+              warnings.push(
+                `${basePath}.intent: "${input.intent}" is not a recognised alert intent`
+              );
+            }
+            break;
+          }
+          case 'oauth': {
+            if (!input.oauth || typeof input.oauth !== 'object') {
+              errors.push(
+                `${basePath}.oauth: "oauth" type requires an oauth config object`
+              );
+            } else {
+              if (
+                typeof input.oauth.authorisationUrl !== 'string' ||
+                !input.oauth.authorisationUrl.trim()
+              ) {
+                errors.push(
+                  `${basePath}.oauth.authorisationUrl: must be a non-empty string`
+                );
+              } else {
+                try {
+                  new URL(input.oauth.authorisationUrl);
+                } catch {
+                  errors.push(
+                    `${basePath}.oauth.authorisationUrl: not a valid URL`
+                  );
+                }
+              }
+              if (
+                !input.oauth.oauthResultField ||
+                typeof input.oauth.oauthResultField !== 'object'
+              ) {
+                errors.push(
+                  `${basePath}.oauth.oauthResultField: must be an object`
+                );
+              } else {
+                if (
+                  typeof input.oauth.oauthResultField.name !== 'string' ||
+                  !input.oauth.oauthResultField.name.trim()
+                ) {
+                  errors.push(
+                    `${basePath}.oauth.oauthResultField.name: must be a non-empty string`
+                  );
+                }
+                if (
+                  typeof input.oauth.oauthResultField.description !==
+                    'string' ||
+                  !input.oauth.oauthResultField.description.trim()
+                ) {
+                  errors.push(
+                    `${basePath}.oauth.oauthResultField.description: must be a non-empty string`
+                  );
+                }
+              }
+            }
+            break;
+          }
+          case 'subsection': {
+            if (!Array.isArray(input.subOptions)) {
+              errors.push(
+                `${basePath}.subOptions: "subsection" type requires a subOptions array`
+              );
+            } else {
+              validateInputs(
+                input.subOptions,
+                `${basePath}.subOptions`,
+                new Set<string>()
+              );
+            }
+            break;
+          }
+          case 'string':
+          case 'password':
+          case 'url': {
+            if (
+              input.default !== undefined &&
+              (typeof input.default !== 'string' || !input.default.trim())
+            ) {
+              errors.push(
+                `${basePath}.default: must be a non-empty string for "${input.type}" type`
+              );
+            }
+            break;
+          }
+          case 'number': {
+            if (
+              input.default !== undefined &&
+              typeof input.default !== 'number'
+            ) {
+              warnings.push(
+                `${basePath}.default: expected a number for "number" type, got ${typeof input.default}`
+              );
+            }
+            if (input.constraints) {
+              const { min, max } = input.constraints;
+              if (min !== undefined && typeof min !== 'number') {
+                errors.push(`${basePath}.constraints.min: must be a number`);
+              }
+              if (max !== undefined && typeof max !== 'number') {
+                errors.push(`${basePath}.constraints.max: must be a number`);
+              }
+              if (
+                typeof min === 'number' &&
+                typeof max === 'number' &&
+                min > max
+              ) {
+                errors.push(
+                  `${basePath}.constraints: min (${min}) cannot exceed max (${max})`
+                );
+              }
+            }
+            break;
+          }
+        }
+
+        if (
+          input.forced !== undefined &&
+          input.forced !== null &&
+          input.required === true
+        ) {
+          warnings.push(
+            `${basePath}: both "forced" and "required" are set - "required" has no effect when a value is forced`
+          );
+        }
+      });
+    };
+
     if (template.config) {
       validateExpressions(template.config, 'config');
+    }
+
+    if (template.metadata.inputs) {
+      validateInputs(template.metadata.inputs);
+    }
+
+    // Warn about inputs declared but never referenced in config.
+    const UNREFERENCED_EXEMPT_TYPES = new Set([
+      'alert',
+      'socials',
+      'subsection',
+      'custom-nntp-servers',
+    ]);
+    if (template.metadata.inputs) {
+      (template.metadata.inputs as any[]).forEach((input: any) => {
+        if (
+          input.id &&
+          typeof input.type === 'string' &&
+          !UNREFERENCED_EXEMPT_TYPES.has(input.type) &&
+          !usedInputIds.has(input.id)
+        ) {
+          warnings.push(
+            `metadata.inputs: "${input.id}" (${input.type}) is declared but never referenced in config`
+          );
+        }
+        if (input.type === 'subsection' && Array.isArray(input.subOptions)) {
+          (input.subOptions as any[]).forEach((sub: any) => {
+            if (
+              sub.id &&
+              typeof sub.type === 'string' &&
+              !UNREFERENCED_EXEMPT_TYPES.has(sub.type) &&
+              !usedInputIds.has(`${input.id}.${sub.id}`)
+            ) {
+              warnings.push(
+                `metadata.inputs: "${input.id}.${sub.id}" (${sub.type}) is declared but never referenced in config`
+              );
+            }
+          });
+        }
+      });
     }
 
     const isValid = errors.length === 0;
@@ -758,7 +1113,7 @@ export function ConfigTemplatesModal({
       const templateData = isArray ? data : [data];
 
       const importedTemplates: Template[] = [];
-      // const protectedTemplateIds: string[] = [];
+      const allImportWarnings: string[] = [];
 
       for (const item of templateData) {
         // Validate it has config field
@@ -819,9 +1174,14 @@ export function ConfigTemplatesModal({
           const validation = validateTemplate(importedTemplate, status);
 
           if (validation.errors.length > 0) {
-            toast.error(
-              `Cannot import template "${importedTemplate.metadata.name}": ${validation.errors.join(', ')}`
-            );
+            // Show the validation modal and abort the import
+            setShowImportModal(false);
+            setImportUrl('');
+            setValidationModalTemplate(importedTemplate);
+            setValidationModalData(validation);
+            setValidationModalOnProceed(null);
+            setValidationModalProceedLabel('Import Anyway');
+            setShowValidationModal(true);
             return;
           }
 
@@ -829,20 +1189,21 @@ export function ConfigTemplatesModal({
             ...prev,
             [importedTemplate.metadata.id]: validation,
           }));
+
+          if (validation.warnings.length > 0) {
+            const prefix =
+              templateData.length > 1
+                ? `[${importedTemplate.metadata.name}] `
+                : '';
+            allImportWarnings.push(
+              ...validation.warnings.map((w) => `${prefix}${w}`)
+            );
+          }
         }
 
         importedTemplates.push(importedTemplate);
       }
 
-      // Show error if any templates were blocked
-      // if (protectedTemplateIds.length > 0) {
-      //   toast.error(
-      //     `Cannot overwrite built-in or custom templates: ${protectedTemplateIds.join(', ')}`
-      //   );
-      //   if (importedTemplates.length === 0) {
-      //     return; // No templates to import
-      //   }
-      // }
       if (importedTemplates.length === 0) {
         toast.info(
           'There were no templates to import as existing templates are newer or the same version.'
@@ -850,7 +1211,25 @@ export function ConfigTemplatesModal({
         return;
       }
 
-      // Close import modal and show confirmation modal
+      if (allImportWarnings.length > 0) {
+        const syntheticValidation: TemplateValidation = {
+          isValid: true,
+          errors: [],
+          warnings: allImportWarnings,
+        };
+        setShowImportModal(false);
+        setImportUrl('');
+        setValidationModalTemplate(importedTemplates[0]);
+        setValidationModalData(syntheticValidation);
+        setValidationModalProceedLabel('Import Anyway');
+        setValidationModalOnProceed(() => () => {
+          setPendingImportTemplates(importedTemplates);
+          setShowImportConfirmModal(true);
+        });
+        setShowValidationModal(true);
+        return;
+      }
+
       setShowImportModal(false);
       setImportUrl('');
       setPendingImportTemplates(importedTemplates);
@@ -1306,22 +1685,7 @@ export function ConfigTemplatesModal({
     }
   };
 
-  const handleLoadTemplate = (template: Template) => {
-    // Show validation warnings if any
-    const validation = templateValidations[template.metadata.id];
-    if (validation && validation.errors.length > 0) {
-      toast.error(`Cannot load template: ${validation.errors.join(', ')}`);
-      return;
-    }
-
-    if (validation && validation.warnings.length > 0) {
-      toast.warning(
-        `Template has warnings: ${validation.warnings.slice(0, 2).join(', ')}${validation.warnings.length > 2 ? '...' : ''}`,
-        {
-          duration: 5000,
-        }
-      );
-    }
+  const executeLoadTemplate = (template: Template) => {
     pushHistory();
 
     const options: Option[] = template.metadata.inputs || [];
@@ -1358,6 +1722,26 @@ export function ConfigTemplatesModal({
     }
 
     proceedWithTemplate(template);
+  };
+
+  const handleLoadTemplate = (template: Template) => {
+    const validation = templateValidations[template.metadata.id];
+    if (
+      validation &&
+      (validation.errors.length > 0 || validation.warnings.length > 0)
+    ) {
+      setValidationModalTemplate(template);
+      setValidationModalData(validation);
+      setValidationModalProceedLabel('Load Anyway');
+      setValidationModalOnProceed(
+        validation.errors.length === 0
+          ? () => () => executeLoadTemplate(template)
+          : null
+      );
+      setShowValidationModal(true);
+      return;
+    }
+    executeLoadTemplate(template);
   };
 
   const handleServiceSelectionNext = () => {
@@ -1729,6 +2113,7 @@ export function ConfigTemplatesModal({
                 key={opt.id}
                 option={opt}
                 value={templateInputValues[opt.id] ?? opt.default}
+                trusted={pendingTemplate?.metadata?.source !== 'external'}
                 onChange={(v) =>
                   setTemplateInputValues((prev) => ({
                     ...prev,
@@ -2502,6 +2887,109 @@ export function ConfigTemplatesModal({
           </div>
         </div>
       </Modal>
+
+      {validationModalData && validationModalTemplate && (
+        <Modal
+          open={showValidationModal}
+          onOpenChange={(o) => {
+            if (!o) {
+              setShowValidationModal(false);
+              setValidationModalTemplate(null);
+              setValidationModalData(null);
+              setValidationModalOnProceed(null);
+            }
+          }}
+          title={
+            validationModalData.errors.length > 0
+              ? `Template Errors - ${validationModalTemplate.metadata.name}`
+              : `Template Warnings - ${validationModalTemplate.metadata.name}`
+          }
+          contentClass="max-w-2xl"
+        >
+          <div className="space-y-4">
+            <div className="space-y-4 overflow-y-auto max-h-[60vh] pr-1">
+              {validationModalData.errors.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <AlertTriangleIcon className="w-4 h-4 text-red-400 flex-shrink-0" />
+                    <span className="text-sm font-semibold text-red-400">
+                      {validationModalData.errors.length} error
+                      {validationModalData.errors.length !== 1 ? 's' : ''} -
+                      template cannot be loaded
+                    </span>
+                  </div>
+                  <ul className="space-y-1.5">
+                    {validationModalData.errors.map((err, idx) => (
+                      <li
+                        key={idx}
+                        className="text-xs text-red-300 bg-red-950/40 border border-red-900/50 rounded px-3 py-2 break-words font-mono"
+                      >
+                        {err}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {validationModalData.warnings.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <AlertTriangleIcon className="w-4 h-4 text-yellow-400 flex-shrink-0" />
+                    <span className="text-sm font-semibold text-yellow-400">
+                      {validationModalData.warnings.length} warning
+                      {validationModalData.warnings.length !== 1 ? 's' : ''}
+                      {validationModalData.errors.length === 0
+                        ? ' - you may still proceed'
+                        : ''}
+                    </span>
+                  </div>
+                  <ul className="space-y-1.5">
+                    {validationModalData.warnings.map((warn, idx) => (
+                      <li
+                        key={idx}
+                        className="text-xs text-yellow-300 bg-yellow-950/40 border border-yellow-900/50 rounded px-3 py-2 break-words font-mono"
+                      >
+                        {warn}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-gray-700">
+              <Button
+                intent="primary-outline"
+                onClick={() => {
+                  setShowValidationModal(false);
+                  setValidationModalTemplate(null);
+                  setValidationModalData(null);
+                  setValidationModalOnProceed(null);
+                }}
+              >
+                {validationModalData.errors.length > 0 ? 'Close' : 'Cancel'}
+              </Button>
+              {validationModalData.errors.length === 0 &&
+                validationModalOnProceed !== null && (
+                  <Button
+                    intent="white"
+                    rounded
+                    onClick={() => {
+                      const onProceed = validationModalOnProceed;
+                      setShowValidationModal(false);
+                      setValidationModalTemplate(null);
+                      setValidationModalData(null);
+                      setValidationModalOnProceed(null);
+                      onProceed();
+                    }}
+                  >
+                    {validationModalProceedLabel}
+                  </Button>
+                )}
+            </div>
+          </div>
+        </Modal>
+      )}
 
       {/* Delete Confirmation Dialog */}
       <ConfirmationDialog {...confirmDeleteTemplate} />
