@@ -203,6 +203,7 @@ export interface TorrentDebridService extends BaseDebridService {
   generateTorrentLink(link: string, clientIp?: string): Promise<string>;
   removeMagnet(magnetId: string): Promise<void>;
   getMagnet?(magnetId: string): Promise<DebridDownload>;
+  resolveHash?(hash: string): Promise<string>;
 }
 
 export interface UsenetDebridService extends BaseDebridService {
@@ -225,7 +226,7 @@ export interface UsenetDebridService extends BaseDebridService {
 
   // Service info
   readonly serviceName: ServiceId;
-  readonly supportsUsenet: boolean;
+  readonly supportsUsenet?: boolean;
 }
 
 export type DebridService = TorrentDebridService | UsenetDebridService;
