@@ -5,7 +5,7 @@ import {
   resolveRef,
   applyTemplateConditionals,
   resolveCredentialRefs,
-} from '../template-processor';
+} from '../templates/processors/conditionals';
 
 // ---------------------------------------------------------------------------
 // getNestedInputValue
