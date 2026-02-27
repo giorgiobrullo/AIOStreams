@@ -394,9 +394,13 @@ export async function selectFileInTorrentOrNZB(
       fileReport.scoreBreakdown.sampleTrailerPenalty = -500;
     }
 
-    if (file.name && /nc(ed|op)/i.test(file.name)) {
+    // Penalize anime OP/ED/NCOP/NCED files that get parsed as episode numbers
+    if (
+      file.name &&
+      /\b(NC)?(?:OP|ED|Opening|Ending)\d*\b/i.test(file.name)
+    ) {
       score -= 500;
-      fileReport.scoreBreakdown.ncedNcopPenalty = -500;
+      fileReport.scoreBreakdown.openingEndingPenalty = -500;
     }
 
     // Base score from video file status (highest priority)
