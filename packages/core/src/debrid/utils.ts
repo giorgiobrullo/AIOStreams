@@ -374,6 +374,10 @@ export async function selectFileInTorrentOrNZB(
     if (parsed && !isSeasonWrong(parsed, metadata)) {
       score += 500;
       fileReport.scoreBreakdown.seasonMatch = 500;
+    } else if (parsed && parsed.seasons?.length && isSeasonWrong(parsed, metadata)) {
+      // File explicitly has a different season — hard penalty
+      score -= 2000;
+      fileReport.scoreBreakdown.wrongSeasonPenalty = -2000;
     }
     if (!parsed?.seasons?.length && metadata?.season) {
       score -= 500;
