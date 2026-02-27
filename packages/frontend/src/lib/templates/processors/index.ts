@@ -1,8 +1,8 @@
 import { Template, StatusResponse } from '@aiostreams/core';
 import { toast } from 'sonner';
-import { asConfigArray } from './templateProcessor';
-import * as constants from '../../../../core/src/utils/constants';
-import { ProcessedTemplate, TemplateInput } from './types';
+import { asConfigArray } from './conditionals';
+import * as constants from '@aiostreams/core/src/utils/constants';
+import { ProcessedTemplate, TemplateInput } from '../types';
 
 /** Detect if a value is a placeholder string in the template. */
 export const parsePlaceholder = (

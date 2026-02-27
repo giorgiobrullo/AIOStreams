@@ -1,5 +1,5 @@
 import { Template, StatusResponse } from '@aiostreams/core';
-import { asConfigArray } from './templateProcessor';
+import { asConfigArray } from './processors/conditionals';
 import { TemplateSchema, TemplateValidation, formatZodError } from './types';
 
 const VALID_INPUT_TYPES = new Set([

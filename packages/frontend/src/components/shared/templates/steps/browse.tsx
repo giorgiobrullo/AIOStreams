@@ -14,7 +14,7 @@ import { Tooltip } from '../../../ui/tooltip';
 import { cn } from '../../../ui/core/styling';
 import MarkdownLite from '../../markdown-lite';
 import * as constants from '../../../../../../core/src/utils/constants';
-import { asConfigArray } from '@/lib/templates/templateProcessor';
+import { asConfigArray } from '@/lib/templates/processors/conditionals';
 import { TemplateValidation } from '@/lib/templates/types';
 
 interface TemplateBrowseStepProps {

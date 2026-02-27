@@ -6,7 +6,7 @@ import { applyMigrations, useUserData } from '@/context/userData';
 import {
   applyTemplateConditionals,
   resolveCredentialRefs,
-} from '@/lib/templates/templateProcessor';
+} from '@/lib/templates/processors/conditionals';
 import {
   WizardStep,
   WizardSnapshot,
@@ -22,7 +22,7 @@ import {
   addServiceInputs,
   filterUnavailablePresets,
   applyInputValue,
-} from '@/lib/templates/processor';
+} from '@/lib/templates/processors';
 import { UseValidationModal } from './validationModal';
 
 export interface UseTemplateWizardParams {
