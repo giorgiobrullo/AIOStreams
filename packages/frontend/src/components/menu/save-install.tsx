@@ -21,7 +21,7 @@ import { useDisclosure } from '@/hooks/disclosure';
 import { Modal } from '../ui/modal';
 import { Switch } from '../ui/switch';
 import { TemplateExportModal } from '../shared/template-export-modal';
-import { ConfigTemplatesModal } from '../shared/config-templates-modal';
+import { ConfigTemplatesModal } from '../shared/templates';
 import {
   Accordion,
   AccordionContent,

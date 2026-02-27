@@ -34,7 +34,7 @@ import { DonationModal } from '../shared/donation-modal';
 import { ModeSwitch } from '../ui/mode-switch/mode-switch';
 import { ModeSelectModal } from '../shared/mode-select-modal';
 import { ConfigModal } from '../config-modal';
-import { ConfigTemplatesModal } from '../shared/config-templates-modal';
+import { ConfigTemplatesModal } from '../shared/templates';
 import {
   ConfirmationDialog,
   useConfirmationDialog,
