@@ -146,6 +146,14 @@ export class StremThruService
     );
   }
 
+  private checkCacheDelete(hash: string): void {
+    StremThruService.checkCache
+      .delete(`${this.serviceName}:${getSimpleTextHash(hash)}`)
+      .catch((e) =>
+        logger.debug('Failed to delete check cache entry', { error: e })
+      );
+  }
+
   private async checkCacheSet(debridDownload: DebridDownload): Promise<void> {
     try {
       await StremThruService.checkCache.set(
