@@ -544,6 +544,10 @@ export const Env = cleanEnv(process.env, {
     default: undefined,
     desc: 'Custom HTML for the addon',
   }),
+  FEATURED_TEMPLATE_IDS: commaSeparated({
+    default: [],
+    desc: 'Comma-separated list of up to 2 template IDs to feature on the about page. Defaults to the first 2 available templates when unset.',
+  }),
   ALTERNATE_DESIGN: bool({
     default: false,
     desc: 'Alternate design for the frontend.',

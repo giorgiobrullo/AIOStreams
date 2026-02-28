@@ -164,6 +164,7 @@ export function ConfigTemplatesModal({
         }}
         title="Templates"
         description="Browse and load pre-configured templates for your AIOStreams setup"
+        contentClass="max-w-5xl w-full"
       >
         <div className="space-y-4 min-w-0 overflow-hidden">
           <TemplateBrowseStep
