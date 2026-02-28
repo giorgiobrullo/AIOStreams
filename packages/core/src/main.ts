@@ -42,6 +42,7 @@ import {
   StreamPrecomputer as Precomputer,
   StreamUtils,
   StreamContext,
+  populateNzbFallbacks,
 } from './streams/index.js';
 import { resolveServiceWrappedStreams } from './streams/serviceWrapper.js';
 import { getAddonName } from './utils/general.js';
@@ -240,6 +241,18 @@ export class AIOStreams {
           });
         });
       }
+    }
+
+    if (this.userData.nzbFailover?.enabled && !preCaching) {
+      await populateNzbFallbacks(
+        finalStreams,
+        this.userData.nzbFailover?.count ?? 3,
+        this.userData.uuid
+      ).catch((error) => {
+        logger.error('Error during NZB failover population:', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
     }
 
     const { filterDetails, includedDetails } =

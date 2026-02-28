@@ -60,6 +60,16 @@ export function hashNzbUrl(url: string, clean: boolean = true): string {
     .digest('hex');
 }
 
+/**
+ * Build the cache key used to store / look up NZB failover entries.
+ */
+export function buildFallbackKey(
+  uuid: string | undefined,
+  nzbUrl: string
+): string {
+  return getSimpleTextHash((uuid ?? '') + ':' + nzbUrl);
+}
+
 export const BuiltinDebridServices = z.array(
   z.object({
     id: z.enum(constants.BUILTIN_SUPPORTED_SERVICES),

@@ -372,6 +372,61 @@ function Content() {
         )}
         {mode === 'pro' && (
           <SettingsCard
+            title="NZB Failover"
+            description={
+              <div className="space-y-2">
+                <p>
+                  When a Usenet stream fails to play, AIOStreams will
+                  automatically try the next best NZB URLs from your sorted
+                  results instead of stopping at the first failure.
+                </p>
+                <Alert intent="info-basic">
+                  <p className="text-sm">
+                    Only applies to built-in Usenet addons using the StremThru
+                    Newz, NZBdav, AltMount and TorBox services. Fallback URLs
+                    are selected from the sorted stream list, so your sort
+                    settings determine which NZBs are tried first.
+                  </p>
+                </Alert>
+              </div>
+            }
+          >
+            <Switch
+              label="Enable"
+              side="right"
+              value={userData.nzbFailover?.enabled ?? false}
+              onValueChange={(value) => {
+                setUserData((prev) => ({
+                  ...prev,
+                  nzbFailover: {
+                    ...prev.nzbFailover,
+                    enabled: value,
+                  },
+                }));
+              }}
+            />
+            <NumberInput
+              label="Fallback Count"
+              help="How many fallback NZB URLs to try before giving up and showing an error."
+              min={1}
+              max={10}
+              defaultValue={3}
+              disabled={!userData.nzbFailover?.enabled}
+              value={userData.nzbFailover?.count ?? 3}
+              onValueChange={(value) => {
+                setUserData((prev) => ({
+                  ...prev,
+                  nzbFailover: {
+                    ...prev.nzbFailover,
+                    count: Math.min(10, Math.max(1, Number(value || 3))),
+                  },
+                }));
+              }}
+            />
+          </SettingsCard>
+        )}
+        {mode === 'pro' && (
+          <SettingsCard
             title="Check Library"
             description="When enabled, built-in addons and service wrapped addons will check if search results already exist in your debrid library and mark them accordingly. This applies to both torrent and usenet results."
           >

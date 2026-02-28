@@ -29,3 +29,9 @@ export {
   refreshLibraryCacheForService,
 } from './builtins/index.js';
 export { PresetManager } from './presets/index.js';
+export {
+  populateNzbFallbacks,
+  getNzbFallbacks,
+  isNzbRetryableError,
+} from './streams/nzbFailover.js';
+export type { NzbFallback } from './streams/nzbFailover.js';

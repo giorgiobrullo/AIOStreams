@@ -663,6 +663,12 @@ export const UserDataSchema = z.object({
 
   autoRemoveDownloads: z.boolean().optional(),
   checkOwned: z.boolean().optional().default(true),
+  nzbFailover: z
+    .object({
+      enabled: z.boolean().optional(),
+      count: z.number().min(1).max(10).optional(),
+    })
+    .optional(),
   serviceWrap: z
     .object({
       enabled: z.boolean().optional(),

@@ -20,3 +20,10 @@ export type { ExtendedMetadata };
 
 export { resolveServiceWrappedStreams } from './serviceWrapper.js';
 export type { ServiceWrapResult, ServiceWrapError } from './serviceWrapper.js';
+
+export {
+  populateNzbFallbacks,
+  getNzbFallbacks,
+  isNzbRetryableError,
+} from './nzbFailover.js';
+export type { NzbFallback } from './nzbFailover.js';

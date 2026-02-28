@@ -20,6 +20,9 @@ import {
   getSimpleTextHash,
   FileInfo,
   maskSensitiveInfo,
+  getNzbFallbacks,
+  isNzbRetryableError,
+  type NzbFallback,
 } from '@aiostreams/core';
 import { ZodError } from 'zod';
 import { StaticFiles } from '../../app.js';
@@ -153,22 +156,86 @@ router.get(
         req.userIp
       );
 
+      const fbk = req.query.fbk as string | undefined;
+      const nzbFallbacks: NzbFallback[] = fbk ? await getNzbFallbacks(fbk) : [];
+
+      logger.debug(`Attempting debrid resolve`, {
+        storeAuthId: storeAuth.id,
+        fallbacks: nzbFallbacks.map((fb) => fb.nzbUrl).length,
+      });
+
+      const attempts: Array<NzbFallback | null> = [null, ...nzbFallbacks];
+
       let streamUrl: string | undefined;
-      try {
-        streamUrl = await debridInterface.resolve(
-          playbackInfo,
-          filename,
-          fileInfo.cacheAndPlay ?? false,
-          fileInfo.autoRemoveDownloads
-        );
-      } catch (error: any) {
-        let staticFile: string = StaticFiles.INTERNAL_SERVER_ERROR;
-        if (error instanceof DebridError) {
-          logger.error(
-            `[${storeAuth.id}] Got Debrid error during debrid resolve: ${error.code}: ${error.message}`,
-            { ...error, stack: undefined }
+      let resolveError: Error | undefined;
+
+      for (let i = 0; i < attempts.length; i++) {
+        const attempt = attempts[i];
+        const isLastAttempt = i === attempts.length - 1;
+
+        const currentPlaybackInfo: PlaybackInfo =
+          attempt !== null && fileInfo.type === 'usenet'
+            ? {
+                ...(playbackInfo as PlaybackInfo & { type: 'usenet' }),
+                nzb: attempt.nzbUrl,
+                hash: attempt.hash,
+                serviceItemId: undefined,
+                fileIndex: undefined,
+                ...(attempt.filename !== undefined && {
+                  filename: attempt.filename,
+                  title: attempt.filename,
+                }),
+              }
+            : playbackInfo;
+
+        const currentFilename = attempt?.filename ?? filename;
+
+        try {
+          streamUrl = await debridInterface.resolve(
+            currentPlaybackInfo,
+            currentFilename,
+            fileInfo.cacheAndPlay ?? false,
+            fileInfo.autoRemoveDownloads
           );
-          switch (error.code) {
+          resolveError = undefined;
+          if (attempt !== null) {
+            logger.info(
+              `[${storeAuth.id}] NZB failover succeeded with fallback NZB`,
+              {
+                attemptIndex: i,
+                fallbackNzb: attempt.nzbUrl.substring(0, 80),
+              }
+            );
+          }
+          break;
+        } catch (error: any) {
+          resolveError = error;
+          const isRetryable =
+            error instanceof DebridError && isNzbRetryableError(error);
+
+          if (!isRetryable || isLastAttempt) {
+            // Non-retryable error, or we have exhausted all attempts.
+            break;
+          }
+
+          logger.warn(
+            `[${storeAuth.id}] NZB resolve failed, trying ${attempt === null ? `first fallback (1 of ${nzbFallbacks.length})` : `next fallback (${i + 1} of ${nzbFallbacks.length})`}`,
+            {
+              code: (error as DebridError).code,
+              message: error.message,
+            }
+          );
+        }
+      }
+
+      if (resolveError) {
+        let staticFile: string = StaticFiles.INTERNAL_SERVER_ERROR;
+        if (resolveError instanceof DebridError) {
+          logger.error(
+            `[${storeAuth.id}] Got Debrid error during debrid resolve: ${resolveError.code}: ${resolveError.message}`,
+            { ...resolveError, stack: undefined }
+          );
+          switch (resolveError.code) {
             case 'UNAVAILABLE_FOR_LEGAL_REASONS':
               staticFile = StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;
               break;
@@ -200,7 +267,7 @@ router.get(
           }
         } else {
           logger.error(
-            `[${storeAuth.id}] Got unknown error during debrid resolve: ${error.message}`
+            `[${storeAuth.id}] Got unknown error during debrid resolve: ${resolveError.message}`
           );
         }
 
