@@ -37,7 +37,8 @@ export function getNestedInputValue(
  *   inputs.<key> >= <n>                  — numeric greater-than-or-equal
  *   inputs.<key> < <n>                   — numeric less-than
  *   inputs.<key> <= <n>                  — numeric less-than-or-equal
- *   services.<serviceId>                 — service selected
+ *   services                             — any service selected (true when selectedSvcs is non-empty)
+ *   services.<serviceId>                 — specific service selected
  *
  * Compound forms (evaluated before negation; each sub-expression may carry its own `!`):
  *   <expr> and <expr> [and ...]          — all must be true (highest precedence)
@@ -52,20 +53,20 @@ export function evaluateTemplateCondition(
   const trimmed = condition.trim();
 
   // Handle compound expressions first (split by lowest-precedence operator)
-  const orParts = trimmed.split(/ or (?=!?(?:inputs|services)\.)/);
+  const orParts = trimmed.split(/ or (?=!?(?:inputs|services)\b)/);
   if (orParts.length > 1) {
     return orParts.some((p) =>
       evaluateTemplateCondition(p.trim(), inputVals, selectedSvcs)
     );
   }
-  const xorParts = trimmed.split(/ xor (?=!?(?:inputs|services)\.)/);
+  const xorParts = trimmed.split(/ xor (?=!?(?:inputs|services)\b)/);
   if (xorParts.length > 1) {
     const count = xorParts.filter((p) =>
       evaluateTemplateCondition(p.trim(), inputVals, selectedSvcs)
     ).length;
     return count % 2 === 1;
   }
-  const andParts = trimmed.split(/ and (?=!?(?:inputs|services)\.)/);
+  const andParts = trimmed.split(/ and (?=!?(?:inputs|services)\b)/);
   if (andParts.length > 1) {
     return andParts.every((p) =>
       evaluateTemplateCondition(p.trim(), inputVals, selectedSvcs)
@@ -120,9 +121,14 @@ export function evaluateTemplateCondition(
     return negated ? !result : result;
   }
 
-  // Bare truthiness form: "inputs.<key>" or "services.<key>"
+  // Bare truthiness form: "inputs.<key>", "services.<key>", or bare "services"
   const dotIdx = expr.indexOf('.');
-  if (dotIdx === -1) return negated;
+  if (dotIdx === -1) {
+    if (expr === 'services') {
+      return negated ? selectedSvcs.length === 0 : selectedSvcs.length > 0;
+    }
+    return negated;
+  }
   const ns = expr.slice(0, dotIdx);
   const key = expr.slice(dotIdx + 1);
   let result = false;
@@ -142,6 +148,7 @@ export function evaluateTemplateCondition(
 
 /**
  * Resolve an "inputs.<id>" or "services.<id>" reference to its runtime value.
+ * The bare "services" reference resolves to the full selectedSvcs array
  */
 export function resolveRef(
   ref: string,
@@ -149,6 +156,9 @@ export function resolveRef(
   selectedSvcs: string[]
 ): any {
   const trimmed = ref.trim();
+  if (trimmed === 'services') {
+    return selectedSvcs.slice();
+  }
   if (trimmed.startsWith('inputs.')) {
     return getNestedInputValue(inputVals, trimmed.slice('inputs.'.length));
   }
@@ -170,9 +180,12 @@ export function resolveRef(
  *                                 object (also works as a __switch case value)
  *   - `{{inputs.<id>}}`         — string interpolation; sole-token refs
  *                                 preserve the original type (array, number, …)
- *   - `{{services.<id>}}`       — resolves to a boolean (true if the service is
- *                                 selected); sole-token refs return the boolean
- *                                 directly, multi-token refs stringify it
+ *   - `{{services}}`            — resolves to the selected services array;
+ *                                 sole-token refs return the array directly,
+ *                                 multi-token refs join with ','
+ *   - `{{services.<id>}}`       — resolves to a boolean (true if the specific
+ *                                 service is selected); sole-token refs return
+ *                                 the boolean directly, multi-token stringify it
  *   - `{{services.<id>.<key>}}` — credential ref: intentionally **preserved as a
  *                                 literal string** so that the final value can be
  *                                 filled in by `resolveCredentialRefs()` once the
@@ -272,6 +285,7 @@ export function applyTemplateConditionals(
   // If the entire string is a single {{...}} token, return the raw value
   // (preserving arrays, numbers, booleans) instead of stringifying.
   if (typeof value === 'string') {
+    if (value === '{{services}}') return selectedSvcs.slice();
     const singleToken = value.match(/^\{\{(inputs|services)\.([^}]+)\}\}$/);
     if (singleToken) {
       const [, ns, key] = singleToken;
@@ -286,9 +300,9 @@ export function applyTemplateConditionals(
         return selectedSvcs.includes(key);
       }
     }
-    return value.replace(
-      /\{\{(inputs|services)\.([^}]+)\}\}/g,
-      (_, ns, key) => {
+    return value
+      .replace(/\{\{services\}\}/g, selectedSvcs.join(','))
+      .replace(/\{\{(inputs|services)\.([^}]+)\}\}/g, (_, ns, key) => {
         if (ns === 'inputs') {
           const v = getNestedInputValue(inputVals, key);
           return v !== undefined && v !== null ? String(v) : '';
@@ -298,8 +312,7 @@ export function applyTemplateConditionals(
           return String(selectedSvcs.includes(key));
         }
         return '';
-      }
-    );
+      });
   }
 
   return value;
