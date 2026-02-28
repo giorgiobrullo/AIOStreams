@@ -6,6 +6,7 @@ import { applyMigrations, useUserData } from '@/context/userData';
 import {
   applyTemplateConditionals,
   resolveCredentialRefs,
+  evaluateTemplateCondition,
 } from '@/lib/templates/processors/conditionals';
 import {
   WizardStep,
@@ -299,12 +300,21 @@ export function useTemplateWizard({
   const handleTemplateInputsNext = () => {
     if (!pendingTemplate) return;
 
-    const visibleOptions =
+    const visibleOptions = (
       mode === 'noob'
         ? templateInputOptions.filter(
             (opt) => opt.advanced !== true && opt.showInSimpleMode !== false
           )
-        : templateInputOptions;
+        : templateInputOptions
+    ).filter((opt) =>
+      (opt as any).__if
+        ? evaluateTemplateCondition(
+            (opt as any).__if,
+            templateInputValues,
+            selectedServices
+          )
+        : true
+    );
 
     const missingRequired = visibleOptions.filter(
       (opt) =>

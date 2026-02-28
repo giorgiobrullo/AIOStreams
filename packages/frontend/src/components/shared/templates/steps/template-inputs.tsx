@@ -5,6 +5,7 @@ import { Button } from '../../../ui/button';
 import { ModeSwitch } from '../../../ui/mode-switch/mode-switch';
 import TemplateOption from '../../template-option';
 import { Mode } from '@/context/mode';
+import { evaluateTemplateCondition } from '@/lib/templates/processors/conditionals';
 
 interface TemplateInputsStepProps {
   mode: Mode;
@@ -13,6 +14,7 @@ interface TemplateInputsStepProps {
   values: Record<string, any>;
   onValuesChange: React.Dispatch<React.SetStateAction<Record<string, any>>>;
   trusted: boolean;
+  selectedServices: string[];
   onBack: () => void;
   onNext: () => void;
 }
@@ -24,15 +26,21 @@ export function TemplateInputsStep({
   values,
   onValuesChange,
   trusted,
+  selectedServices,
   onBack,
   onNext,
 }: TemplateInputsStepProps) {
-  const visibleOptions =
+  const visibleOptions = (
     mode === 'noob'
       ? options.filter(
           (opt) => opt.advanced !== true && opt.showInSimpleMode !== false
         )
-      : options;
+      : options
+  ).filter((opt) =>
+    (opt as any).__if
+      ? evaluateTemplateCondition((opt as any).__if, values, selectedServices)
+      : true
+  );
 
   return (
     <>

@@ -206,7 +206,7 @@ const DeduplicatorOptions = z.object({
     .optional(),
 });
 
-const OptionDefinition = z.object({
+const OptionDefinition = z.looseObject({
   id: z.string().min(1),
   name: z.string().min(1),
   description: z.string().min(1),
@@ -1150,7 +1150,7 @@ export const AIOStream = StreamSchema.extend({
       indexer: z.string().optional(),
       age: z.number().or(z.string()).optional(), // Age in hours since upload
       nzbUrl: z.string().or(z.null()).optional(),
-      torrent: z  
+      torrent: z
         .object({
           infoHash: z.string().min(1).optional(),
           fileIdx: z.number().optional(),

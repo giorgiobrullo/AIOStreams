@@ -207,6 +207,7 @@ export function ConfigTemplatesModal({
             values={wizard.templateInputValues}
             onValuesChange={wizard.setTemplateInputValues}
             trusted={wizard.pendingTemplate?.metadata?.source !== 'external'}
+            selectedServices={wizard.selectedServices}
             onBack={wizard.handleBack}
             onNext={wizard.handleTemplateInputsNext}
           />
