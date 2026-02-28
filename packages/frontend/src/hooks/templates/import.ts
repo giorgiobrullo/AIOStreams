@@ -291,8 +291,8 @@ export function useTemplateImport({
     );
 
     const updatedTemplates = [
-      ...filteredLocalTemplates,
       ...pendingImportTemplates,
+      ...filteredLocalTemplates,
     ];
     saveLocalStorageTemplates(updatedTemplates);
 
@@ -300,7 +300,7 @@ export function useTemplateImport({
       const filtered = prev.filter(
         (t) => !existingTemplateIds.has(t.metadata.id)
       );
-      return [...filtered, ...pendingImportTemplates];
+      return [...pendingImportTemplates, ...filtered];
     });
 
     const overwriteCount = localTemplates.filter((t) =>
