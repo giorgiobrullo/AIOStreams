@@ -16,6 +16,7 @@ import { toast } from 'sonner';
 import { Modal } from '@/components/ui/modal';
 import { Button } from '@/components/ui/button';
 import { PasswordInput } from '@/components/ui/password-input';
+import { AddonPasswordModal } from '@/components/shared/addon-password-modal';
 import { DiffViewer } from '@/components/shared/diff-viewer';
 import { Switch } from '@/components/ui/switch';
 import { Alert } from '@/components/ui/alert';
@@ -304,7 +305,7 @@ export function SaveProvider({ children }: { children: React.ReactNode }) {
         // Check if manifest changed after save
         await checkManifestChange();
       } catch (err) {
-        if (err instanceof APIError && err.is('USER_INVALID_DETAILS')) {
+        if (err instanceof APIError && err.is('ADDON_PASSWORD_INVALID')) {
           toast.error('Your addon password is incorrect');
           setUserData((prev) => ({ ...prev, addonPassword: '' }));
           setPasswordModalOpen(true);
@@ -345,32 +346,17 @@ export function SaveProvider({ children }: { children: React.ReactNode }) {
     <SaveContext.Provider value={{ handleSave, loading }}>
       {children}
 
-      <Modal
+      <AddonPasswordModal
         open={passwordModalOpen}
         onOpenChange={setPasswordModalOpen}
-        title="Addon Password"
-        description="This instance is protected with a password. You must enter the password for this instance (NOT your user password you set earlier) to save a configuration here."
-      >
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSave({ authenticated: true });
-          }}
-        >
-          <PasswordInput
-            label="Addon Password"
-            value={userData.addonPassword}
-            required
-            placeholder="Enter the password for this instance"
-            onValueChange={(value) =>
-              setUserData((prev) => ({ ...prev, addonPassword: value }))
-            }
-          />
-          <Button type="submit" intent="white" loading={loading} rounded>
-            Save
-          </Button>
-        </form>
-      </Modal>
+        loading={loading}
+        onSubmit={() => handleSave({ authenticated: true })}
+        submitText="Save"
+        value={userData.addonPassword ?? ''}
+        onValueChange={(value) =>
+          setUserData((prev) => ({ ...prev, addonPassword: value }))
+        }
+      />
 
       <Modal
         open={diffModalOpen}

@@ -26,6 +26,7 @@ import {
   constants,
   SelAccess,
   createPosterService,
+  APIError,
 } from './index.js';
 import { z, ZodError } from 'zod';
 import {
@@ -292,9 +293,7 @@ export async function validateConfig(
     Env.ADDON_PASSWORD.length > 0 &&
     !Env.ADDON_PASSWORD.includes(config.addonPassword || '')
   ) {
-    throw new Error(
-      'Invalid addon password. Please enter the value of the ADDON_PASSWORD environment variable '
-    );
+    throw new APIError(constants.ErrorCode.ADDON_PASSWORD_INVALID);
   }
 
   validateSyncedRegexUrls(config, options?.skipErrorsFromAddonsOrProxies);

@@ -7,6 +7,7 @@ export enum ErrorCode {
   USER_INVALID_CONFIG = 'USER_INVALID_CONFIG',
   USER_NEW_PASSWORD_TOO_SHORT = 'USER_NEW_PASSWORD_TOO_SHORT',
   USER_NEW_PASSWORD_TOO_SIMPLE = 'USER_NEW_PASSWORD_TOO_SIMPLE',
+  ADDON_PASSWORD_INVALID = 'ADDON_PASSWORD_INVALID',
   // Database
   DATABASE_ERROR = 'DATABASE_ERROR',
   // Encryption
@@ -54,6 +55,10 @@ export const ErrorMap: Record<ErrorCode, ErrorDetails> = {
   [ErrorCode.USER_NEW_PASSWORD_TOO_SIMPLE]: {
     statusCode: 400,
     message: 'New password is too simple',
+  },
+  [ErrorCode.ADDON_PASSWORD_INVALID]: {
+    statusCode: 401,
+    message: 'Invalid addon password',
   },
   [ErrorCode.DATABASE_ERROR]: {
     statusCode: 500,

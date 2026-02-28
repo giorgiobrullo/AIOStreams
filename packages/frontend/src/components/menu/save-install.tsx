@@ -7,6 +7,7 @@ import {
   createUserConfig,
   deleteUserConfig,
   CreateUserResponse,
+  APIError,
 } from '@/lib/api';
 import { PageWrapper } from '@/components/shared/page-wrapper';
 import { Alert } from '@/components/ui/alert';
@@ -37,6 +38,7 @@ import {
 } from '../shared/confirmation-dialog';
 import { UserData } from '@aiostreams/core';
 import { useSave } from '@/context/save';
+import { AddonPasswordModal } from '@/components/shared/addon-password-modal';
 
 // Reusable modal option button component
 interface ModalOptionButtonProps {
@@ -111,6 +113,8 @@ function Content() {
   const [filterCredentialsInExport, setFilterCredentialsInExport] =
     React.useState(true);
   const [installProtocol, setInstallProtocol] = React.useState('stremio');
+  const [addonPasswordModalOpen, setAddonPasswordModalOpen] =
+    React.useState(false);
   const { handleSave: handleSaveContext, loading: saveLoading } = useSave();
   const confirmResetProps = useConfirmationDialog({
     title: 'Confirm Reset',
@@ -166,6 +170,11 @@ function Content() {
       setEncryptedPassword((result as CreateUserResponse).encryptedPassword);
       setPassword(newPassword);
     } catch (err) {
+      if (err instanceof APIError && err.is('ADDON_PASSWORD_INVALID')) {
+        setUserData((prev) => ({ ...prev, addonPassword: '' }));
+        setAddonPasswordModalOpen(true);
+        return;
+      }
       toast.error(
         err instanceof Error ? err.message : 'Failed to create configuration'
       );
@@ -660,6 +669,21 @@ function Content() {
         </Modal>
         <ConfirmationDialog {...confirmDelete} />
         <ConfirmationDialog {...confirmResetProps} />
+
+        <AddonPasswordModal
+          open={addonPasswordModalOpen}
+          onOpenChange={setAddonPasswordModalOpen}
+          loading={createLoading}
+          onSubmit={() => {
+            setAddonPasswordModalOpen(false);
+            handleCreate();
+          }}
+          submitText="Create"
+          value={userData.addonPassword ?? ''}
+          onValueChange={(value) =>
+            setUserData((prev) => ({ ...prev, addonPassword: value }))
+          }
+        />
 
         <Modal
           open={exportMenuModal.isOpen}
