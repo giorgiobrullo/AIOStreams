@@ -190,11 +190,13 @@ export function validateTemplate(
           const bare = subCond.trim().replace(/^!/, '').split(/\s+/)[0];
           const dotIdx = bare.indexOf('.');
           if (dotIdx === -1) {
-            errors.push(
-              `${path}.__if: "${subCond.trim()}" is not a valid condition - expected "inputs.<id>" or "services.<id>"`
-            );
+            if (bare !== 'services') {
+              errors.push(
+                `${path}.__if: "${subCond.trim()}" is not a valid condition - expected "inputs\.<id>" or "services\.<id> or "services"`
+              );
+            }
           } else {
-            const ns = bare.slice(0, dotIdx);
+            const ns = bare.slice(0, dotIdx === -1 ? undefined : dotIdx);
             const key = bare.slice(dotIdx + 1);
             const topKey = key.split('.')[0];
             if (ns !== 'inputs' && ns !== 'services') {
@@ -227,9 +229,11 @@ export function validateTemplate(
       } else {
         const dotIdx = ref.indexOf('.');
         if (dotIdx === -1) {
-          errors.push(
-            `${path}.__switch: "${ref}" is not a valid reference - expected "inputs.<id>" or "services.<id>"`
-          );
+          if (ref.trim() !== 'services') {
+            errors.push(
+              `${path}.__switch: "${ref}" is not a valid reference - expected "inputs\.<id>" or "services\.<id> or "services"`
+            );
+          }
         } else {
           const ns = ref.slice(0, dotIdx);
           const key = ref.slice(dotIdx + 1);
