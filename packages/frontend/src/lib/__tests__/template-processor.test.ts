@@ -160,6 +160,73 @@ describe('evaluateTemplateCondition — services', () => {
 });
 
 // ---------------------------------------------------------------------------
+// evaluateTemplateCondition — bare services (any service selected)
+// ---------------------------------------------------------------------------
+describe('evaluateTemplateCondition — bare services', () => {
+  it('is true when at least one service is selected', () => {
+    expect(evaluateTemplateCondition('services', {}, ['torbox'])).toBe(true);
+  });
+
+  it('is true when multiple services are selected', () => {
+    expect(
+      evaluateTemplateCondition('services', {}, ['torbox', 'realdebrid'])
+    ).toBe(true);
+  });
+
+  it('is false when no services are selected', () => {
+    expect(evaluateTemplateCondition('services', {}, [])).toBe(false);
+  });
+
+  it('negated: !services is false when services are present', () => {
+    expect(evaluateTemplateCondition('!services', {}, ['torbox'])).toBe(false);
+  });
+
+  it('negated: !services is true when no services', () => {
+    expect(evaluateTemplateCondition('!services', {}, [])).toBe(true);
+  });
+
+  it('and compound: services and inputs.flag — true only when both hold', () => {
+    expect(
+      evaluateTemplateCondition('services and inputs.flag', { flag: true }, [
+        'torbox',
+      ])
+    ).toBe(true);
+    expect(
+      evaluateTemplateCondition('services and inputs.flag', { flag: true }, [])
+    ).toBe(false);
+    expect(
+      evaluateTemplateCondition('services and inputs.flag', { flag: false }, [
+        'torbox',
+      ])
+    ).toBe(false);
+  });
+
+  it('and compound — trailing: inputs.flag and services', () => {
+    expect(
+      evaluateTemplateCondition('inputs.flag and services', { flag: true }, [
+        'torbox',
+      ])
+    ).toBe(true);
+    expect(
+      evaluateTemplateCondition('inputs.flag and services', { flag: true }, [])
+    ).toBe(false);
+  });
+
+  it('or compound — trailing: inputs.flag or services', () => {
+    // flag false, no services → false
+    expect(
+      evaluateTemplateCondition('inputs.flag or services', { flag: false }, [])
+    ).toBe(false);
+    // flag false, services present → true
+    expect(
+      evaluateTemplateCondition('inputs.flag or services', { flag: false }, [
+        'torbox',
+      ])
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // evaluateTemplateCondition — == operator
 // ---------------------------------------------------------------------------
 describe('evaluateTemplateCondition — == operator', () => {
@@ -321,6 +388,18 @@ describe('resolveRef', () => {
 
   it('returns undefined for unknown namespace', () => {
     expect(resolveRef('unknown.thing', {}, [])).toBeUndefined();
+  });
+
+  it('bare services: resolves to the selected services array when services present', () => {
+    expect(resolveRef('services', {}, ['torbox'])).toEqual(['torbox']);
+    expect(resolveRef('services', {}, ['torbox', 'realdebrid'])).toEqual([
+      'torbox',
+      'realdebrid',
+    ]);
+  });
+
+  it('bare services: resolves to an empty array when no services selected', () => {
+    expect(resolveRef('services', {}, [])).toEqual([]);
   });
 });
 
@@ -635,6 +714,34 @@ describe('applyTemplateConditionals — __switch', () => {
     expect(result).toEqual({ id: 'tb-addon' });
   });
 
+  it('resolves __switch for bare services ref: falls to default when no services (empty array key)', () => {
+    // String([]) == "" — not found in cases → uses default
+    const result = applyTemplateConditionals(
+      {
+        __switch: 'services',
+        cases: { '': { mode: 'p2p' } },
+        default: { mode: 'debrid' },
+      },
+      {},
+      []
+    );
+    expect(result).toEqual({ mode: 'p2p' });
+  });
+
+  it('resolves __switch for bare services ref: default used when services present (no matching case)', () => {
+    // String(["torbox"]) == "torbox" — not in cases → uses default
+    const result = applyTemplateConditionals(
+      {
+        __switch: 'services',
+        cases: { '': { mode: 'p2p' } },
+        default: { mode: 'debrid' },
+      },
+      {},
+      ['torbox']
+    );
+    expect(result).toEqual({ mode: 'debrid' });
+  });
+
   it('stringifies number input for case matching', () => {
     const result = applyTemplateConditionals(
       {
@@ -654,6 +761,25 @@ describe('applyTemplateConditionals — __switch', () => {
 // ---------------------------------------------------------------------------
 describe('applyTemplateConditionals — interpolation', () => {
   const noSvcs: string[] = [];
+
+  it('{{services}} sole token: returns selected services array when services present', () => {
+    expect(applyTemplateConditionals('{{services}}', {}, ['torbox'])).toEqual([
+      'torbox',
+    ]);
+  });
+
+  it('{{services}} sole token: returns empty array when no services', () => {
+    expect(applyTemplateConditionals('{{services}}', {}, [])).toEqual([]);
+  });
+
+  it('{{services}} multi-token: stringifies as comma-joined IDs', () => {
+    expect(applyTemplateConditionals('mode={{services}}', {}, ['torbox'])).toBe(
+      'mode=torbox'
+    );
+    expect(applyTemplateConditionals('mode={{services}}', {}, [])).toBe(
+      'mode='
+    );
+  });
 
   it('sole token: preserves a string value', () => {
     expect(
