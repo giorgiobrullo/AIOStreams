@@ -84,7 +84,9 @@ export interface ParseValue {
     encode: string | null;
     audioChannels: string[] | null;
     edition: string | null;
-    remastered: boolean;
+    editions: string[] | null;
+    remastered: null;
+    regraded: boolean;
     repack: boolean;
     uncensored: boolean;
     unrated: boolean;
@@ -426,8 +428,10 @@ export abstract class BaseFormatter {
         ageHours: stream.age || null,
         message: stream.message || null,
         proxied: stream.proxied ?? false,
-        edition: stream.parsedFile?.edition || null,
-        remastered: stream.parsedFile?.remastered ?? false,
+        edition: stream.parsedFile?.editions?.[0] || null,
+        editions: stream.parsedFile?.editions || null,
+        regraded: stream.parsedFile?.regraded ?? false,
+        remastered: null,
         repack: stream.parsedFile?.repack ?? false,
         uncensored: stream.parsedFile?.uncensored ?? false,
         unrated: stream.parsedFile?.unrated ?? false,
@@ -894,7 +898,7 @@ export abstract class BaseFormatter {
           // Extract the content from remove(['"]...['"])
           const content = _mod.substring(8, _mod.length - 2);
 
-          if (content) return variable.replaceAll(content,'');
+          if (content) return variable.replaceAll(content, '');
         }
         case mod.startsWith('truncate(') && mod.endsWith(')'): {
           // Extract N from truncate(N)
