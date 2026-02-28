@@ -13,6 +13,7 @@ import {
   WizardSnapshot,
   ProcessedTemplate,
   TemplateValidation,
+  TemplateInput,
 } from '@/lib/templates/types';
 import {
   getLocalStorageTemplateInputs,
@@ -131,6 +132,96 @@ export function useTemplateWizard({
     setInputValues(snapshot.inputValues);
   };
 
+  /**
+   * Migrates config, stamps in input values, filters services,
+   * resolves credential refs, merges into userData, then resets wizard state.
+   */
+  const applyTemplate = async ({
+    config,
+    inputs,
+    resolvedValues,
+    selectedSvcs,
+    templateName,
+    setToSaveInstallMenu,
+  }: {
+    config: any;
+    inputs: TemplateInput[];
+    resolvedValues: Record<string, string>;
+    selectedSvcs: string[];
+    templateName: string;
+    setToSaveInstallMenu?: boolean;
+  }) => {
+    setIsLoading(true);
+    try {
+      const migratedData = applyMigrations(JSON.parse(JSON.stringify(config)));
+
+      inputs.forEach((input) => {
+        const value = resolvedValues[input.key];
+        if (value || !input.required) {
+          const paths = Array.isArray(input.path) ? input.path : [input.path];
+          for (const path of paths) {
+            if (path.startsWith('services.')) {
+              const pathParts = path.split('.');
+              const serviceId = pathParts[1] as any;
+              const credKey = pathParts[2];
+              if (!migratedData.services) migratedData.services = [];
+              let service = migratedData.services.find(
+                (s: any) => s.id === serviceId
+              );
+              if (!service) {
+                service = { id: serviceId, enabled: true, credentials: {} };
+                migratedData.services.push(service);
+              }
+              if (!service.credentials) service.credentials = {};
+              service.credentials[credKey] = value || '';
+            } else {
+              applyInputValue(migratedData, path, value || '');
+            }
+          }
+        }
+      });
+
+      if (selectedSvcs.length > 0 && migratedData.services) {
+        migratedData.services = migratedData.services.filter((s: any) =>
+          selectedSvcs.includes(s.id)
+        );
+      }
+
+      resolveCredentialRefs(migratedData, resolvedValues);
+      setUserData((prev: any) => ({ ...prev, ...migratedData }));
+
+      const addonsNeedingSetup = (migratedData.presets || [])
+        .filter((preset: any) =>
+          ['gdrive'].some((type) => preset.type.toLowerCase().includes(type))
+        )
+        .map((preset: any) => preset.options?.name || preset.type);
+
+      toast.success(`Template "${templateName}" loaded successfully`);
+
+      if (addonsNeedingSetup.length > 0) {
+        setTimeout(() => {
+          toast.info(
+            `Note: ${addonsNeedingSetup.join(', ')} require additional setup. Please configure them in the Addons section.`,
+            { duration: 8000 }
+          );
+        }, 1000);
+      }
+
+      setProcessedTemplate(null);
+      setCurrentStep('browse');
+      setSelectedServices([]);
+      setInputValues({});
+      setWizardHistory([]);
+      if (setToSaveInstallMenu) setSelectedMenu('save-install');
+      onOpenChange(false);
+    } catch (err) {
+      console.error('Error loading template:', err);
+      toast.error('Failed to load template');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   /** Process template, navigate to the appropriate step. */
   const proceedWithTemplate = (template: Template) => {
     filterUnavailablePresets(template.config, status);
@@ -148,6 +239,20 @@ export function useTemplateWizard({
         processed.inputs = [...serviceInputs, ...processed.inputs];
         setSelectedServices(processed.services);
       }
+
+      if (processed.inputs.length === 0) {
+        applyTemplate({
+          config: template.config,
+          inputs: [],
+          resolvedValues: {},
+          selectedSvcs:
+            processed.services.length === 1 ? processed.services : [],
+          templateName: template.metadata.name,
+          setToSaveInstallMenu: template.metadata.setToSaveInstallMenu,
+        });
+        return;
+      }
+
       setInputValues(
         processed.inputs.reduce(
           (acc, input) => ({ ...acc, [input.key]: input.value }),
@@ -159,6 +264,17 @@ export function useTemplateWizard({
       setSelectedServices([]);
       setCurrentStep('selectService');
     } else {
+      if (processed.inputs.length === 0) {
+        applyTemplate({
+          config: template.config,
+          inputs: [],
+          resolvedValues: {},
+          selectedSvcs: [],
+          templateName: template.metadata.name,
+          setToSaveInstallMenu: template.metadata.setToSaveInstallMenu,
+        });
+        return;
+      }
       setInputValues(
         processed.inputs.reduce(
           (acc, input) => ({ ...acc, [input.key]: input.value }),
@@ -392,93 +508,15 @@ export function useTemplateWizard({
       return;
     }
 
-    setIsLoading(true);
-    try {
-      const migratedData = applyMigrations(
-        JSON.parse(JSON.stringify(processedTemplate.template.config))
-      );
-
-      processedTemplate.inputs.forEach((input) => {
-        const value = inputValues[input.key];
-        if (value || !input.required) {
-          const paths = Array.isArray(input.path) ? input.path : [input.path];
-          for (const path of paths) {
-            if (path.startsWith('services.')) {
-              const pathParts = path.split('.');
-              const serviceId = pathParts[1] as any;
-              const credKey = pathParts[2];
-
-              if (!migratedData.services) {
-                migratedData.services = [];
-              }
-
-              let service = migratedData.services.find(
-                (s: any) => s.id === serviceId
-              );
-
-              if (!service) {
-                service = { id: serviceId, enabled: true, credentials: {} };
-                migratedData.services.push(service);
-              }
-
-              if (!service.credentials) {
-                service.credentials = {};
-              }
-
-              service.credentials[credKey] = value || '';
-            } else {
-              applyInputValue(migratedData, path, value || '');
-            }
-          }
-        }
-      });
-
-      if (selectedServices.length > 0 && migratedData.services) {
-        migratedData.services = migratedData.services.filter((s: any) =>
-          selectedServices.includes(s.id)
-        );
-      }
-
-      resolveCredentialRefs(migratedData, inputValues);
-
-      setUserData((prev: any) => ({ ...prev, ...migratedData }));
-
-      const addonsNeedingSetup = (migratedData.presets || [])
-        .filter((preset: any) => {
-          const presetType = preset.type.toLowerCase();
-          return ['gdrive'].some((type) => presetType.includes(type));
-        })
-        .map((preset: any) => preset.options?.name || preset.type);
-
-      toast.success(
-        `Template "${processedTemplate.template.metadata.name}" loaded successfully`
-      );
-
-      if (addonsNeedingSetup.length > 0) {
-        setTimeout(() => {
-          toast.info(
-            `Note: ${addonsNeedingSetup.join(', ')} require additional setup. Please configure them in the Addons section.`,
-            { duration: 8000 }
-          );
-        }, 1000);
-      }
-
-      // Reset state
-      setProcessedTemplate(null);
-      setCurrentStep('browse');
-      setSelectedServices([]);
-      setInputValues({});
-      setWizardHistory([]);
-      if (processedTemplate?.template.metadata.setToSaveInstallMenu) {
-        setSelectedMenu('save-install');
-      }
-      onOpenChange(false);
-    } catch (err) {
-      console.error('Error loading template:', err);
-      toast.error('Failed to load template');
-    } finally {
-      setIsLoading(false);
-    }
+    await applyTemplate({
+      config: processedTemplate.template.config,
+      inputs: processedTemplate.inputs,
+      resolvedValues: inputValues,
+      selectedSvcs: selectedServices,
+      templateName: processedTemplate.template.metadata.name,
+      setToSaveInstallMenu:
+        processedTemplate.template.metadata.setToSaveInstallMenu,
+    });
   };
 
   const handleCancel = () => {
