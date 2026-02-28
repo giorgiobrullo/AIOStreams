@@ -297,15 +297,55 @@ export function useTemplateWizard({
         } else if (opt.type === 'boolean') {
           defaults[opt.id] = false;
         }
+        if (
+          opt.type === 'subsection' &&
+          Array.isArray((opt as any).subOptions)
+        ) {
+          const subDefaults: Record<string, any> = {};
+          for (const sub of (opt as any).subOptions as Option[]) {
+            if (sub.default !== undefined) {
+              subDefaults[sub.id] = sub.default;
+            } else if (sub.type === 'boolean') {
+              subDefaults[sub.id] = false;
+            }
+          }
+          if (Object.keys(subDefaults).length > 0) {
+            defaults[opt.id] = { ...subDefaults, ...(defaults[opt.id] ?? {}) };
+          }
+        }
       }
       const saved = getLocalStorageTemplateInputs(template.metadata.id);
+
+      const mergeWithDefaults = (
+        base: Record<string, any>,
+        overrides: Record<string, any>
+      ): Record<string, any> => {
+        const result = { ...base };
+        for (const key of Object.keys(overrides)) {
+          if (
+            overrides[key] !== null &&
+            typeof overrides[key] === 'object' &&
+            !Array.isArray(overrides[key]) &&
+            typeof base[key] === 'object' &&
+            base[key] !== null &&
+            !Array.isArray(base[key])
+          ) {
+            result[key] = { ...base[key], ...overrides[key] };
+          } else {
+            result[key] = overrides[key];
+          }
+        }
+        return result;
+      };
+
+      const initialValues = mergeWithDefaults(defaults, saved);
 
       const processed = processTemplate(template, status, userData);
       if (processed.showServiceSelection) {
         setProcessedTemplate(processed);
         setPendingTemplate(template);
         setTemplateInputOptions(options);
-        setTemplateInputValues({ ...defaults, ...saved });
+        setTemplateInputValues(initialValues);
         setSelectedServices([]);
         setCurrentStep('selectService');
         return;
@@ -314,7 +354,7 @@ export function useTemplateWizard({
       setProcessedTemplate(null);
       setPendingTemplate(template);
       setTemplateInputOptions(options);
-      setTemplateInputValues({ ...defaults, ...saved });
+      setTemplateInputValues(initialValues);
       setCurrentStep('templateInputs');
       return;
     }
