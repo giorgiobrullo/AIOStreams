@@ -261,7 +261,16 @@ export function useTemplateWizard({
       );
       setCurrentStep('inputs');
     } else if (processed.showServiceSelection) {
-      setSelectedServices([]);
+      const preSelected = ((userData?.services ?? []) as any[])
+        .filter(
+          (s) =>
+            processed.services.includes(s.id) &&
+            s.enabled &&
+            s.credentials &&
+            Object.values(s.credentials).some((v) => v)
+        )
+        .map((s) => s.id);
+      setSelectedServices(preSelected);
       setCurrentStep('selectService');
     } else {
       if (processed.inputs.length === 0) {
