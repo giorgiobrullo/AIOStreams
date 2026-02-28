@@ -1,6 +1,6 @@
-import { Template, StatusResponse } from '@aiostreams/core';
+import { Template, StatusResponse, Option } from '@aiostreams/core';
 import { toast } from 'sonner';
-import { asConfigArray } from './conditionals';
+import { asConfigArray, evaluateTemplateCondition } from './conditionals';
 import * as constants from '@aiostreams/core/src/utils/constants';
 import { ProcessedTemplate, TemplateInput } from '../types';
 
@@ -293,3 +293,24 @@ export const applyInputValue = (obj: any, path: string, value: any): void => {
 
   current[parts[parts.length - 1]] = value;
 };
+
+/**
+ * Returns the subset of template input options that should be shown to the user,
+ * respecting the current mode (noob hides advanced options) and __if conditions.
+ */
+export const getVisibleOptions = (
+  mode: string,
+  options: Option[],
+  values: Record<string, any>,
+  selectedServices: string[]
+): Option[] =>
+  (mode === 'noob'
+    ? options.filter(
+        (opt) => opt.advanced !== true && opt.showInSimpleMode !== false
+      )
+    : options
+  ).filter((opt) =>
+    (opt as any).__if
+      ? evaluateTemplateCondition((opt as any).__if, values, selectedServices)
+      : true
+  );
