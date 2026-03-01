@@ -79,25 +79,17 @@ class StreamDeduplicator {
         currentStreamKeyStrings.push(`filename:${normalisedFilename}`);
       }
 
-      // fileIdx distinguishes files within a season pack torrent.
-      // Different services return inconsistent values for the same file:
-      //   - cached services return the real index (e.g. 5)
-      //   - uncached services return -1 (file not yet selected)
-      //   - some addons return undefined
-      // Normalise: treat -1 and undefined as 0 (unknown/default) so they
-      // merge with each other. Positive indices are kept distinct to avoid
-      // merging different episodes from the same pack.
+      // Some addons provide fileIdx (to distinguish multiple files
+      // within a single torrent), while others don't. This creates an unavoidable trade-off
+      // where addons that provide fileIdx will not deduplicate properly with those that don't
+      // via infoHash alone.
       if (
         deduplicationKeys.includes('infoHash') &&
         stream.torrent?.infoHash &&
         stream.type !== 'usenet'
       ) {
-        const fileIdx =
-          stream.torrent.fileIdx != null && stream.torrent.fileIdx >= 0
-            ? stream.torrent.fileIdx
-            : 0;
         currentStreamKeyStrings.push(
-          `infoHash:${stream.torrent.infoHash}${fileIdx}`
+          `infoHash:${stream.torrent.infoHash}${stream.torrent.fileIdx ?? 0}`
         );
       }
       if (
