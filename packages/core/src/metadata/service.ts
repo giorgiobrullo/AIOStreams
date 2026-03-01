@@ -145,29 +145,39 @@ export class MetadataService {
               promises.push(Promise.resolve(undefined));
             }
 
-            // IMDb metadata
+            // IMDb / Cinemeta metadata
             if (imdbId) {
               const imdbMetadata = new IMDBMetadata();
               promises.push(imdbMetadata.getCinemetaData(imdbId, type));
-              promises.push(imdbMetadata.getImdbSuggestionData(imdbId, type));
             } else {
-              promises.push(Promise.resolve(undefined));
               promises.push(Promise.resolve(undefined));
             }
 
-            // Execute all promises in parallel
+            // IMDb Suggestion — launched in parallel but awaited separately
+            // because it's the slowest source (~130-700 ms) and only provides
+            // title/year/yearEnd that are already covered by TMDB+TVDB.
+            const imdbSuggestionPromise = imdbId
+              ? new IMDBMetadata()
+                  .getImdbSuggestionData(imdbId, type)
+                  .catch((err: unknown) => {
+                    logger.warn(
+                      `Failed to fetch IMDb suggestion data for ${imdbId}: ${err}`
+                    );
+                    return undefined;
+                  })
+              : Promise.resolve(undefined);
+
+            // Execute core promises in parallel
             const [
               tmdbResult,
               tvdbResult,
               traktResult,
               imdbResult,
-              imdbSuggestionResult,
             ] = (await Promise.allSettled(promises)) as [
               PromiseSettledResult<(Metadata & { tmdbId: string }) | undefined>,
               PromiseSettledResult<(Metadata & { tvdbId: number }) | undefined>,
               PromiseSettledResult<MetadataTitle[] | undefined>,
               PromiseSettledResult<Meta | undefined>,
-              PromiseSettledResult<Metadata | undefined>,
             ];
 
             // Process TMDB results
@@ -357,21 +367,19 @@ export class MetadataService {
               );
             }
 
-            if (
-              imdbSuggestionResult.status === 'fulfilled' &&
-              imdbSuggestionResult.value
-            ) {
-              const imdbSuggestionData = imdbSuggestionResult.value;
-              if (imdbSuggestionData.title)
-                titles.unshift({ title: imdbSuggestionData.title });
-              if (imdbSuggestionData.year && !year)
-                year = imdbSuggestionData.year;
-              if (imdbSuggestionData.yearEnd && !yearEnd)
-                yearEnd = imdbSuggestionData.yearEnd;
-            } else {
-              logger.warn(
-                `Failed to fetch IMDb suggestion data for ${imdbId}: ${imdbSuggestionResult.status === 'rejected' ? imdbSuggestionResult.reason : 'no data'}`
-              );
+            // Only await IMDb Suggestion if we're still missing data it
+            // can provide. On the happy path (TMDB+TVDB succeeded) this
+            // skips a ~130-700 ms wait entirely.
+            if (!titles.length || year === undefined) {
+              const imdbSuggestionData = await imdbSuggestionPromise;
+              if (imdbSuggestionData) {
+                if (imdbSuggestionData.title)
+                  titles.unshift({ title: imdbSuggestionData.title });
+                if (imdbSuggestionData.year && !year)
+                  year = imdbSuggestionData.year;
+                if (imdbSuggestionData.yearEnd && !yearEnd)
+                  yearEnd = imdbSuggestionData.yearEnd;
+              }
             }
 
             const uniqueTitles = deduplicateTitles(titles);
