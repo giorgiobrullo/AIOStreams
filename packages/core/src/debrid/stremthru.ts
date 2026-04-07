@@ -1090,7 +1090,13 @@ export class StremThruService
           }
         }
         if (magnetDownload.status !== 'downloaded') {
-          return undefined;
+          throw new DebridError(`Timed out waiting for magnet to download`, {
+            statusCode: 408,
+            statusText: `Timed out waiting for magnet to download`,
+            code: 'UNKNOWN',
+            headers: {},
+            body: magnetDownload,
+          });
         }
       }
     }

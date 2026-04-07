@@ -36,6 +36,9 @@ import TemplateOption from '../../../shared/template-option';
 import MarkdownLite from '../../../shared/markdown-lite';
 import { StatusResponse, UserData } from '@aiostreams/core';
 
+// Non-debrid service IDs (these don't use shared debrid infrastructure)
+const NON_DEBRID_SERVICES = ['qbittorrent', 'easynews', 'nzbdav', 'altmount', 'stremio_nntp', 'stremthru_newz'];
+
 // Usenet service IDs
 const USENET_SERVICE_IDS: string[] = [
   NZBDAV_SERVICE,
@@ -231,6 +234,13 @@ export function StreamServices() {
       })
       .map((service) => status.settings.services[service.id]?.name) ?? [];
 
+  const hasProwlarr = userData.presets?.some((p) => p.type === 'prowlarr' && p.enabled);
+  const hasDebridService = userData.services?.some(
+    (s) => s.enabled && !NON_DEBRID_SERVICES.includes(s.id) && !isUsenetService(s.id)
+  );
+  const showPrivateTrackerWarning =
+    status.settings.excludePrivateTrackersFromDebrid && hasProwlarr && hasDebridService;
+
   const allServiceIds = userData.services?.map((s) => s.id) || [];
 
   const isFiltering = searchQuery.trim() !== '' || categoryFilter !== 'all';
@@ -272,6 +282,21 @@ export function StreamServices() {
                   </div>
                 ))}
               </div>
+            </>
+          }
+        />
+      )}
+
+      {showPrivateTrackerWarning && (
+        <Alert
+          intent="info"
+          title="Private Tracker Protection"
+          description={
+            <>
+              Private tracker torrents from Prowlarr are automatically excluded
+              from debrid services to protect your tracker accounts. Debrid services
+              use shared IPs and non-whitelisted clients which can get you banned.
+              Use qBittorrent for private tracker content instead.
             </>
           }
         />
