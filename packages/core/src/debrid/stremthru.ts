@@ -1052,22 +1052,22 @@ export class StremThruService
           );
           if (!magnetDownloadInList) {
             logger.warn(`Failed to find ${hash} in list`);
-          } else {
-            logger.debug(`Polled status for ${hash}`, {
-              attempt: i + 1,
-              status: magnetDownloadInList.status,
-            });
-            if (magnetDownloadInList.status === 'downloaded') {
-              // listMagnets doesn't return files, so preserve the original
-              // file list from addMagnet/addTorrent
-              magnetDownload = {
-                ...magnetDownloadInList,
-                files: magnetDownloadInList.files?.length
-                  ? magnetDownloadInList.files
-                  : initialFiles,
-              };
-              break;
-            }
+            continue;
+          }
+          logger.debug(`Polled status for ${hash}`, {
+            attempt: i + 1,
+            status: magnetDownloadInList.status,
+          });
+          if (magnetDownloadInList.status === 'downloaded') {
+            // listMagnets doesn't return files, so preserve the original
+            // file list from addMagnet/addTorrent
+            magnetDownload = {
+              ...magnetDownloadInList,
+              files: magnetDownloadInList.files?.length
+                ? magnetDownloadInList.files
+                : initialFiles,
+            };
+            break;
           }
           if (['failed', 'invalid'].includes(magnetDownloadInList.status)) {
             const err = new DebridError(
