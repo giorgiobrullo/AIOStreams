@@ -81,6 +81,8 @@ const SERVICE_LOGO_MAP: Record<ServiceId, string> = {
     'https://raw.githubusercontent.com/nzbdav-dev/nzbdav/refs/heads/main/frontend/public/logo.svg',
   altmount:
     'https://raw.githubusercontent.com/javi11/altmount/refs/heads/main/docs/static/img/logo.png',
+  qbittorrent:
+    'https://raw.githubusercontent.com/qbittorrent/qBittorrent/master/src/icons/skin/qbittorrent-tray.svg',
 };
 
 function ServiceLogo({
