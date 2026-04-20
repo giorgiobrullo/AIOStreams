@@ -206,7 +206,15 @@ async function processTorrentsForDebridService(
       );
       torrents = torrents.filter((t) => !t.private);
       if (torrents.length === 0) {
-        return [];
+        return {
+          results: [],
+          magnetCheckMs: 0,
+          processingMs: 0,
+          totalMs: Date.now() - startTime,
+          cachedCount: 0,
+          uncachedCount: 0,
+          torrentsIn: 0,
+        };
       }
     }
   }
