@@ -964,6 +964,16 @@ export class StremThruService
         id: magnetDownload.id,
       });
     } else if (
+      // Never call addTorrent() unless we can rule out a private tracker.
+      // The .torrent file fetched from a private tracker contains our passkey
+      // in its announce list; handing the downloadUrl to a shared debrid
+      // service (Torbox/RD/AllDebrid/etc.) exposes that passkey to their
+      // infrastructure. We gate on `private === false` explicitly — any
+      // parser that leaves `private` as `undefined` could be a private
+      // indexer (e.g. Torznab without a `<type>` element), so we default-deny.
+      // qBittorrent is always allowed: it runs on user-controlled infra where
+      // announcing with our passkey is exactly how it's supposed to work.
+      (playbackInfo.private === false || this.serviceName === 'qbittorrent') &&
       (playbackInfo.private !== undefined || playbackInfo.placeholderHash) &&
       playbackInfo.downloadUrl &&
       Env.BUILTIN_DEBRID_USE_TORRENT_DOWNLOAD_URL &&
@@ -1002,7 +1012,25 @@ export class StremThruService
       if (playbackInfo.filename) {
         magnet += `&dn=${playbackInfo.filename}`;
       }
-      if (playbackInfo.sources.length > 0) {
+      // For SHARED debrid services (Torbox/RD/AllDebrid/etc.), omit tracker
+      // announces from the magnet unless we've explicitly confirmed the
+      // torrent is public (`private === false`). playbackInfo.sources
+      // contains announce URLs from the .torrent, which for a private tracker
+      // embed our passkey (e.g. https://tracker/PASSKEY/announce). Sending
+      // those to the debrid leaks the passkey into their logs and — on cache
+      // eviction between check and play — would cause them to announce with
+      // it from a shared non-whitelisted IP, the exact ban-bait we're trying
+      // to avoid. We default-deny on `undefined` because some parsers (e.g.
+      // Torznab without a `<type>` element) don't reliably set the flag. The
+      // infohash alone is enough for a cache lookup; DHT/PEX fallback is
+      // irrelevant for `private: 1` torrents per BEP-27.
+      //
+      // qBittorrent is the exception: it runs on user-controlled infra with
+      // a whitelisted IP and client, so it MUST receive the full tracker
+      // list to actually download the torrent.
+      const stripTrackers =
+        playbackInfo.private !== false && this.serviceName !== 'qbittorrent';
+      if (!stripTrackers && playbackInfo.sources.length > 0) {
         magnet += `&tr=${playbackInfo.sources.join('&tr=')}`;
       }
 

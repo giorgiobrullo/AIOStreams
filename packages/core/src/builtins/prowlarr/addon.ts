@@ -277,7 +277,9 @@ export class ProwlarrAddon extends BaseDebridAddon<ProwlarrAddonConfig> {
       if (seenTorrents.has(infoHash ?? downloadUrl!)) continue;
       seenTorrents.add(infoHash ?? downloadUrl!);
 
-      const isPrivate = privateIndexerIds.has(result.indexerId) ? true : undefined;
+      // Always return a concrete boolean so downstream default-deny filters
+      // don't misclassify public-indexer results as maybe-private.
+      const isPrivate = privateIndexerIds.has(result.indexerId);
 
       torrents.push({
         hash: infoHash,
