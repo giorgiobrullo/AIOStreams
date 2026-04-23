@@ -191,34 +191,6 @@ async function processTorrentsForDebridService(
 }> {
   const startTime = Date.now();
 
-  // Exclude private tracker torrents from debrid services to prevent account
-  // bans. Private trackers require your own IP and ratio management — debrid
-  // services use shared IPs and non-whitelisted clients. qBittorrent is exempt
-  // since it runs on user-controlled infrastructure.
-  if (
-    Env.BUILTIN_DEBRID_EXCLUDE_PRIVATE_TRACKERS &&
-    service.id !== constants.QBITTORRENT_SERVICE
-  ) {
-    const privateTorrents = torrents.filter((t) => t.private);
-    if (privateTorrents.length > 0) {
-      logger.info(
-        `Excluded ${privateTorrents.length} private tracker torrents from ${service.id}`
-      );
-      torrents = torrents.filter((t) => !t.private);
-      if (torrents.length === 0) {
-        return {
-          results: [],
-          magnetCheckMs: 0,
-          processingMs: 0,
-          totalMs: Date.now() - startTime,
-          cachedCount: 0,
-          uncachedCount: 0,
-          torrentsIn: 0,
-        };
-      }
-    }
-  }
-
   const debridService = getDebridService(
     service.id,
     service.credential,
@@ -311,6 +283,49 @@ async function processTorrentsForDebridService(
   const magnetCheckMap = new Map<string, DebridDownload>();
   for (const result of magnetCheckResults) {
     if (result.hash) magnetCheckMap.set(result.hash, result);
+  }
+
+  // Exclude private tracker torrents that aren't already cached on the debrid
+  // service. Using a private-tracker torrent via debrid would trigger a
+  // download from the tracker via a non-whitelisted client with a shared IP,
+  // which is ban-bait. BUT if the torrent is already cached upstream (someone
+  // else's torrent already sitting in the debrid's shared cache), fetching
+  // that copy doesn't re-contact the tracker — it's safe. qBittorrent is
+  // always allowed since it runs on user-controlled infrastructure.
+  if (
+    Env.BUILTIN_DEBRID_EXCLUDE_PRIVATE_TRACKERS &&
+    service.id !== constants.QBITTORRENT_SERVICE
+  ) {
+    const beforeCount = torrents.length;
+    // Default-deny: only treat a torrent as safe-for-non-qBit-debrid when its
+    // source has explicitly marked it `private: false`. Parsers that leave
+    // `private` as `undefined` (e.g. Torznab responses without a `<type>`
+    // element) may still carry passkey-bearing tracker URLs in `sources`, so
+    // we can't assume they're safe. In the ambiguous case, we still allow
+    // them through if already cached on the debrid service — using a cached
+    // copy doesn't re-expose trackers.
+    torrents = torrents.filter((t) => {
+      if (t.private === false) return true;
+      const status = magnetCheckMap.get(t.hash)?.status;
+      return status === 'cached';
+    });
+    const excluded = beforeCount - torrents.length;
+    if (excluded > 0) {
+      logger.info(
+        `Excluded ${excluded} uncached private tracker torrents from ${service.id}`
+      );
+    }
+    if (torrents.length === 0) {
+      return {
+        results: [],
+        magnetCheckMs,
+        processingMs: 0,
+        totalMs: Date.now() - startTime,
+        cachedCount: 0,
+        uncachedCount: 0,
+        torrentsIn: 0,
+      };
+    }
   }
 
   const normTitles: Set<string> | null = metadata?.titles?.length
