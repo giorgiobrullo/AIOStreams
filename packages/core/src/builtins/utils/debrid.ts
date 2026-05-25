@@ -2,11 +2,11 @@ import {
   BuiltinServiceId,
   constants,
   createLogger,
-  Env,
   getTimeTakenSincePoint,
   mergeParsedMediaInfos,
   parseMediaInfo,
 } from '../../utils/index.js';
+import { config as appConfig } from '../../config/index.js';
 import {
   BuiltinDebridServices,
   DebridFile,
@@ -293,7 +293,7 @@ async function processTorrentsForDebridService(
   // that copy doesn't re-contact the tracker — it's safe. qBittorrent is
   // always allowed since it runs on user-controlled infrastructure.
   if (
-    Env.BUILTIN_DEBRID_EXCLUDE_PRIVATE_TRACKERS &&
+    appConfig.builtins.debrid.excludePrivateTrackers &&
     service.id !== constants.QBITTORRENT_SERVICE
   ) {
     const beforeCount = torrents.length;

@@ -192,6 +192,16 @@ export const builtinsSchema = {
       requiresRestart: false,
       secret: false,
     },
+    excludePrivateTrackers: {
+      schema: z.boolean(),
+      default: true,
+      label: 'Exclude private trackers from debrid',
+      description:
+        'Exclude private-tracker torrents from debrid services (they remain available via qBittorrent). Cached torrents are still allowed through.',
+      env: 'BUILTIN_DEBRID_EXCLUDE_PRIVATE_TRACKERS',
+      requiresRestart: false,
+      secret: false,
+    },
     metadataStore: {
       schema: z.union([debridStore, z.null()]),
       default: null,
