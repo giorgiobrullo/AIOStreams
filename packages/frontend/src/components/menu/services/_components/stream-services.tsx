@@ -90,7 +90,7 @@ const SERVICE_LOGO_MAP: Record<ServiceId, string> = {
   altmount:
     'https://raw.githubusercontent.com/javi11/altmount/refs/heads/main/docs/static/img/logo.png',
   qbittorrent:
-    'https://raw.githubusercontent.com/qbittorrent/qBittorrent/master/src/icons/skin/qbittorrent-tray.svg',
+    'https://raw.githubusercontent.com/qbittorrent/qBittorrent/refs/heads/master/src/icons/qbittorrent-tray.svg',
   aiostreams: '/logo.png',
   torrin: 'https://torrin.app/favicon.png',
 };
