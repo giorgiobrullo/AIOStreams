@@ -149,6 +149,7 @@ export class MediaFusionPreset extends Preset {
       constants.PIKPAK_SERVICE,
       constants.SEEDR_SERVICE,
       constants.EASYNEWS_SERVICE,
+      constants.TORRIN_SERVICE,
     ];
 
     const supportedResources = [
@@ -344,7 +345,7 @@ export class MediaFusionPreset extends Preset {
     }
 
     const usableServiceIds: (ServiceId | 'p2p')[] | undefined =
-      this.getUsableServices(userData, options.services)?.map(
+      this.getUsableServices(userData, options.services, options.name)?.map(
         (service) => service.id
       );
 

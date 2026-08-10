@@ -1,6 +1,7 @@
-﻿import express, { Request, Response, Express } from 'express';
+﻿import express, { Express } from 'express';
 import {
   userApi,
+  profilesApi,
   healthApi,
   statusApi,
   formatApi,
@@ -15,6 +16,7 @@ import {
   syncApi,
   authApi,
   dashboardApi,
+  usenetApi,
 } from './routes/api/index.js';
 import {
   configure,
@@ -31,6 +33,9 @@ import {
   streams as chillLinkStreams,
 } from './routes/chilllink/index.js';
 import seanimeExtensionsRouter from './routes/seanime/extensions.js';
+import sabnzbdRouter from './routes/api/sabnzbd.js';
+import publicBlocklistRouter from './routes/blocklist.js';
+import { createNabRouter } from './routes/api/nab.js';
 import {
   gdrive,
   torboxSearch,
@@ -53,6 +58,10 @@ import {
   staticRateLimiter,
   internalMiddleware,
   stremioStreamRateLimiter,
+  stremioManifestRateLimiter,
+  stremioMetaRateLimiter,
+  stremioCatalogRateLimiter,
+  stremioSubtitleRateLimiter,
   requireSessionIfAuthRequired,
 } from './middlewares/index.js';
 
@@ -61,6 +70,7 @@ import {
   constants,
   createLogger,
   Env,
+  VARIANT_PATH_ROUTE,
 } from '@aiostreams/core';
 import { StremioTransformer } from '@aiostreams/core';
 import { createResponse } from './utils/responses.js';
@@ -85,6 +95,44 @@ export enum StaticFiles {
   OK = '200.mp4',
 }
 
+/**
+ * Map a DebridError code to the fallback video served in its place. Playback
+ * endpoints answer a player, so a failure has to be watchable to be legible.
+ */
+export function mapDebridErrorToStaticFile(code: string | undefined): string {
+  switch (code) {
+    case 'UNAVAILABLE_FOR_LEGAL_REASONS':
+      return StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;
+    case 'STORE_LIMIT_EXCEEDED':
+      return StaticFiles.STORE_LIMIT_EXCEEDED;
+    case 'PAYMENT_REQUIRED':
+      return StaticFiles.PAYMENT_REQUIRED;
+    case 'TOO_MANY_ACTIVE_CONNECTIONS':
+      return StaticFiles.CONTENT_PROXY_LIMIT_REACHED;
+    case 'TOO_MANY_REQUESTS':
+      return StaticFiles.TOO_MANY_REQUESTS;
+    case 'FORBIDDEN':
+      return StaticFiles.FORBIDDEN;
+    case 'UNAUTHORIZED':
+      return StaticFiles.UNAUTHORIZED;
+    case 'UNPROCESSABLE_ENTITY':
+    case 'UNSUPPORTED_MEDIA_TYPE':
+    case 'STORE_MAGNET_INVALID':
+    case 'DOWNLOAD_FAILED':
+    case 'BAD_GATEWAY':
+    case 'GONE':
+      return StaticFiles.DOWNLOAD_FAILED;
+    case 'NO_MATCHING_FILE':
+      return StaticFiles.NO_MATCHING_FILE;
+    case 'SERVICE_UNAVAILABLE':
+      return StaticFiles.DOWNLOAD_FAILED;
+    case 'TIMEOUT':
+      return StaticFiles.DOWNLOADING;
+    default:
+      return StaticFiles.INTERNAL_SERVER_ERROR;
+  }
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -105,6 +153,7 @@ if (appConfig.bootstrap.nodeEnv === 'development') {
 // API Routes
 const apiRouter = express.Router();
 apiRouter.use('/user', userApi);
+apiRouter.use('/profiles', profilesApi);
 apiRouter.use('/health', healthApi);
 apiRouter.use('/status', statusApi);
 apiRouter.use('/format', formatApi);
@@ -129,6 +178,10 @@ apiRouter.use('/templates', templatesApi);
 apiRouter.use('/sync', syncApi);
 apiRouter.use('/auth', authApi);
 apiRouter.use('/dashboard', dashboardApi);
+apiRouter.use('/usenet', usenetApi);
+apiRouter.use('/sabnzbd', sabnzbdRouter);
+apiRouter.use('/newznab', createNabRouter('newznab'));
+apiRouter.use('/torznab', createNabRouter('torznab'));
 apiRouter.use((req, res) => {
   res.status(404).json(
     createResponse({
@@ -144,8 +197,8 @@ app.use(`/api/v${constants.API_VERSION}`, apiRouter);
 const stremioRouter = express.Router({ mergeParams: true });
 stremioRouter.use(corsMiddleware);
 // Public routes - no auth needed
-stremioRouter.use('/manifest.json', manifest);
-stremioRouter.use('/stream', stream);
+stremioRouter.use('/manifest.json', stremioManifestRateLimiter, manifest);
+stremioRouter.use('/stream', stremioStreamRateLimiter, stream);
 stremioRouter.use('/configure', requireSessionIfAuthRequired, configure);
 
 stremioRouter.use('/u', alias);
@@ -153,6 +206,11 @@ stremioRouter.use('/u', alias);
 // Protected routes with authentication
 const stremioAuthRouter = express.Router({ mergeParams: true });
 stremioAuthRouter.use(corsMiddleware);
+stremioAuthRouter.use('/manifest.json', stremioManifestRateLimiter);
+stremioAuthRouter.use('/stream', stremioStreamRateLimiter);
+stremioAuthRouter.use('/meta', stremioMetaRateLimiter);
+stremioAuthRouter.use('/catalog', stremioCatalogRateLimiter);
+stremioAuthRouter.use('/subtitles', stremioSubtitleRateLimiter);
 stremioAuthRouter.use(userDataMiddleware);
 stremioAuthRouter.use('/manifest.json', manifest);
 stremioAuthRouter.use('/stream', stream);
@@ -163,14 +221,25 @@ stremioAuthRouter.use('/subtitles', subtitle);
 stremioAuthRouter.use('/addon_catalog', addonCatalog);
 
 app.use('/stremio', stremioRouter); // For public routes
+
+app.use(
+  `/stremio/:uuid/:encryptedPassword${VARIANT_PATH_ROUTE}`,
+  stremioAuthRouter
+);
 app.use('/stremio/:uuid/:encryptedPassword', stremioAuthRouter); // For authenticated routes
 
 const chillLinkRouter = express.Router({ mergeParams: true });
 chillLinkRouter.use(corsMiddleware);
+chillLinkRouter.use('/manifest', stremioManifestRateLimiter);
+chillLinkRouter.use('/streams', stremioStreamRateLimiter);
 chillLinkRouter.use(userDataMiddleware);
 chillLinkRouter.use('/manifest', chillLinkManifest);
 chillLinkRouter.use('/streams', chillLinkStreams);
 
+app.use(
+  `/chilllink/:uuid/:encryptedPassword${VARIANT_PATH_ROUTE}`,
+  chillLinkRouter
+);
 app.use('/chilllink/:uuid/:encryptedPassword', chillLinkRouter);
 
 const seanimeRouter = express.Router({ mergeParams: true });
@@ -193,6 +262,8 @@ builtinsRouter.use('/seadex', seadex);
 builtinsRouter.use('/easynews', easynews);
 builtinsRouter.use('/library', library);
 app.use('/builtins', builtinsRouter);
+
+app.use('/blocklist', publicBlocklistRouter);
 
 // Content-hashed build assets. These filenames change on every content
 // change, so they are immutable and safe to cache aggressively. Deliberately

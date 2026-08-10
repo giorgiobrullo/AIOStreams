@@ -28,6 +28,7 @@ import {
   APIError,
 } from './index.js';
 import { assertConfigAccessKey } from './auth.js';
+import { validateVariants } from '../variants/runtime.js';
 import { parseSyncedUrl } from './sync.js';
 import { ZodError } from 'zod';
 import {
@@ -244,18 +245,38 @@ export async function validateConfig(
     }
   }
 
-  // validate NZB failover count against the server limit
+  // validate max failover attempts against the server limit
   if (
-    config.nzbFailover?.count &&
-    config.nzbFailover.count > appConfig.userLimits.maxNzbFailoverCount
+    config.failover?.maxAttempts &&
+    config.failover.maxAttempts > appConfig.userLimits.maxFailoverAttempts
   ) {
     if (options?.skipErrorsFromAddonsOrProxies) {
-      config.nzbFailover.count = appConfig.userLimits.maxNzbFailoverCount;
+      config.failover.maxAttempts = appConfig.userLimits.maxFailoverAttempts;
     } else {
       throw new Error(
-        `NZB failover count is ${config.nzbFailover.count}, but the maximum allowed is ${appConfig.userLimits.maxNzbFailoverCount}`
+        `Failover max attempts is ${config.failover.maxAttempts}, but the maximum allowed is ${appConfig.userLimits.maxFailoverAttempts}`
       );
     }
+  }
+  // validate parallel attempts against the server limit
+  if (
+    config.failover?.parallel &&
+    config.failover.parallel > appConfig.userLimits.maxParallelAttempts
+  ) {
+    if (options?.skipErrorsFromAddonsOrProxies) {
+      config.failover.parallel = appConfig.userLimits.maxParallelAttempts;
+    } else {
+      throw new Error(
+        `Failover parallel attempts is ${config.failover.parallel}, but the maximum allowed is ${appConfig.userLimits.maxParallelAttempts}`
+      );
+    }
+  }
+  // a parallel window can never exceed the total attempt budget
+  if (config.failover?.parallel && config.failover.maxAttempts) {
+    config.failover.parallel = Math.min(
+      config.failover.parallel,
+      config.failover.maxAttempts
+    );
   }
 
   // now, validate preset options and service credentials.
@@ -289,6 +310,16 @@ export async function validateConfig(
       }
     }
   }
+
+  // Static only: a full validateConfig per variant would recurse here and
+  // refetch every addon manifest.
+  validateVariants(config, (patched) => {
+    const parsed = UserDataSchema.safeParse(patched);
+    return {
+      success: parsed.success,
+      error: parsed.success ? undefined : parsed.error.issues[0]?.message,
+    };
+  });
 
   if (config.groups?.groupings) {
     for (const group of config.groups.groupings) {
@@ -458,6 +489,12 @@ function removeInvalidPresetReferences(config: UserData) {
   if (config.seasonEpisodeMatching) {
     config.seasonEpisodeMatching.addons =
       config.seasonEpisodeMatching.addons?.filter((addon) =>
+        existingPresetIds?.includes(addon)
+      );
+  }
+  if (config.episodeTitleMatching) {
+    config.episodeTitleMatching.addons =
+      config.episodeTitleMatching.addons?.filter((addon) =>
         existingPresetIds?.includes(addon)
       );
   }
@@ -681,6 +718,25 @@ export function applyMigrations(config: any): UserData {
   delete config.alwaysPrecache;
   delete config.precacheCondition;
 
+  // migrate nzbFailover -> generic failover (usenet-only, sequential = old behaviour)
+  if (config.failover === undefined && config.nzbFailover !== undefined) {
+    config.failover = {
+      enabled: config.nzbFailover.enabled,
+      maxAttempts: config.nzbFailover.count,
+      position: config.nzbFailover.position,
+      contentTypes: [...constants.DEFAULT_FAILOVER_CONTENT_TYPES],
+      allowCrossType: false,
+      parallel: constants.DEFAULT_FAILOVER_PARALLEL,
+    };
+  }
+  delete config.nzbFailover;
+
+  // migrate failover.count -> failover.maxAttempts (renamed)
+  if (config.failover && config.failover.count !== undefined) {
+    config.failover.maxAttempts ??= config.failover.count;
+    delete config.failover.count;
+  }
+
   // migrate stream expressions from string[] to {expression, enabled}[]
   const streamExpressionKeys = [
     'excludedStreamExpressions',
@@ -713,6 +769,77 @@ export function applyMigrations(config: any): UserData {
         };
       }
       return preset;
+    });
+  }
+
+  // migrate seasonPackStrategy (torznab/newznab) to seasonEpisodeStrategy
+  if (config.presets && Array.isArray(config.presets)) {
+    const seasonPackStrategyMap: Record<string, string> = {
+      episodeOnly: 'episode',
+      dynamic: 'dynamic',
+      episodeFirstSeasonPackFallback: 'episodeFirst',
+      seasonPackFirstEpisodeFallback: 'season',
+    };
+    config.presets = config.presets.map((preset: any) => {
+      if (
+        typeof preset.options?.seasonPackStrategy === 'string' &&
+        preset.options.seasonEpisodeStrategy === undefined
+      ) {
+        const { seasonPackStrategy, ...restOptions } = preset.options;
+        return {
+          ...preset,
+          options: {
+            ...restOptions,
+            seasonEpisodeStrategy:
+              seasonPackStrategyMap[seasonPackStrategy] ?? 'episode',
+          },
+        };
+      }
+      return preset;
+    });
+  }
+
+  // migrate nab url/apiKey/apiPath options into a single `api` object holding
+  // the complete endpoint
+  if (config.presets && Array.isArray(config.presets)) {
+    // [urlOption, apiKeyOption, urlIsBaseOnly]
+    const nabOptionKeys: Record<string, [string, string, boolean?]> = {
+      newznab: ['newznabUrl', 'apiKey'],
+      torznab: ['torznabUrl', 'apiKey'],
+      // NZBHydra keeps a bare base url; '/api' is appended at request time
+      nzbhydra: ['nzbhydraUrl', 'nzbhydraApiKey', true],
+    };
+    config.presets = config.presets.map((preset: any) => {
+      const keys = nabOptionKeys[preset.type];
+      if (!keys || !preset.options || preset.options.api !== undefined) {
+        return preset;
+      }
+      const [urlKey, apiKeyKey, urlIsBaseOnly] = keys;
+      const {
+        [urlKey]: url,
+        [apiKeyKey]: apiKey,
+        apiPath,
+        ...rest
+      } = preset.options;
+      if (url === undefined && apiKey === undefined && apiPath === undefined) {
+        return preset;
+      }
+      const api: { url?: string; apiKey?: string } = {};
+      // a preconfigured NZBHydra stores no url, and must not gain a bare '/api'
+      if (typeof url === 'string' && url.trim()) {
+        const base = url.trim().replace(/\/+$/, '');
+        if (urlIsBaseOnly) {
+          api.url = base;
+        } else {
+          const path = apiPath === undefined ? '/api' : String(apiPath).trim();
+          const normalised = path.replace(/^\/+|\/+$/g, '');
+          api.url = base + (normalised ? `/${normalised}` : '');
+        }
+      }
+      if (apiKey !== undefined) {
+        api.apiKey = apiKey;
+      }
+      return { ...preset, options: { ...rest, api } };
     });
   }
 
@@ -1080,7 +1207,7 @@ function validateOption(
     }
     return value;
   }
-  if (option.type === 'subsection') {
+  if (option.type === 'subsection' || option.type === 'nab-endpoint') {
     for (const subOption of option.subOptions ?? []) {
       // for subsection, the value must be an object
       if (typeof value !== 'object' || Array.isArray(value)) {
@@ -1324,7 +1451,8 @@ const FILTER_FIELDS: (keyof UserData)[] = [
   'excludeUncachedFromStreamTypes', 'excludeUncachedMode',
   'excludeSeederRange', 'includeSeederRange', 'requiredSeederRange', 'seederRangeTypes',
   'excludeAgeRange', 'includeAgeRange', 'requiredAgeRange', 'ageRangeTypes',
-  'digitalReleaseFilter', 'size', 'bitrate', 'titleMatching', 'yearMatching', 'seasonEpisodeMatching'
+  'digitalReleaseFilter', 'size', 'bitrate', 'titleMatching', 'yearMatching', 'seasonEpisodeMatching', 'episodeTitleMatching',
+  'languageInference'
 ];
 
 // prettier-ignore
@@ -1353,7 +1481,7 @@ const METADATA_FIELDS: (keyof UserData)[] = [
 // prettier-ignore
 const MISC_FIELDS: (keyof UserData)[] = [
   'autoPlay', 'areYouStillThere', 'statistics', 'dynamicAddonFetching',
-  'nzbFailover', 'serviceWrap', 'cacheAndPlay', 'preloadStreams', 'precacheSelector',
+  'failover', 'serviceWrap', 'cacheAndPlay', 'preloadStreams', 'precacheSelector',
   'hideErrors', 'hideErrorsForResources', 'addonCategoryColors', 'catalogModifications', 'mergedCatalogs',
   'accessKey', 'externalDownloads', 'autoRemoveDownloads', 'checkOwned', 'showChanges',
 ];
@@ -1365,9 +1493,11 @@ const BRANDING_FIELDS: (keyof UserData)[] = [
 
 // Personal fields are never inherited — always use the child's own values.
 // Includes per-user identity and per-instance state that has no meaning across configs.
+// Variants reference this config's own instanceIds and saved formatter names,
+// so a parent's would target fields the child lacks.
 // prettier-ignore
 const PERSONAL_FIELDS: (keyof UserData)[] = [
-  'appliedTemplates',
+  'appliedTemplates', 'variants',
 ];
 
 /**

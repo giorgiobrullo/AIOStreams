@@ -8,6 +8,7 @@ import {
   STREMIO_NNTP_SERVICE,
   EASYNEWS_SERVICE,
   STREMTHRU_NEWZ_SERVICE,
+  AIOSTREAMS_SERVICE,
 } from '../../../../../../core/src/utils/constants';
 import { restrictToVerticalAxis } from '@dnd-kit/modifiers';
 import {
@@ -36,7 +37,14 @@ import MarkdownLite from '../../../shared/markdown-lite';
 import { StatusResponse, UserData } from '@aiostreams/core';
 
 // Non-debrid service IDs (these don't use shared debrid infrastructure)
-const NON_DEBRID_SERVICES = ['qbittorrent', 'easynews', 'nzbdav', 'altmount', 'stremio_nntp', 'stremthru_newz'];
+const NON_DEBRID_SERVICES = [
+  'qbittorrent',
+  'easynews',
+  'nzbdav',
+  'altmount',
+  'stremio_nntp',
+  'stremthru_newz',
+];
 
 // Usenet service IDs
 const USENET_SERVICE_IDS: string[] = [
@@ -45,6 +53,7 @@ const USENET_SERVICE_IDS: string[] = [
   STREMIO_NNTP_SERVICE,
   EASYNEWS_SERVICE,
   STREMTHRU_NEWZ_SERVICE,
+  AIOSTREAMS_SERVICE,
 ];
 
 const DUAL_SERVICE_IDS: string[] = ['torbox'];
@@ -82,6 +91,8 @@ const SERVICE_LOGO_MAP: Record<ServiceId, string> = {
     'https://raw.githubusercontent.com/javi11/altmount/refs/heads/main/docs/static/img/logo.png',
   qbittorrent:
     'https://raw.githubusercontent.com/qbittorrent/qBittorrent/master/src/icons/skin/qbittorrent-tray.svg',
+  aiostreams: '/logo.png',
+  torrin: 'https://torrin.app/favicon.png',
 };
 
 function ServiceLogo({
@@ -235,12 +246,17 @@ export function StreamServices() {
       })
       .map((service) => status.settings.services[service.id]?.name) ?? [];
 
-  const hasProwlarr = userData.presets?.some((p) => p.type === 'prowlarr' && p.enabled);
+  const hasProwlarr = userData.presets?.some(
+    (p) => p.type === 'prowlarr' && p.enabled
+  );
   const hasDebridService = userData.services?.some(
-    (s) => s.enabled && !NON_DEBRID_SERVICES.includes(s.id) && !isUsenetService(s.id)
+    (s) =>
+      s.enabled && !NON_DEBRID_SERVICES.includes(s.id) && !isUsenetService(s.id)
   );
   const showPrivateTrackerWarning =
-    status.settings.excludePrivateTrackersFromDebrid && hasProwlarr && hasDebridService;
+    status.settings.excludePrivateTrackersFromDebrid &&
+    hasProwlarr &&
+    hasDebridService;
 
   const allServiceIds = userData.services?.map((s) => s.id) || [];
 
@@ -295,9 +311,9 @@ export function StreamServices() {
           description={
             <>
               Private tracker torrents from Prowlarr are automatically excluded
-              from debrid services to protect your tracker accounts. Debrid services
-              use shared IPs and non-whitelisted clients which can get you banned.
-              Use qBittorrent for private tracker content instead.
+              from debrid services to protect your tracker accounts. Debrid
+              services use shared IPs and non-whitelisted clients which can get
+              you banned. Use qBittorrent for private tracker content instead.
             </>
           }
         />

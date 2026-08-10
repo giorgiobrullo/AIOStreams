@@ -23,7 +23,9 @@ export const stremthruSpecialCases: Partial<
       const mapping = credentials.pathMapping as string;
       const colonIdx = mapping.indexOf(':');
       if (colonIdx === -1) {
-        throw new Error('Path mapping must be in "from:to" format (e.g. /downloads:/media/torrents)');
+        throw new Error(
+          'Path mapping must be in "from:to" format (e.g. /downloads:/media/torrents)'
+        );
       }
       if (colonIdx === 0) {
         throw new Error('Path mapping "from" path cannot be empty');
@@ -112,6 +114,7 @@ export class StremThruPreset extends Preset {
     constants.REALDEBRID_SERVICE,
     constants.TORBOX_SERVICE,
     constants.QBITTORRENT_SERVICE,
+    constants.TORRIN_SERVICE,
   ] as const;
 
   protected static readonly socialLinks: Option['socials'] = [

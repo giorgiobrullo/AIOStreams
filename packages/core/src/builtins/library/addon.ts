@@ -347,7 +347,10 @@ export class LibraryAddon extends BaseDebridAddon<LibraryAddonConfig> {
     this._searchMetadataPromise = this._getSearchMetadata(parsedId, type).then(
       (metadata) => {
         if (metadata.primaryTitle) {
-          metadata.primaryTitle = cleanTitle(metadata.primaryTitle);
+          metadata.primaryTitle = cleanTitle(
+            metadata.primaryTitle,
+            metadata.originalLanguage
+          );
         }
         return metadata;
       }
@@ -375,6 +378,8 @@ export class LibraryAddon extends BaseDebridAddon<LibraryAddonConfig> {
         episode: meta.episode,
         absoluteEpisode: meta.absoluteEpisode,
         relativeAbsoluteEpisode: meta.relativeAbsoluteEpisode,
+        airDates: meta.airDates,
+        isDateBased: meta.isDateBased,
       };
       metadataId = getSimpleTextHash(JSON.stringify(titleMetadata));
       await metadataStore().set(
