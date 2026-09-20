@@ -39,6 +39,7 @@ import { precacheCache } from './caches.js';
 import {
   applyPosterModifications,
   convertDiscoverDeepLinks,
+  withQualifiedCollection,
 } from './catalog.js';
 import {
   hmac,
@@ -248,6 +249,7 @@ export async function processStreams(
     includeExternalFailover?: boolean;
     sameReleaseLimit: number;
     duplicateStaggerMs: number;
+    onlySameReleaseFailover: boolean;
   }
 ): Promise<{
   streams: ParsedStream[];
@@ -350,6 +352,7 @@ export async function processStreams(
         includeExternal: failoverOpts.includeExternalFailover,
         sameReleaseLimit: failoverOpts.sameReleaseLimit,
         duplicateStaggerMs: failoverOpts.duplicateStaggerMs,
+        onlySameReleaseFailover: failoverOpts.onlySameReleaseFailover,
       },
       userScopeKey(ctx.userData)
     ).catch((error) => {
@@ -385,6 +388,7 @@ export async function processStreams(
         includeExternal: failoverOpts.includeExternalFailover,
         sameReleaseLimit: failoverOpts.sameReleaseLimit,
         duplicateStaggerMs: failoverOpts.duplicateStaggerMs,
+        onlySameReleaseFailover: failoverOpts.onlySameReleaseFailover,
       },
       userScopeKey(ctx.userData)
     ).catch((error) => {
@@ -418,6 +422,7 @@ export async function processStreams(
           includeExternal: failoverOpts.includeExternalFailover,
           sameReleaseLimit: failoverOpts.sameReleaseLimit,
           duplicateStaggerMs: failoverOpts.duplicateStaggerMs,
+          onlySameReleaseFailover: failoverOpts.onlySameReleaseFailover,
         },
         userScopeKey(ctx.userData)
       ).catch((error) => {
@@ -685,7 +690,7 @@ export async function getStreams(
     'found addons for stream resource'
   );
 
-  const context = StreamContext.create(type, id, ctx.userData);
+  const context = await StreamContext.create(type, id, ctx.userData);
   ctx.streamContext = context;
 
   const pipelineTtl = appConfig.resources.cache.pipeline.ttl;
@@ -780,6 +785,9 @@ export async function getStreams(
           duplicateStaggerMs:
             ctx.userData.failover.duplicateStaggerMs ??
             constants.DEFAULT_FAILOVER_DUPLICATE_STAGGER_MS,
+          onlySameReleaseFailover:
+            ctx.userData.failover.onlySameReleaseFailover ??
+            constants.DEFAULT_FAILOVER_ONLY_SAME_RELEASE,
         }
       : undefined
   );
@@ -1018,7 +1026,11 @@ export async function getMeta(
       'trying addon for meta resource'
     );
     try {
-      const meta = await new Wrapper(candidate.addon).getMeta(type, id);
+      const meta = withQualifiedCollection(
+        ctx,
+        candidate.instanceId,
+        await new Wrapper(candidate.addon).getMeta(type, id)
+      );
       logger.debug(
         { addon: candidate.addon.name, instanceId: candidate.instanceId },
         'successfully got meta from addon'
@@ -1029,7 +1041,7 @@ export async function getMeta(
         meta.links = convertDiscoverDeepLinks(ctx, meta.links);
       }
       if (meta.videos) {
-        const context = StreamContext.create(type, id, ctx.userData);
+        const context = await StreamContext.create(type, id, ctx.userData);
         ctx.streamContext = context;
         meta.videos = await Promise.all(
           meta.videos.map(async (video) => {

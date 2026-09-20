@@ -4,7 +4,7 @@ import { parseTorrentTitleCached } from './title.js';
 import { RESOLUTIONS } from '../utils/constants.js';
 import { mapLanguageCode, convertLangCodeToName } from '../utils/languages.js';
 
-function matchPattern(
+export function matchPattern(
   filename: string,
   patterns: Record<string, RegExp>
 ): string | undefined {
@@ -48,7 +48,7 @@ function normaliseResolution(
   return undefined;
 }
 
-function matchMultiplePatterns(
+export function matchMultiplePatterns(
   filename: string,
   patterns: Record<string, RegExp>
 ): string[] {
@@ -59,22 +59,8 @@ function matchMultiplePatterns(
 
 class FileParser {
   static parse(filename: string): ParsedFile {
-    // `parsed` is shared by the memo, so the title is adjusted in a local
-    // instead of on the object.
     const parsed = parseTorrentTitleCached(filename);
-    let parsedTitle = parsed.title;
-    if (
-      ['vinland', 'furiosaamadmax', 'horizonanamerican'].includes(
-        (parsedTitle || '')
-          .normalize('NFD')
-          .replace(/[\u0300-\u036f]/g, '')
-          .replace(/[^\p{L}\p{N}+]/gu, '')
-          .toLowerCase()
-      ) &&
-      parsed.complete
-    ) {
-      parsedTitle = `${parsedTitle} Saga`;
-    }
+    const parsedTitle = parsed.title;
     // prevent the title from being parsed for info
     if (parsedTitle && parsedTitle.length > 4) {
       const escapedTitle = parsedTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -119,8 +105,7 @@ class FileParser {
       ]),
     ];
 
-    const releaseGroup =
-      filename.match(PARSE_REGEX.releaseGroup)?.[1] ?? parsed.group;
+    const releaseGroup = parsed.group;
     const title = parsedTitle;
     const year = parsed.year ? parsed.year.toString() : undefined;
     const country = parsed.country;
@@ -150,6 +135,7 @@ class FileParser {
       unrated: parsed.unrated ?? false,
       upscaled: parsed.upscaled ?? false,
       network: parsed.network,
+      site: parsed.site,
       container: parsed.container,
       extension: parsed.extension,
       seasons: parsed.seasons,

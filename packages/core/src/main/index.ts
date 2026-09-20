@@ -5,12 +5,7 @@ import {
   StrictManifestResource,
   UserData,
 } from '../db/index.js';
-import {
-  Cache,
-  createLogger,
-  IdParser,
-  userScopeKey,
-} from '../utils/index.js';
+import { Cache, createLogger, IdParser, userScopeKey } from '../utils/index.js';
 import { withVariantSelector } from '../variants/runtime.js';
 import Proxifier from '../streams/proxifier.js';
 import StreamLimiter from '../streams/limiter.js';
@@ -29,6 +24,10 @@ import {
   fetchManifests,
   buildResources,
 } from './setup.js';
+import {
+  resolvePlaybackSinks,
+  type ResolvedPlaybackSink,
+} from '../watch-state/handoff/index.js';
 import { getCatalog as _getCatalog } from './catalog.js';
 import {
   getStreams as _getStreams,
@@ -129,6 +128,19 @@ export class AIOStreams {
     return this.ctx.finalCatalogs;
   }
 
+  /** A catalog an addon declares, whether or not this configuration lists it. */
+  public findAddonCatalog(
+    type: string,
+    id: string
+  ): Manifest['catalogs'][number] | undefined {
+    this.checkInitialised();
+    const instanceId = id.split('.', 1)[0];
+    const catalog = this.ctx.manifests[instanceId]?.catalogs?.find(
+      (c) => `${instanceId}.${c.id}` === id && c.type === type
+    );
+    return catalog ? { ...catalog, id } : undefined;
+  }
+
   public getAddonCatalogs(): Manifest['addonCatalogs'] {
     this.checkInitialised();
     return this.ctx.finalAddonCatalogs;
@@ -136,6 +148,18 @@ export class AIOStreams {
 
   public getAddon(instanceId: string): Addon | undefined {
     return this.ctx.addons.find((a) => a.instanceId === instanceId);
+  }
+
+  public getPlaybackSinks(): ResolvedPlaybackSink[] {
+    this.checkInitialised();
+    return resolvePlaybackSinks(this.ctx);
+  }
+
+  /** Addons whose manifest failed to load. */
+  public getFailedAddons(): Addon[] {
+    return this.ctx.addonInitialisationErrors.flatMap(({ addon }) =>
+      'preset' in addon ? [addon] : []
+    );
   }
 
   public async shouldStopAutoPlay(type: string, id: string) {

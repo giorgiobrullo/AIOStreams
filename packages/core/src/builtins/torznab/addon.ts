@@ -13,6 +13,7 @@ import {
   NabAddonConfig,
   parseNabParsedFileInfo,
 } from '../base/nab/addon.js';
+import { ageInHoursSince } from '../utils/general.js';
 
 const logger = createLogger('torznab');
 
@@ -68,7 +69,9 @@ export class TorznabAddon extends BaseNabAddon<NabAddonConfig, TorznabApi> {
       torrents.push({
         confirmed: meta.searchType === 'id',
         hash: infoHash,
+        guid: result.guid,
         downloadUrl,
+        age: result.pubDate ? ageInHoursSince(result.pubDate) : undefined,
         sources: result.torznab?.magneturl?.toString()
           ? extractTrackersFromMagnet(result.torznab.magneturl.toString())
           : [],
@@ -81,7 +84,10 @@ export class TorznabAddon extends BaseNabAddon<NabAddonConfig, TorznabApi> {
           typeof result.torznab?.downloadvolumefactor === 'number'
             ? result.torznab.downloadvolumefactor
             : undefined,
-        indexer: result.jackettindexer?.name ?? undefined,
+        indexer:
+          result.prowlarrindexer?.name ??
+          result.jackettindexer?.name ??
+          undefined,
         title: result.title,
         size:
           result.size ??

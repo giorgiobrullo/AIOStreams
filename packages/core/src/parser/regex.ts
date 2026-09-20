@@ -37,7 +37,6 @@ type PARSE_REGEX = {
     'Unknown' | 'Original'
   >;
   encodes: Omit<Record<(typeof constants.ENCODES)[number], RegExp>, 'Unknown'>;
-  releaseGroup: RegExp;
 };
 
 export const PARSE_REGEX: PARSE_REGEX = {
@@ -114,6 +113,7 @@ export const PARSE_REGEX: PARSE_REGEX = {
       'dts(?![ .\\-:_]?(x(?=[\\s\\)\\]_.\\-,]|$)|hd[ .\\-_]?(ma)?|es))'
     ),
     TrueHD: createRegex('true[ .\\-_]?hd'),
+    PCM: createRegex('l?pcm'),
     OPUS: createRegex('opus'),
     AAC: createRegex('q?aac(?:[ .\\-_]?2)?'),
     FLAC: createRegex('flac(?:[ .\\-_]?(lossless|2\\.0|x[2-4]))?'),
@@ -137,6 +137,7 @@ export const PARSE_REGEX: PARSE_REGEX = {
     'VC-1': createRegex('vc[ .\\-_]?1'),
     XviD: createRegex('xvid'),
     DivX: createRegex('divx|dvix'),
+    'MPEG-4': createRegex('mpeg[ .\\-_]?4'),
   },
   languages: {
     Multi: createLanguageRegex('multi'),
@@ -195,6 +196,4 @@ export const PARSE_REGEX: PARSE_REGEX = {
     Malay: createLanguageRegex('malay'),
     Latino: createLanguageRegex('latino|lat'),
   },
-  releaseGroup:
-    /-[. ]?(?!\d+$|S\d+|\d+x|ep?\d+|[^[]+]$)([^\-. []+[^\-. [)\]\d][^\-. [)\]]*)(?:\[[\w.-]+])?(?=\)|[.-]+\w{2,4}$|$)/i,
 };
