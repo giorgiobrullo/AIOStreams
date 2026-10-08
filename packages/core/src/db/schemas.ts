@@ -111,6 +111,23 @@ const Formatter = z.object({
 const CONFIG_UUID_SHAPE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+export const PERSONA_PIN_PATTERN = /^\d{4,12}$/;
+const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
+/** A plain PIN as entered, or the bcrypt hash it was saved as. */
+const PERSONA_LOCK_PATTERN = new RegExp(
+  `${PERSONA_PIN_PATTERN.source}|${BCRYPT_HASH_PATTERN.source}`
+);
+
+export function isPersonaLockHash(value: string): boolean {
+  return BCRYPT_HASH_PATTERN.test(value);
+}
+
+/** A PIN's bcrypt hash; a plain PIN sent here is hashed when the config is saved. */
+const UserLockSchema = z
+  .string()
+  .regex(PERSONA_LOCK_PATTERN, 'A PIN must be 4 to 12 digits.')
+  .optional();
+
 /** A user a Jellyfin client can sign in as. Shares the configuration's credential. */
 const JellyfinPersonaSchema = z.object({
   // Names the DB partition, so a rename must not touch it.
@@ -130,6 +147,7 @@ const JellyfinPersonaSchema = z.object({
   trackers: z.array(z.string().min(1)).max(50).optional(),
   /** Kept out of the picker; still usable by name. */
   hidden: z.boolean().optional(),
+  lock: UserLockSchema,
 });
 
 export type JellyfinPersona = z.infer<typeof JellyfinPersonaSchema>;
@@ -154,6 +172,10 @@ const JellyfinSettingsFields = z.object({
   segments: z.boolean().optional(),
   /** Which markers to offer. Absent means all of them. */
   segmentTypes: z.array(z.enum(['Intro', 'Recap', 'Outro'])).optional(),
+  /** Send unaired episodes as missing, which clients won't offer to play. Default on. */
+  markUnaired: z.boolean().optional(),
+  /** Seconds a play waits for its version's tracks; absent uses the instance's. */
+  playWait: z.number().int().min(0).max(30).optional(),
   /** The configuration's own user: the history its trackers sync with. */
   primary: z
     .object({
@@ -165,6 +187,7 @@ const JellyfinSettingsFields = z.object({
         .optional(),
       /** Preset ids of the trackers it syncs with; absent means all. */
       trackers: z.array(z.string().min(1)).max(50).optional(),
+      lock: UserLockSchema,
     })
     .optional(),
   personas: z
@@ -231,33 +254,13 @@ const JellyfinSettingsFields = z.object({
 
 /** Per-configuration settings for the Jellyfin-compatible API. */
 const JellyfinSettings = JellyfinSettingsFields.superRefine((settings, ctx) => {
-  // A tracker account belongs to one history, or two histories would mix.
-  const owners = new Map<string, string>();
-  const claim = (who: string, trackers: string[] | undefined) => {
-    for (const id of new Set(trackers ?? [])) {
-      const owner = owners.get(id);
-      if (owner) {
-        ctx.addIssue({
-          code: 'custom',
-          message: `Tracker "${id}" is selected for both ${owner} and ${who}.`,
-        });
-      } else {
-        owners.set(id, who);
-      }
-    }
-  };
-  claim('the primary user', settings.primary?.trackers);
   for (const persona of settings.personas ?? []) {
-    if (persona.history === 'shared') {
-      if (persona.trackers) {
-        ctx.addIssue({
-          code: 'custom',
-          message: `${persona.name} shares the primary user's history, so it uses the primary user's trackers.`,
-        });
-      }
-      continue;
+    if (persona.history === 'shared' && persona.trackers) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `${persona.name} shares the primary user's history, so it uses the primary user's trackers.`,
+      });
     }
-    claim(persona.name, persona.trackers);
   }
 });
 
@@ -552,12 +555,14 @@ const CatalogModification = z.object({
   reverse: z.boolean().optional(), // reverse the catalog
   persistShuffleFor: z.number().min(0).max(24).optional(), // persist the shuffle for a given amount of time (in hours)
   onlyOnDiscover: z.boolean().optional(), // only show the catalog on the discover page
+  showOnHome: z.boolean().optional(), // show a genre-requiring catalog on the home page too
   disableSearch: z.boolean().optional(), // disable the search for the catalog
   onlyOnSearch: z.boolean().optional(), // only show the catalog on search results - mutually exclusive with onlyOnDiscover, only available when the catalog has a non-required search extra
   enabled: z.boolean().optional(), // enable or disable the catalog
   usePosterService: z.boolean().optional(), // use rpdb or top poster for posters if supported
   overrideType: z.string().min(1).optional(), // override the type of the catalog
   hideable: z.boolean().optional(), // hide the catalog from the home page
+  genreRequired: z.boolean().optional(), // property of whether only a genre is required (showOnHome applies)
   searchable: z.boolean().optional(), // property of whether the catalog is searchable (not a search only catalog)
   addonName: z.string().optional(), // the name of the addon that provides the catalog
 });
@@ -1122,6 +1127,8 @@ export const UserDataSchema = z.object({
   presets: PresetList,
   addonCategoryColors: z.record(z.string(), z.string()).optional(), // maps custom category name → colour key
   catalogModifications: z.array(CatalogModification).optional(),
+  newCatalogsDisabled: z.array(z.string()).optional(), // addon instance ids whose catalogs start disabled until saved otherwise
+  upstreamCatalogOrder: z.array(z.string()).optional(), // addon instance ids whose catalogs keep the addon's order within their positions
   mergedCatalogs: z.array(MergedCatalog).optional(),
   externalDownloads: z.boolean().optional(),
   cacheAndPlay: CacheAndPlaySchema.optional(),
@@ -1171,6 +1178,11 @@ export const UserDataSchema = z.object({
     })
     .optional(),
   jellyfin: JellyfinSettings.optional(),
+  remuxDb: z
+    .object({
+      enabled: z.boolean().optional(),
+    })
+    .optional(),
 });
 
 export type UserData = z.infer<typeof UserDataSchema>;
@@ -1225,6 +1237,7 @@ const AddonCatalogDefinitionSchema = z.object({
  */
 export const WatchStateCapabilitySchema = z.looseObject({
   version: z.coerce.number().optional(),
+  viewers: z.boolean().optional(),
   push: z
     .looseObject({
       events: z.array(z.string()).optional(),
@@ -1237,6 +1250,7 @@ export const WatchStateCapabilitySchema = z.looseObject({
       items: z.boolean().optional(),
       watched: z.boolean().optional(),
       watchlist: z.boolean().optional(),
+      ratings: z.boolean().optional(),
       ttlSeconds: z.coerce.number().min(0).optional(),
     })
     .optional(),
@@ -1267,6 +1281,7 @@ export const ManifestSchema = z
         p2p: z.boolean().optional(),
         configurable: z.boolean().optional(),
         configurationRequired: z.boolean().optional(),
+        epgProvider: z.boolean().optional(),
       })
       .optional(),
     // not part of the manifest scheme, but needed for stremio-addons.net
@@ -1370,10 +1385,13 @@ export const MEDIA_INFO_QUALITY_TIERS = ['probe', 'indexer', 'addon'] as const;
 
 /** One probed audio or subtitle track; see ParsedMediaTrack in utils/media-info. */
 export const MediaTrackSchema = z.object({
+  index: z.number().int().nonnegative().optional(),
   lang: z.string().optional(),
   codec: z.string().optional(),
   title: z.string().optional(),
+  /** @deprecated the first of `tags` */
   tag: z.string().optional(),
+  tags: z.array(z.string()).optional(),
   channels: z.string().optional(),
   default: z.boolean().optional(),
   forced: z.boolean().optional(),
@@ -1398,6 +1416,7 @@ export const ParsedFileSchema = z.object({
   subtitles: z.array(z.string()).optional(),
   audioTracks: z.array(MediaTrackSchema).optional(),
   subtitleTracks: z.array(MediaTrackSchema).optional(),
+  videoIndex: z.number().int().nonnegative().optional(),
   subbed: z.boolean().optional(),
   dubbed: z.boolean().optional(),
   title: z.string().optional(),
@@ -1466,6 +1485,8 @@ export const ParsedStreamSchema = z.object({
       sources: z.array(z.string().min(1)).optional(),
       private: z.boolean().optional(),
       freeleech: z.boolean().optional(),
+      file: z.string().min(1).optional(),
+      title: z.string().min(1).optional(),
     })
     .optional(),
   countryWhitelist: z.array(z.string().length(3)).optional(),
@@ -1548,8 +1569,8 @@ export type ParsedStreams = z.infer<typeof ParsedStreams>;
 
 const TrailerSchema = z
   .object({
-    source: z.string().min(1),
-    type: z.string(),
+    source: z.string().optional(),
+    type: z.string().optional(),
   })
   .passthrough();
 
@@ -1558,6 +1579,15 @@ const MetaLinkSchema = z
     name: z.string().min(1),
     category: z.string().min(1),
     url: z.string().url().or(z.string().startsWith('stremio:///')),
+  })
+  .passthrough();
+
+/** A certification a programme carries. */
+const ContentRatingSchema = z
+  .object({
+    value: z.string(),
+    system: z.string().nullish(),
+    icon: z.string().nullish(),
   })
   .passthrough();
 
@@ -1638,6 +1668,18 @@ const MetaVideoSchema = z
     ids: ExternalIdsSchema.nullish(),
     rating: z.number().or(z.string()).nullish(),
     people: z.array(MetaPersonSchema).nullish(),
+    startTime: z.string().nullish(),
+    endTime: z.string().nullish(),
+    runtime: z.string().nullish(),
+    releaseInfo: z.string().nullish(),
+    genres: z.array(z.string()).nullish(),
+    cast: z.array(z.string()).nullish(),
+    directors: z.array(z.string()).nullish(),
+    links: z.array(MetaLinkSchema).nullish(),
+    // Some addons send a display string here.
+    ratings: z.array(ContentRatingSchema).nullish().catch(undefined),
+    filler: z.boolean().nullish(),
+    recap: z.boolean().nullish(),
   })
   .passthrough();
 
@@ -1689,6 +1731,7 @@ export const MetaSchema = MetaPreviewSchema.extend({
     .object({
       defaultVideoId: z.string().or(z.null()).optional(),
       hasScheduledVideo: z.boolean().nullable().optional(),
+      hasScheduledVideos: z.boolean().nullable().optional(),
     })
     .passthrough()
     .optional(),
@@ -1728,6 +1771,7 @@ export const ExtrasSchema = z
     skip: z.coerce.number().optional(),
     genre: z.string().optional(),
     search: z.string().optional(),
+    date: z.string().optional(),
     filename: z.string().optional(),
     videoHash: z.string().optional(),
     videoSize: z.coerce.number().optional(),
@@ -1866,8 +1910,12 @@ const StatusResponseSchema = z.object({
         maxLibraries: z.number(),
         /** Extra users a configuration may add beyond its primary user. */
         maxPersonas: z.number(),
+        /** Whether a user's PIN alone signs it in on a picker address. */
+        pinSignIn: z.boolean().optional(),
         /** Trackers one user syncs with at most. */
         maxTrackers: z.number(),
+        /** The default wait for tracks on play; absent when nothing is probed. */
+        playWait: z.number().optional(),
         segments: z.object({
           enabled: z.boolean(),
           /** In the operator's order; `configuration` needs the configuration's own key. */
@@ -1919,7 +1967,6 @@ const StatusResponseSchema = z.object({
       minTtl: z.number(),
       maxTimeout: z.number(),
       maxBytes: z.number(),
-      allowPrivateUrls: z.boolean(),
     }),
     loggingSensitiveInfo: z.boolean(),
     searchApiDisabled: z.boolean(),
@@ -1929,6 +1976,7 @@ const StatusResponseSchema = z.object({
       tmdb: z.object({ accessToken: z.boolean(), apiKey: z.boolean() }),
       tvdb: z.object({ apiKey: z.boolean() }),
     }),
+    remuxdb: z.object({ enabled: z.boolean() }),
     /** Global analytics master switch (false = no events written anywhere). */
     analyticsEnabled: z.boolean(),
     /** Per-user analytics (configure-page Stats tab) enabled state. */

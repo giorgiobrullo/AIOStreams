@@ -14,7 +14,7 @@ import {
   type UserData,
   type WatchScope,
 } from '@aiostreams/core';
-import { personaById, resolveConfigFor } from './context.js';
+import { lockTag, personaById, resolveConfigFor } from './context.js';
 
 const logger = createLogger('jellyfin');
 
@@ -23,7 +23,7 @@ const MAX_SOCKETS_TOTAL = 50_000;
 const KEEPALIVE_SECONDS = 60;
 
 const SOCKET_PATH =
-  /^\/jellyfin(?:\/([^/?]+)\/([^/?]+))?(?:\/v\/[^/?]+)?(?:\/(?:emby|mediabrowser))?\/(?:socket|websocket)(?:\?|$)/i;
+  /^\/jellyfin(?:\/([^/?]+)\/[^/?]+)?(?:\/(?:emby|mediabrowser))?\/(?:socket|websocket)(?:\?|$)/i;
 
 interface SocketUser {
   /** The rows this socket follows. */
@@ -47,30 +47,28 @@ async function authenticateUpgrade(url: string): Promise<SocketUser | null> {
     query.get('apikey') ??
     query.get('token') ??
     '';
+  const payload = apiKey ? readToken(apiKey) : null;
+  // Nothing here pushes sessions; a tool polls /Sessions once its socket fails.
+  if (!payload || payload.a) return null;
+  if (
+    m[1] &&
+    decodeURIComponent(m[1]).toLowerCase() !== payload.u.toLowerCase()
+  )
+    return null;
   // Resolved rather than verified: see `resolveConfigFor`. The config this
   // proves the credentials with is the same one the persona is read from, so
   // the persona branch costs nothing extra.
-  let resolved: { uuid: string; userData: UserData } | null = null;
-  let personaKey = '';
-  if (apiKey) {
-    const payload = readToken(apiKey);
-    // Nothing here pushes sessions; a tool polls /Sessions once its socket fails.
-    if (payload?.a) return null;
-    if (payload) {
-      resolved = await resolveConfigFor(payload.u, payload.p);
-      personaKey = payload.k ?? '';
-    }
-  }
-  if (!resolved && m[1] && m[2]) {
-    resolved = await resolveConfigFor(decodeURIComponent(m[1]), m[2]);
-  }
+  const resolved: { uuid: string; userData: UserData } | null =
+    await resolveConfigFor(payload.u, payload.p);
+  const personaKey = payload.k ?? '';
   if (!resolved) return null;
   const { uuid, userData } = resolved;
-  if (!personaKey) {
+  const persona = personaKey ? personaById(userData, personaKey) : null;
+  if (personaKey && !persona) return null;
+  if ((payload.l ?? '') !== lockTag(userData, persona)) return null;
+  if (!persona) {
     return { scope: accountScope(uuid), userId: personaUserId(uuid, '') };
   }
-  const persona = personaById(userData, personaKey);
-  if (!persona) return null;
   return {
     scope:
       persona.history === 'shared'

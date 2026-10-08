@@ -7,11 +7,13 @@ import {
   type SinkRow,
 } from '../../db/repositories/playback-handoff.js';
 import { getSimpleTextHash } from '../../utils/crypto.js';
-import type { IdType } from '../../utils/id-parser.js';
+import { IdParser, type IdType } from '../../utils/id-parser.js';
 import { sinkProbeMs } from './deliver.js';
 import { pullUrlFor, pushUrlFor, uniqueByAddress } from './resolve.js';
 import {
+  DROP_EVENTS,
   PLAYBACK_EVENTS,
+  RATING_EVENTS,
   WATCHLIST_EVENTS,
   type PlaybackEventKind,
 } from './capability.js';
@@ -23,13 +25,14 @@ const logger = createLogger('playback-handoff');
 
 /**
  * Transitions key on position, not a clock bucket, so a pause and the resume
- * after it stay two events. A mark has no position and keys on its timestamp.
+ * after it stay two events, and on when the playback began, so a later viewing
+ * never repeats an earlier one's ids. A mark keys on its timestamp.
  */
 function idempotencyKeyFor(event: PlaybackEventInput, at: number): string {
   const suffix =
     event.kind === 'played' || event.kind === 'unplayed'
       ? at
-      : Math.round(event.positionMs ?? 0);
+      : `${Math.round(event.positionMs ?? 0)}${event.sessionStartedAt ? `|${event.sessionStartedAt}` : ''}`;
   return `${event.itemKey}|${event.kind}|${suffix}`;
 }
 
@@ -65,6 +68,7 @@ export interface PlaybackEventInput {
   durationMs?: number;
   /** Our threshold decision, so the addon does not re-derive it. */
   played?: boolean;
+  sessionStartedAt?: number;
   providerIds?: Record<string, string>;
 }
 
@@ -99,6 +103,9 @@ const ANIME_MAPPED: [keyof AnimeEntryMappings, string][] = [
   ['themoviedbId', 'tmdb'],
   ['thetvdbId', 'tvdb'],
 ];
+
+/** Ids that name one anime entry. */
+const ENTRY_IDS = ['mal', 'kitsu', 'anilist', 'anidb'];
 
 /** Fills gaps from the anime database. */
 async function fillAnimeIds(
@@ -325,6 +332,12 @@ function replacesFor(
     case 'watchlisted':
     case 'unwatchlisted':
       return WATCHLIST_EVENTS;
+    case 'dropped':
+    case 'undropped':
+      return DROP_EVENTS;
+    case 'rated':
+    case 'unrated':
+      return RATING_EVENTS;
     case 'start':
     case 'pause':
       return ['start', 'pause'];
@@ -528,18 +541,19 @@ export async function dispatchBulkMark(
   );
 }
 
-export interface WatchlistChangeInput {
-  kind: 'watchlisted' | 'unwatchlisted';
+/** A title put on or taken off one of the tracker's lists. */
+export interface ListChangeInput {
+  kind: 'watchlisted' | 'unwatchlisted' | 'dropped' | 'undropped';
   type: string;
   metaId: string;
   itemKey: string;
   providerIds?: Record<string, string>;
 }
 
-export async function dispatchWatchlist(
+export async function dispatchListChange(
   scope: WatchScope,
   sinks: ResolvedPlaybackSink[],
-  change: WatchlistChangeInput
+  change: ListChangeInput
 ): Promise<void> {
   if (!appConfig.watchState.reportEnabled || !sinks.length) return;
 
@@ -567,7 +581,80 @@ export async function dispatchWatchlist(
           ...(Object.keys(ids).length ? { ids } : {}),
         }),
         priority: SINGLE_LANE,
-        replaces: WATCHLIST_EVENTS,
+        replaces: replacesFor(change.kind),
+      },
+    ]
+  );
+}
+
+/** A rating given or cleared; an episode is named as its playback events name it. */
+export interface RatingChangeInput {
+  kind: 'rated' | 'unrated';
+  scope: 'movie' | 'series' | 'season' | 'episode';
+  type: string;
+  metaId: string;
+  itemKey: string;
+  videoId?: string | null;
+  season?: number | null;
+  episode?: number | null;
+  rating?: number;
+  providerIds?: Record<string, string>;
+}
+
+export async function dispatchRating(
+  scope: WatchScope,
+  sinks: ResolvedPlaybackSink[],
+  change: RatingChangeInput
+): Promise<void> {
+  if (!appConfig.watchState.reportEnabled || !sinks.length) return;
+
+  const at = Date.now();
+  let ids = externalIds(change.providerIds);
+  const entryKeyed = ['kitsuId', 'malId', 'anilistId', 'anidbId'].includes(
+    IdParser.parse(change.metaId, change.type)?.type ?? ''
+  );
+  // A show kept under an id that spans several anime entries names none of
+  // them; its seasons and episodes name their own.
+  if (!entryKeyed && change.scope !== 'movie')
+    ids = Object.fromEntries(
+      Object.entries(ids).filter(([key]) => !ENTRY_IDS.includes(key))
+    );
+  if (entryKeyed || change.scope !== 'series')
+    ids = await fillAnimeIds(ids, change.season, change.episode);
+  const idempotencyKey = `r|${change.itemKey}|${change.kind}|${at}`;
+  const episode = change.scope === 'episode' ? change.videoId : null;
+  const pathId = episode ?? change.metaId;
+
+  await queueToSinks(
+    scope,
+    sinks,
+    change.kind,
+    (sink) =>
+      matchesSink(sink, change.kind, change.type, [pathId, change.metaId]),
+    async (sink) => [
+      {
+        idempotencyKey,
+        event: change.kind,
+        itemKey: change.itemKey,
+        url: pushUrlFor(sink, change.type, pathId),
+        body: JSON.stringify({
+          id: idempotencyKey,
+          event: change.kind,
+          scope: change.scope,
+          at: Math.floor(at / 1000),
+          metaId: change.metaId,
+          ...(episode ? { videoId: episode } : {}),
+          ...(change.scope === 'season' || episode
+            ? {
+                ...(change.season != null ? { season: change.season } : {}),
+                ...(change.episode != null ? { episode: change.episode } : {}),
+              }
+            : {}),
+          ...(change.rating != null ? { rating: change.rating } : {}),
+          ...(Object.keys(ids).length ? { ids } : {}),
+        }),
+        priority: SINGLE_LANE,
+        replaces: RATING_EVENTS,
       },
     ]
   );

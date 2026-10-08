@@ -254,6 +254,8 @@ export const DEFAULT_FAILOVER_PREFERRED_GRACE_MS = 2000;
  * a proxy.
  */
 export const INTERNAL_PROXY_MARKER = 'from_proxy';
+/** Query marker naming the client path a play came from (`jellyfin`). */
+export const PLAY_PATH_MARKER = 'via';
 
 /**
  * Path prefix of an AIOStreams builtin-proxy URL.
@@ -665,7 +667,7 @@ const SERVICE_DETAILS: Record<
     id: AIOSTREAMS_SERVICE,
     name: 'AIOStreams',
     shortName: 'AIO',
-    knownNames: ['AIO', 'AIO Usenet', 'NZB', 'Usenet', 'Native Usenet'],
+    knownNames: ['AIO', 'AIO Usenet', 'NZB', 'Native Usenet'],
     // Streams from the operator's own NNTP providers, not a debrid host - same
     // classification as nzbdav / altmount / stremthru_newz.
     debrid: false,
@@ -1181,6 +1183,7 @@ export const DEFAULT_SMART_DETECT_ATTRIBUTES: SmartDetectAttribute[] = [
 
 export const AUTO_PLAY_ATTRIBUTES = [
   'service',
+  'cached',
   'addon',
   'proxied',
   'resolution',

@@ -3,10 +3,10 @@ import {
   APIError,
   constants,
   createLogger,
-  decryptString,
+  decodeProxyToken,
+  ProxyDataSchema,
   resolveOverrideHeaders,
   appConfig,
-  fromUrlSafeBase64,
   getTimeTakenSincePoint,
   makeUrlLogSafe,
   rewriteRequestUrl,
@@ -23,6 +23,9 @@ import {
   BuiltinProxy,
   streamRegistry,
   proxyTargetKey,
+  PLAYBACK_PATH_PREFIX,
+  withPlayPath,
+  onProxiedPlay,
 } from '@aiostreams/core';
 import { z } from 'zod';
 import { request, Dispatcher } from 'undici';
@@ -39,6 +42,18 @@ function sanitiseHeaderValue(value: string): string {
   return value.replace(/[^\t\x20-\x7e]/g, '');
 }
 
+const HOP_BY_HOP = [
+  'connection',
+  'upgrade',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailers',
+  'transfer-encoding',
+  'proxy-connection',
+];
+
 // A helper to iterate over the headers object
 function sanitiseHeaders(
   headers: Record<string, string | string[] | number | undefined>
@@ -46,7 +61,7 @@ function sanitiseHeaders(
   const sanitised: Record<string, string | string[]> = {};
 
   for (const [key, value] of Object.entries(headers)) {
-    if (value === undefined) {
+    if (value === undefined || HOP_BY_HOP.includes(key.toLowerCase())) {
       continue;
     }
 
@@ -101,16 +116,7 @@ function copyHeaders(headers: Record<string, string | string[] | undefined>) {
     'cf-pseudo-ipv4',
     'x-forwarded-proto',
 
-    // Hop-by-hop headers
-    'connection',
-    'upgrade',
-    'keep-alive',
-    'proxy-authenticate',
-    'proxy-authorization',
-    'te',
-    'trailers',
-    'transfer-encoding',
-    'proxy-connection',
+    ...HOP_BY_HOP,
   ]);
   return Object.fromEntries(
     Object.entries(headers).filter(([key]) => !exclude.has(key))
@@ -124,15 +130,6 @@ const ProxyAuthSchema = z.object({
   password: z.string(),
 });
 
-const ProxyDataSchema = z.object({
-  url: z.url(),
-  filename: z.string().optional(),
-  type: z.enum(['nzb', 'stream']).optional(),
-  // These are optional, as we'll be forwarding client headers
-  requestHeaders: z.record(z.string(), z.string()).optional(),
-  responseHeaders: z.record(z.string(), z.string()).optional(),
-});
-
 type ProxyAuth = z.infer<typeof ProxyAuthSchema>;
 type ProxyData = z.infer<typeof ProxyDataSchema>;
 
@@ -144,36 +141,9 @@ type ProxyData = z.infer<typeof ProxyDataSchema>;
 function decodeAndAuthorizeRequest(
   encryptedAuthAndData: string,
   requestId: string
-): { auth: ProxyAuth; data: ProxyData } {
-  const parts = encryptedAuthAndData.split('.');
-  let encodedAuth: string;
-  let encodedData: string;
-  let encodeMode: 'e' | 'u';
-  if (parts.length === 2) {
-    encodeMode = 'e';
-    [encodedAuth, encodedData] = parts;
-  } else if (parts.length === 3) {
-    encodeMode = parts[0] as 'e' | 'u';
-    [, encodedAuth, encodedData] = parts;
-  } else {
-    throw new APIError(
-      constants.ErrorCode.BAD_REQUEST,
-      undefined,
-      'Invalid encrypted auth and data'
-    );
-  }
-
-  let rawAuth: string | undefined;
-  let rawData: string | undefined;
-  if (encodeMode === 'e') {
-    rawAuth = decryptString(encodedAuth).data ?? undefined;
-    rawData = decryptString(encodedData).data ?? undefined;
-  } else {
-    rawAuth = fromUrlSafeBase64(encodedAuth);
-    rawData = fromUrlSafeBase64(encodedData);
-  }
-
-  if (!rawData || !rawAuth) {
+): { auth: ProxyAuth; data: ProxyData; encrypted: boolean } {
+  const decoded = decodeProxyToken(encryptedAuthAndData);
+  if (!decoded) {
     logger.error(`[${requestId}] Decryption failed`);
     throw new APIError(
       constants.ErrorCode.ENCRYPTION_ERROR,
@@ -182,8 +152,8 @@ function decodeAndAuthorizeRequest(
     );
   }
 
-  const data = ProxyDataSchema.parse(JSON.parse(rawData));
-  const auth = ProxyAuthSchema.parse(JSON.parse(rawAuth));
+  const data = ProxyDataSchema.parse(JSON.parse(decoded.rawData));
+  const auth = ProxyAuthSchema.parse(JSON.parse(decoded.rawAuth));
 
   if (!validateCredentials(auth.username, auth.password)) {
     logger.warn(`[${requestId}] Authentication failed`, {
@@ -207,7 +177,7 @@ function decodeAndAuthorizeRequest(
     );
   }
 
-  return { auth, data };
+  return { auth, data, encrypted: decoded.encrypted };
 }
 
 /**
@@ -371,8 +341,11 @@ router.all(
     let session: ReturnType<typeof streamRegistry.open> | undefined;
 
     try {
-      const { auth: decodedAuth, data: decodedData } =
-        decodeAndAuthorizeRequest(req.params.encryptedAuthAndData, requestId);
+      const {
+        auth: decodedAuth,
+        data: decodedData,
+        encrypted,
+      } = decodeAndAuthorizeRequest(req.params.encryptedAuthAndData, requestId);
       auth = decodedAuth;
       data = decodedData;
       const filename = req.params.filename as string | undefined;
@@ -437,7 +410,12 @@ router.all(
       }
 
       const upstreamStartTime = Date.now();
-      let currentUrl = data.url;
+      // Our playback route learns which client path this proxy URL served.
+      let currentUrl =
+        req.query[constants.PLAY_PATH_MARKER] === 'jellyfin' &&
+        data.url.includes(PLAYBACK_PATH_PREFIX)
+          ? withPlayPath(data.url, 'jellyfin')
+          : data.url;
 
       let redirectCount = 0;
       let method = req.method as Dispatcher.HttpMethod;
@@ -542,6 +520,28 @@ router.all(
         contentRange: upstreamResponse.headers['content-range'],
         targetUrl: currentUrl,
       });
+
+      // Only a token we encrypted can name the release it plays.
+      if (
+        encrypted &&
+        data.mediaInfo &&
+        req.method === 'GET' &&
+        upstreamResponse.statusCode < 300 &&
+        rangeStart(req.headers.range) === 0 &&
+        !data.url.includes(PLAYBACK_PATH_PREFIX)
+      ) {
+        onProxiedPlay({
+          path:
+            req.query[constants.PLAY_PATH_MARKER] === 'jellyfin'
+              ? 'jellyfin'
+              : 'stremio',
+          url: currentUrl,
+          from: data.url,
+          headers: data.requestHeaders,
+          mediaInfo: data.mediaInfo,
+          filename: data.filename,
+        });
+      }
 
       if (session?.ok) {
         // Content-Range carries the whole file; Content-Length only this range.

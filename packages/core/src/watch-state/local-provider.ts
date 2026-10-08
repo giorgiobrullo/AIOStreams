@@ -8,22 +8,31 @@ import {
   type WatchStatePatch,
   type WatchStateRow,
 } from '../db/repositories/watch-state.js';
-import type {
-  WatchChangeListener,
-  WatchEvent,
-  WatchProgressEvent,
-  WatchScope,
-  WatchStateProvider,
+import {
+  seriesKeyOfMatch,
+  type WatchChangeListener,
+  type WatchEvent,
+  type WatchProgressEvent,
+  type WatchScope,
+  type WatchStateProvider,
 } from './types.js';
 
 const logger = createLogger('watch-state');
 
-/** Progress at or past this fraction marks the item played. */
-const PLAYED_FRACTION = 0.9;
-/** Progress below this fraction on stop resets the position. */
-const RESUME_MIN_FRACTION = 0.05;
 /** Items shorter than this never create a resume entry. */
 const RESUME_MIN_DURATION_MS = 90_000;
+
+export function playedThrough(
+  positionMs: number,
+  durationMs: number | undefined
+): boolean {
+  return (
+    !!durationMs &&
+    durationMs > 0 &&
+    positionMs >= (durationMs * appConfig.watchState.playedPercent) / 100
+  );
+}
+
 interface PendingProgress {
   scope: WatchScope;
   identity: WatchIdentity;
@@ -54,6 +63,10 @@ export class LocalWatchStateProvider implements WatchStateProvider {
 
   listRecentSeries(scope: WatchScope, limit: number) {
     return WatchStateRepository.listRecentSeries(scope, limit);
+  }
+
+  recentSeries(scope: WatchScope, page: number) {
+    return WatchStateRepository.recentSeries(scope, page);
   }
 
   listFavorites(scope: WatchScope, kinds?: WatchKind[]) {
@@ -100,6 +113,7 @@ export class LocalWatchStateProvider implements WatchStateProvider {
       }
       case 'start': {
         this.pending.delete(key);
+        await this.undropOnPlay(scope, event.identity);
         return this.write(scope, event.identity, {
           positionMs: event.positionMs,
           durationMs: event.durationMs,
@@ -137,11 +151,76 @@ export class LocalWatchStateProvider implements WatchStateProvider {
           snapshot: event.snapshot,
         });
       case 'unfavorite':
+        await this.unfavoriteSpellings(scope, event.identity);
         return this.write(scope, event.identity, {
           favorite: false,
           snapshot: event.snapshot,
         });
+      case 'dropped':
+      case 'undropped':
+        return this.write(scope, event.identity, {
+          dropped: event.type === 'dropped',
+          snapshot: event.snapshot,
+        });
+      case 'rating':
+        return this.write(scope, event.identity, {
+          rating: event.rating,
+          likes: event.likes,
+          snapshot: event.snapshot,
+        });
     }
+  }
+
+  /** Reads count a favourite under any spelling, so every one of them goes. */
+  private async unfavoriteSpellings(
+    scope: WatchScope,
+    identity: WatchIdentity
+  ) {
+    const keys = [identity.itemKey, identity.matchKey].filter(
+      (key): key is string => !!key
+    );
+    for (const row of await WatchStateRepository.getSpellings(scope, keys)) {
+      if (row.favorite && row.itemKey !== identity.itemKey)
+        await this.write(scope, row, { favorite: false });
+    }
+  }
+
+  private async undropOnPlay(scope: WatchScope, identity: WatchIdentity) {
+    if (identity.kind !== 'episode' || !identity.seriesKey) return;
+    const show = identity.matchKey
+      ? seriesKeyOfMatch(identity.matchKey, identity.mediaType)
+      : null;
+    await WatchStateRepository.undropSeries(
+      scope,
+      show ? [identity.seriesKey, show] : [identity.seriesKey]
+    );
+  }
+
+  async clear(scope: WatchScope, itemKeys?: string[]): Promise<number> {
+    // Every spelling goes, or the history would list the next one in its place.
+    const keys = itemKeys
+      ? await WatchStateRepository.withSpellings(scope, itemKeys)
+      : undefined;
+    const prefix = `${scope.uuid}|${scope.persona}|`;
+    const only = keys ? new Set(keys) : null;
+    for (const key of this.pending.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      if (!only || only.has(key.slice(prefix.length))) this.pending.delete(key);
+    }
+    const cleared = await WatchStateRepository.clearPlayback(scope, keys);
+    if (cleared.length) {
+      this.notify(
+        scope,
+        cleared.map((row) => ({
+          ...row,
+          played: false,
+          positionMs: 0,
+          playCount: 0,
+          lastPlayedAt: null,
+        }))
+      );
+    }
+    return cleared.length;
   }
 
   async flush(): Promise<void> {
@@ -178,20 +257,19 @@ export class LocalWatchStateProvider implements WatchStateProvider {
   }
 
   private progressPatch(p: PendingProgress): WatchStatePatch {
-    const dur = p.durationMs ?? 0;
-    if (dur > 0 && p.positionMs >= dur * PLAYED_FRACTION) {
+    if (playedThrough(p.positionMs, p.durationMs)) {
       return {
         positionMs: 0,
-        durationMs: dur,
+        durationMs: p.durationMs,
         played: true,
         lastPlayedAt: p.at,
         snapshot: p.snapshot,
       };
     }
     /*
-     * `played` is absent rather than false: the upsert coalesces it, so leaving
-     * it out preserves what is stored. Clearing it is a decision, and only an
-     * explicit unplayed or a stop makes it.
+     * `played` is absent rather than false, here and on a stop: the upsert
+     * coalesces it, so a position on a played item is a rewatch under way.
+     * Only an explicit unplayed clears it.
      */
     return {
       positionMs: p.positionMs,
@@ -210,9 +288,9 @@ export class LocalWatchStateProvider implements WatchStateProvider {
       event.identity.itemKey
     );
     const dur = event.durationMs || existing?.durationMs || 0;
-    const pos = event.positionMs ?? existing?.positionMs ?? 0;
+    const pos = event.positionMs ?? 0;
     const now = Date.now();
-    if (dur > 0 && pos >= dur * PLAYED_FRACTION) {
+    if (playedThrough(pos, dur)) {
       return {
         positionMs: 0,
         durationMs: dur,
@@ -223,11 +301,11 @@ export class LocalWatchStateProvider implements WatchStateProvider {
       };
     }
     const tooShort = dur > 0 && dur < RESUME_MIN_DURATION_MS;
-    const tooEarly = dur > 0 && pos < dur * RESUME_MIN_FRACTION;
+    const tooEarly =
+      dur > 0 && pos < (dur * appConfig.watchState.minResumePercent) / 100;
     return {
       positionMs: tooShort || tooEarly ? 0 : pos,
       durationMs: dur || undefined,
-      played: false,
       lastPlayedAt: now,
       snapshot: event.snapshot,
     };
@@ -239,9 +317,14 @@ export class LocalWatchStateProvider implements WatchStateProvider {
     patch: WatchStatePatch
   ): Promise<WatchStateRow> {
     const row = await WatchStateRepository.upsert(scope, identity, patch);
+    this.notify(scope, [row]);
+    return row;
+  }
+
+  private notify(scope: WatchScope, rows: WatchStateRow[]) {
     for (const listener of this.listeners) {
       try {
-        listener(scope, [row]);
+        listener(scope, rows);
       } catch (error) {
         logger.debug(
           { err: error instanceof Error ? error.message : String(error) },
@@ -249,6 +332,5 @@ export class LocalWatchStateProvider implements WatchStateProvider {
         );
       }
     }
-    return row;
   }
 }

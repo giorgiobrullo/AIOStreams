@@ -1,10 +1,19 @@
 import { Router, type Request } from 'express';
 import {
   config as appConfig,
+  isConfigUuid,
+  isEncrypted,
   JellyfinRepository,
   serverId as instanceServerId,
 } from '@aiostreams/core';
-import { jf, jfOptional, param, qs, requestOrigin } from './context.js';
+import {
+  jf,
+  jfOptional,
+  param,
+  qs,
+  requestOrigin,
+  resolveConfig,
+} from './context.js';
 
 const router: Router = Router({ mergeParams: true });
 
@@ -14,10 +23,52 @@ export function serverName(): string {
   return appConfig.branding.addonName || 'AIOStreams';
 }
 
-export function publicInfo(req: Request) {
+/**
+ * The extensions this server implements, each with its version, so a client
+ * checks for the one it needs rather than for AIOStreams.
+ */
+const FEATURES = {
+  /** Sign-in with a configuration's UUID or alias. */
+  configSignIn: 1,
+  /** `/AIOStreams/Users` and `/AIOStreams/Token`. */
+  users: 1,
+  /** `/AIOStreams/History`, its `Clear` and `Export`, and `/AIOStreams/Activity`. */
+  history: 1,
+  /** `/AIOStreams/PlayedUpTo/{id}`. */
+  playedUpTo: 1,
+  /** A series rated `Likes=false` is dropped. */
+  dropped: 1,
+  /** `Refresh` in a PlaybackInfo body runs the addons again. */
+  refreshVersions: 1,
+  /** Every version carries the `aiostreams` object with its own `id`. */
+  versions: 1,
+  /** A library that needs a genre picked says so, as `aiostreams.genreRequired`. */
+  genreRequired: 1,
+  /** A filler or recap episode says so, as `aiostreams.filler` or `aiostreams.recap`. */
+  fillers: 1,
+} as const;
+
+export async function publicInfo(req: Request) {
+  const addressed = addressedConfig(req);
+  const config = await configOf(req);
   return {
     LocalAddress: `${requestOrigin(req)}${req.baseUrl}`.replace(/\/$/, ''),
-    ServerName: req.jf?.userData.addonName || serverName(),
+    ServerName: config?.addonName || serverName(),
+    // Jellyfin has no field for a logo; clients ignore what they don't know.
+    aiostreams: {
+      // The instance's own logo when unset, as the Stremio manifest falls back too.
+      logo: config?.addonLogo || `${requestOrigin(req)}/logo.png`,
+      configureUrl: addressed
+        ? `${requestOrigin(req)}/stremio/${addressed.uuid}/${addressed.encryptedPassword}/configure`
+        : `${requestOrigin(req)}/stremio/configure`,
+      pinSignIn: appConfig.jellyfin.pinSignIn && !!mountOf(req),
+      features: FEATURES,
+      version: {
+        tag: appConfig.bootstrap.tag,
+        channel: appConfig.bootstrap.channel,
+        commit: appConfig.bootstrap.gitCommit,
+      },
+    },
     Version: appConfig.jellyfin.version,
     ProductName: JELLYFIN_PRODUCT_NAME,
     OperatingSystem: '',
@@ -26,15 +77,15 @@ export function publicInfo(req: Request) {
   };
 }
 
-router.get('/System/Info/Public', (req, res) => {
-  res.json(publicInfo(req));
+router.get('/System/Info/Public', async (req, res) => {
+  res.json(await publicInfo(req));
 });
 
 router.get(
   '/System/Info',
   jf(async (req, res) => {
     res.json({
-      ...publicInfo(req),
+      ...(await publicInfo(req)),
       SystemArchitecture: 'X64',
       OperatingSystemDisplayName: '',
       HasPendingRestart: false,
@@ -204,17 +255,62 @@ router.post('/Startup/{*rest}', (_req, res) => {
   res.status(204).end();
 });
 
-/* Some clients resolve the PWA manifest against the server. */
+/** The configuration named in the address itself, not one an alias resolves to. */
+function addressedConfig(req: Request) {
+  const p = req.params as Record<string, string | undefined>;
+  return p.uuid &&
+    p.encryptedPassword &&
+    isConfigUuid(p.uuid) &&
+    isEncrypted(p.encryptedPassword)
+    ? { uuid: p.uuid, encryptedPassword: p.encryptedPassword }
+    : null;
+}
+
+/** A picker address's configuration, before or after `jellyfinContext` ran. */
+function mountOf(req: Request) {
+  return req.jfMount ?? addressedConfig(req);
+}
+
+/** The signed-in configuration, else the one a picker address names. */
+async function configOf(req: Request) {
+  if (req.jf) return req.jf.userData;
+  const mount = mountOf(req);
+  return mount
+    ? resolveConfig(mount.uuid, mount.encryptedPassword).catch(() => null)
+    : null;
+}
+
+/** The web app's name: its configuration's addon name on a picker address. */
+export async function webAppName(req: Request): Promise<string> {
+  return (await configOf(req))?.addonName || serverName();
+}
+
+const WEB_APP_COLOUR = '#070707';
+const WEB_APP_ICONS = [192, 512].flatMap((size) =>
+  ['any', 'maskable'].map((purpose) => ({
+    src: `/web-app-manifest-${size}x${size}.png`,
+    sizes: `${size}x${size}`,
+    type: 'image/png',
+    purpose,
+  }))
+);
+
 router.get(
   '/web/manifest.json',
-  jfOptional(async (_req, res) => {
-    res.json({
-      name: serverName(),
-      short_name: serverName(),
-      start_url: '/',
-      display: 'standalone',
-      icons: [],
-    });
+  jfOptional(async (req, res) => {
+    const name = await webAppName(req);
+    res.type('application/manifest+json').send(
+      JSON.stringify({
+        name,
+        short_name: name,
+        start_url: './',
+        scope: './',
+        display: 'standalone',
+        background_color: WEB_APP_COLOUR,
+        theme_color: WEB_APP_COLOUR,
+        icons: WEB_APP_ICONS,
+      })
+    );
   })
 );
 

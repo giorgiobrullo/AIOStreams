@@ -1,7 +1,17 @@
 import type { MediaTrack, ParsedFile, ParsedStream } from '../db/schemas.js';
-import { constants } from '../utils/index.js';
+import { constants, hasTrackLists } from '../utils/index.js';
+import type { TitleMetadata } from '../debrid/base.js';
+import { withPlayPath } from '../debrid/utils.js';
+import { applyMediaInfo } from '../media-info/apply.js';
+import { mediaInfoIdentity, storedMediaInfoFor } from '../media-info/lookup.js';
+import { probeBeforePlay } from '../media-info/play.js';
+import type { ContributionIds } from '../media-info/contribute.js';
 import { languageToIso6392 } from '../utils/languages.js';
 import { subtitleLanguage } from './enrichment.js';
+import {
+  defaultTrackIndexes,
+  type TrackPreferences,
+} from './track-defaults.js';
 import { mediaSourceId } from './ids.js';
 import {
   mergeSubtitleTracks,
@@ -18,6 +28,11 @@ import type {
 } from './types.js';
 
 export const TICKS_PER_MS = 10_000;
+
+/** Clients read ticks as 64-bit integers, so a fraction fails to decode. */
+export function msToTicks(ms: number): number {
+  return Math.round(ms * TICKS_PER_MS);
+}
 
 type Encode = (typeof constants.ENCODES)[number];
 type AudioTag = (typeof constants.AUDIO_TAGS)[number];
@@ -104,13 +119,22 @@ const VIDEO_RANGE_TYPE = {
   Unknown: undefined,
 } satisfies Record<VisualTag, string | undefined>;
 
-const RANGE_PRIORITY = ['DOVI', 'HDR10Plus', 'HDR10', 'HLG', 'SDR'];
+const BASE_RANGE_PRIORITY = ['HDR10Plus', 'HDR10', 'HLG', 'SDR'];
+
+const DOVI_WITH: Record<string, string> = {
+  HDR10Plus: 'DOVIWithHDR10Plus',
+  HDR10: 'DOVIWithHDR10',
+  HLG: 'DOVIWithHLG',
+  SDR: 'DOVIWithSDR',
+};
 
 function videoRangeTypeOf(tags: string[]): string {
   const found = tags
     .map((t) => VIDEO_RANGE_TYPE[t as VisualTag])
     .filter((v): v is string => !!v);
-  return RANGE_PRIORITY.find((r) => found.includes(r)) ?? 'SDR';
+  const base = BASE_RANGE_PRIORITY.find((r) => found.includes(r));
+  if (!found.includes('DOVI')) return base ?? 'SDR';
+  return base ? DOVI_WITH[base] : 'DOVI';
 }
 
 export function containerOf(stream: ParsedStream): string {
@@ -125,18 +149,8 @@ export function containerOf(stream: ParsedStream): string {
   return 'mkv';
 }
 
-export function extensionFor(
-  stream: ParsedStream,
-  formatted: { name: string; description: string }
-): AiostreamsSourceExtension {
-  const pf = stream.parsedFile;
+function fileExtension(pf: ParsedFile | undefined) {
   return {
-    name: formatted.name,
-    description: formatted.description,
-    addon: stream.addon?.name ?? '',
-    service: stream.service?.id,
-    cached: stream.service?.cached,
-    proxied: stream.proxied,
     resolution: pf?.resolution,
     quality: pf?.quality,
     encode: pf?.encode,
@@ -144,15 +158,76 @@ export function extensionFor(
     audioTags: pf?.audioTags ?? [],
     audioChannels: pf?.audioChannels ?? [],
     languages: pf?.languages ?? [],
+    releaseGroup: pf?.releaseGroup,
+    mediaInfoQuality: pf?.mediaInfoQuality,
+  };
+}
+
+export function extensionFor(
+  stream: ParsedStream,
+  formatted: { name: string; description: string },
+  bingeGroup?: string
+): AiostreamsSourceExtension {
+  return {
+    name: formatted.name,
+    description: formatted.description,
+    addon: stream.addon?.name ?? '',
+    service: stream.service?.id,
+    cached: stream.service?.cached,
+    proxied: stream.proxied,
+    ...fileExtension(stream.parsedFile),
     size: stream.size,
     seeders: stream.torrent?.seeders,
     age: stream.age,
-    releaseGroup: pf?.releaseGroup,
     indexer: stream.indexer,
-    mediaInfoQuality: pf?.mediaInfoQuality,
     filename: stream.filename,
     type: stream.type,
+    bingeGroup,
   };
+}
+
+/**
+ * Fill a version from a file probed after it was listed. `waitMs` probes the
+ * file now when nothing is stored and reading it is safe.
+ */
+export async function applyStoredMediaInfo(
+  record: MediaSourceRecord,
+  metadata: TitleMetadata | undefined,
+  opts: { waitMs?: number; clientIp?: string; ids?: ContributionIds } = {}
+): Promise<boolean> {
+  if (record.notice || hasTrackLists(record.parsedFile)) return false;
+  const stored = () =>
+    record.mediaInfo
+      ? storedMediaInfoFor(record.mediaInfo, metadata)
+      : Promise.resolve(undefined);
+  let info = await stored();
+  if (!info && opts.waitMs && record.url) {
+    info =
+      (await probeBeforePlay(
+        {
+          url: record.url,
+          mediaInfo: record.mediaInfo,
+          service: record.extension.service,
+          proxied: record.extension.proxied,
+        },
+        { timeoutMs: opts.waitMs, clientIp: opts.clientIp, ids: opts.ids }
+      )) ?? (await stored());
+  }
+  if (!info) return false;
+  const target = {
+    parsedFile: record.parsedFile,
+    duration: record.durationMs,
+    bitrate: record.bitrate,
+  };
+  applyMediaInfo(target, info);
+  record.parsedFile = target.parsedFile;
+  record.durationMs = target.duration;
+  record.bitrate = target.bitrate;
+  record.extension = {
+    ...record.extension,
+    ...fileExtension(record.parsedFile),
+  };
+  return true;
 }
 
 /** A stream clients can play directly: has a URL and needs no headers unless proxied. */
@@ -165,17 +240,54 @@ export function isPlayable(stream: ParsedStream): boolean {
   return !needsHeaders;
 }
 
+function fileKey(stream: ParsedStream): string {
+  const file = stream.filename ?? String(stream.size ?? '');
+  const infoHash = stream.torrent?.infoHash?.toLowerCase();
+  if (infoHash) return `btih:${infoHash}|${stream.torrent?.fileIdx ?? file}`;
+  if (stream.releaseKey)
+    return `release:${stream.releaseKey}|${stream.indexer ?? ''}|${file}`;
+  if (stream.nzbUrl) return `nzb:${stream.nzbUrl}|${file}`;
+  if (stream.ytId) return `yt:${stream.ytId}`;
+  if (stream.externalUrl) return `external:${stream.externalUrl}`;
+  if (stream.filename) return `file:${stream.filename}|${stream.size ?? ''}`;
+  return `url:${stream.url ?? ''}`;
+}
+
+/**
+ * What each version is, whatever its place in the list: its item, addon,
+ * service and file. Versions alike in all of it are numbered in order, as
+ * nothing else tells them apart.
+ */
+export function sourceIdentities(
+  itemId: string,
+  streams: ParsedStream[]
+): string[] {
+  const seen = new Map<string, number>();
+  return streams.map((stream) => {
+    const key = [
+      itemId,
+      stream.addon.instanceId,
+      stream.service?.id ?? '',
+      fileKey(stream),
+    ].join('|');
+    const count = seen.get(key) ?? 0;
+    seen.set(key, count + 1);
+    return count ? `${key}|${count}` : key;
+  });
+}
+
 export function sourceRecordFrom(
   uuid: string,
+  identity: string,
   stream: ParsedStream,
   formatted: { name: string; description: string },
   label: string,
-  addonSubtitles: SubtitleTrack[]
+  addonSubtitles: SubtitleTrack[],
+  bingeGroup?: string
 ): MediaSourceRecord {
-  const identity = stream.id || stream.url || JSON.stringify(stream.releaseKey);
   return {
     msid: mediaSourceId(uuid, identity),
-    url: stream.url!,
+    url: withPlayPath(stream.url!, 'jellyfin'),
     requestHeaders: stream.proxied ? undefined : stream.requestHeaders,
     filename: stream.filename,
     container: containerOf(stream),
@@ -185,9 +297,10 @@ export function sourceRecordFrom(
     label,
     parsedFile: stream.parsedFile,
     subtitles: mergeSubtitleTracks(stream, addonSubtitles),
+    mediaInfo: mediaInfoIdentity(stream),
     videoHash: stream.videoHash,
     live: stream.type === 'live',
-    extension: extensionFor(stream, formatted),
+    extension: extensionFor(stream, formatted, bingeGroup),
   };
 }
 
@@ -197,7 +310,7 @@ export function noticeRecordFrom(
   label: string,
   extension: Pick<
     AiostreamsSourceExtension,
-    'name' | 'description' | 'addon' | 'type'
+    'name' | 'description' | 'addon' | 'type' | 'externalUrl'
   >
 ): MediaSourceRecord {
   return {
@@ -269,7 +382,8 @@ function videoStream(
     AspectRatio: size ? (size[0] / size[1] >= 1.7 ? '16:9' : '4:3') : undefined,
     IsDefault: true,
     IsTextSubtitleStream: false,
-    VideoRange: rangeType === 'SDR' ? 'SDR' : 'HDR',
+    VideoRange:
+      rangeType === 'SDR' || rangeType === 'DOVIWithSDR' ? 'SDR' : 'HDR',
     VideoRangeType: rangeType,
     BitDepth: tenBit ? 10 : 8,
     BitRate: bitrate,
@@ -277,30 +391,52 @@ function videoStream(
       [
         resolution !== 'Unknown' ? resolution : undefined,
         encode !== 'Unknown' ? encode : undefined,
-        rangeType !== 'SDR' ? rangeType : undefined,
+        rangeType !== 'SDR'
+          ? rangeType.replace('DOVIWith', 'DOVI ')
+          : undefined,
       ]
         .filter(Boolean)
         .join(' ') || 'Video',
   };
 }
 
-/* One entry per real track when the probe listed them, otherwise per language. */
-function audioStreams(
-  pf: ParsedFile | undefined,
-  startIndex: number
-): JellyfinMediaStream[] {
+const NOT_A_TRACK = new Set([
+  'Unknown',
+  'Dual Audio',
+  'Dubbed',
+  'Multi',
+  'Original',
+]);
+
+/**
+ * Clients pick tracks by position: one unnamed track per confirmed language, as
+ * a deduplicated list is never longer than the file's but its order is unknown.
+ */
+function placeholderLanguages(pf: ParsedFile | undefined, list?: string[]) {
+  if (!pf?.mediaInfoQuality) return [];
+  return (list ?? []).filter((l) => l && !NOT_A_TRACK.has(l));
+}
+
+function audioStreams(pf: ParsedFile | undefined): JellyfinMediaStream[] {
   if (pf?.audioTracks?.length) {
     return pf.audioTracks.map((track, i) => {
-      const tag = track.tag as AudioTag | undefined;
+      const tags = track.tags ?? [];
+      const format = tags[0] as AudioTag | undefined;
       const channelTag = track.channels as AudioChannels | undefined;
       return {
         Type: 'Audio',
-        Index: startIndex + i,
+        Index: i,
         ...STREAM_FLAGS,
-        Codec: track.codec ?? (tag ? AUDIO_CODEC[tag] : undefined),
+        Codec: track.codec ?? (format ? AUDIO_CODEC[format] : undefined),
         Language: track.lang ? languageToIso6392(track.lang) : undefined,
         DisplayTitle:
-          [track.lang, track.title, tag, channelTag, ...trackFlagLabels(track)]
+          [
+            track.lang,
+            track.title,
+            ...tags,
+            channelTag,
+            ...trackFlagLabels(track),
+          ]
             .filter(Boolean)
             .join(' ') || 'Audio',
         Title: track.title,
@@ -314,6 +450,17 @@ function audioStreams(
     });
   }
 
+  const placeholders = placeholderLanguages(pf, pf?.languages);
+  if (placeholders.length > 1) {
+    return placeholders.map((_, i) => ({
+      Type: 'Audio',
+      Index: i,
+      ...STREAM_FLAGS,
+      DisplayTitle: `Audio ${i + 1}`,
+      IsDefault: i === 0,
+      IsTextSubtitleStream: false,
+    }));
+  }
   const languages = (pf?.languages ?? []).filter((l) => l && l !== 'Unknown');
   const audioTag = (pf?.audioTags ?? []).find((t) => t !== 'Unknown') as
     | AudioTag
@@ -324,42 +471,50 @@ function audioStreams(
     | undefined;
   const channels = channelTag ? CHANNEL_COUNT[channelTag] : undefined;
   const layout = channelTag ? CHANNEL_LAYOUT[channelTag] : undefined;
-  const list = languages.length ? languages : ['Unknown'];
-  return list.map((lang, i) => ({
-    Type: 'Audio',
-    Index: startIndex + i,
-    ...STREAM_FLAGS,
-    Codec: codec,
-    Language: lang === 'Unknown' ? undefined : languageToIso6392(lang),
-    DisplayTitle:
-      [lang !== 'Unknown' ? lang : undefined, audioTag, channelTag]
-        .filter(Boolean)
-        .join(' ') || 'Audio',
-    Channels: channels,
-    ChannelLayout: layout,
-    IsDefault: i === 0,
-    IsTextSubtitleStream: false,
-  }));
+  return [
+    {
+      Type: 'Audio',
+      Index: 0,
+      ...STREAM_FLAGS,
+      Codec: codec,
+      Language:
+        languages.length === 1 ? languageToIso6392(languages[0]) : undefined,
+      DisplayTitle:
+        [languages.join(', '), audioTag, channelTag]
+          .filter(Boolean)
+          .join(' ') || 'Audio',
+      Channels: channels,
+      ChannelLayout: layout,
+      IsDefault: true,
+      IsTextSubtitleStream: false,
+    },
+  ];
 }
 
-/*
- * Only a real probe knows the embedded tracks. Clients match an advertised
- * track to the one their player demuxed by language and title, so the language
- * fallback emits no `Title` rather than an invented one that mis-selects.
- */
+const IMAGE_SUBTITLE_CODEC = /pgs|dvd_?sub|dvb_?sub|vobsub|xsub/i;
+
 function embeddedSubtitleStreams(
-  pf: ParsedFile | undefined,
-  startIndex: number
+  pf: ParsedFile | undefined
 ): JellyfinMediaStream[] {
-  if (pf?.mediaInfoQuality !== 'probe') return [];
-  const tracks = pf.subtitleTracks?.length
-    ? pf.subtitleTracks
-    : (pf.subtitles ?? [])
-        .filter((l) => l && l !== 'Unknown')
-        .map((lang) => ({ lang }) as MediaTrack);
+  const tracks =
+    pf?.mediaInfoQuality === 'probe' ? (pf.subtitleTracks ?? []) : [];
+  if (!tracks.length) {
+    const languages = placeholderLanguages(pf, pf?.subtitles);
+    const only = languages.length === 1 ? languages[0] : undefined;
+    return languages.map((_, i) => ({
+      Type: 'Subtitle',
+      Index: i,
+      ...STREAM_FLAGS,
+      Language: only ? languageToIso6392(only) : undefined,
+      DisplayTitle: only ?? `Subtitle ${i + 1}`,
+      IsDefault: false,
+      IsTextSubtitleStream: true,
+      DeliveryMethod: 'Embed',
+    }));
+  }
   return tracks.map((track, i) => ({
     Type: 'Subtitle',
-    Index: startIndex + i,
+    Index: i,
     ...STREAM_FLAGS,
     Codec: track.codec,
     Language: track.lang ? languageToIso6392(track.lang) : undefined,
@@ -371,9 +526,52 @@ function embeddedSubtitleStreams(
     IsDefault: track.default ?? false,
     IsForced: track.forced ?? false,
     IsHearingImpaired: track.hearingImpaired ?? false,
-    IsTextSubtitleStream: true,
+    IsTextSubtitleStream: !IMAGE_SUBTITLE_CODEC.test(track.codec ?? ''),
     DeliveryMethod: 'Embed',
   }));
+}
+
+/** Each row's stream index in the file, when a probe gave every one of them. */
+function fileIndexes(
+  pf: ParsedFile | undefined,
+  audioRows: number,
+  subtitleRows: number
+): number[] | undefined {
+  const audio = pf?.audioTracks ?? [];
+  const subtitles =
+    pf?.mediaInfoQuality === 'probe' ? (pf.subtitleTracks ?? []) : [];
+  if (audio.length !== audioRows || subtitles.length !== subtitleRows) {
+    return undefined;
+  }
+  const indexes = [
+    pf?.videoIndex,
+    ...[...audio, ...subtitles].map((t) => t.index),
+  ];
+  if (indexes.some((i) => i === undefined)) return undefined;
+  return new Set(indexes).size === indexes.length
+    ? (indexes as number[])
+    : undefined;
+}
+
+/**
+ * The file's own streams in its order, numbered by position: players match a
+ * row to their track by its number or by its position among all of them.
+ */
+function embeddedStreams(
+  pf: ParsedFile | undefined,
+  bitrate: number | undefined
+): JellyfinMediaStream[] {
+  const audio = audioStreams(pf);
+  const subtitles = embeddedSubtitleStreams(pf);
+  const rows = [videoStream(pf, bitrate), ...audio, ...subtitles];
+  const indexes = fileIndexes(pf, audio.length, subtitles.length);
+  const ordered = indexes
+    ? rows
+        .map((row, i) => ({ row, at: indexes[i] }))
+        .sort((a, b) => a.at - b.at)
+        .map(({ row }) => row)
+    : rows;
+  return ordered.map((row, i) => ({ ...row, Index: i }));
 }
 
 function externalSubtitleTitle(
@@ -397,41 +595,60 @@ export interface MediaSourceBuildOptions {
   id: string;
   /** Delivery format for one track, given the format it is served in upstream. */
   subtitleFormat: (sourceExtension: string) => SubtitleFormat;
-  /** Server-relative delivery URL for the subtitle stream at `index`. */
+  /** Server-relative delivery URL; {@link externalSubtitleFor} reads `index` back. */
   subtitleUrl: (index: number, format: SubtitleFormat) => string;
+  /** The client's own token, as players fetch subtitles without its headers. */
+  subtitleToken?: string;
+  playSessionId?: string;
+  /** `File` sends the client through the server's stream route, not `Path`. */
+  protocol?: 'Http' | 'File';
   runtimeMs?: number;
   includeExtension: boolean;
   hasSegments?: boolean;
   /** Where a notice source points, having nothing of its own. */
   noticePath?: string;
+  /** The user's choices, which pick the tracks a version starts with. */
+  tracks?: TrackPreferences;
+  originalLanguage?: string;
 }
 
 /**
- * Index of the first external subtitle stream. The subtitle route is addressed
- * by MediaStream index, so this must match what `buildMediaStreams` emits.
+ * Subtitle URLs name an external track by its position among them, past any
+ * stream index, so a URL from an earlier list still names the same track once
+ * a probe adds embedded ones. Lower indexes are MediaStream indexes.
  */
-export function externalSubtitleStartIndex(record: MediaSourceRecord): number {
-  return (
-    1 +
-    audioStreams(record.parsedFile, 0).length +
-    embeddedSubtitleStreams(record.parsedFile, 0).length
-  );
+const EXTERNAL_SUBTITLE_URL_BASE = 1000;
+
+export function externalSubtitleFor(
+  record: MediaSourceRecord,
+  urlIndex: number
+): SubtitleTrack | undefined {
+  const position =
+    urlIndex >= EXTERNAL_SUBTITLE_URL_BASE
+      ? urlIndex - EXTERNAL_SUBTITLE_URL_BASE
+      : urlIndex - embeddedStreams(record.parsedFile, record.bitrate).length;
+  return record.subtitles[position];
 }
 
 export function buildMediaStreams(
   record: MediaSourceRecord,
-  opts: Pick<MediaSourceBuildOptions, 'subtitleFormat' | 'subtitleUrl'>
+  opts: Pick<
+    MediaSourceBuildOptions,
+    'subtitleFormat' | 'subtitleUrl' | 'subtitleToken' | 'playSessionId'
+  >
 ): JellyfinMediaStream[] {
-  const streams: JellyfinMediaStream[] = [
-    videoStream(record.parsedFile, record.bitrate),
-  ];
-  streams.push(...audioStreams(record.parsedFile, streams.length));
-  streams.push(...embeddedSubtitleStreams(record.parsedFile, streams.length));
+  const query = [
+    opts.subtitleToken && `ApiKey=${encodeURIComponent(opts.subtitleToken)}`,
+    opts.playSessionId && `PlaySessionId=${opts.playSessionId}`,
+  ]
+    .filter(Boolean)
+    .join('&');
+  const streams = embeddedStreams(record.parsedFile, record.bitrate);
   const externalStart = streams.length;
   record.subtitles.forEach((sub, i) => {
     const index = externalStart + i;
     const format = opts.subtitleFormat(subtitleExtensionOf(sub.url));
-    const url = opts.subtitleUrl(index, format);
+    const url = opts.subtitleUrl(EXTERNAL_SUBTITLE_URL_BASE + i, format);
     const language = subtitleLanguage(sub.lang);
     streams.push({
       Type: 'Subtitle',
@@ -448,8 +665,9 @@ export function buildMediaStreams(
       IsHearingImpaired: sub.hearingImpaired ?? false,
       IsTextSubtitleStream: true,
       DeliveryMethod: 'External',
-      DeliveryUrl: url,
+      DeliveryUrl: query ? `${url}?${query}` : url,
       IsExternalUrl: false,
+      // No token here: clients read the format off its end.
       Path: url,
     });
   });
@@ -493,11 +711,14 @@ export function buildMediaSource(
   }
   const mediaStreams = buildMediaStreams(record, opts);
   const audioIndex = mediaStreams.findIndex((s) => s.Type === 'Audio');
+  const defaults = opts.tracks
+    ? defaultTrackIndexes(mediaStreams, opts.tracks, opts.originalLanguage)
+    : { audio: audioIndex >= 0 ? audioIndex : undefined, subtitle: -1 };
   const durationMs = record.live
     ? undefined
     : record.durationMs || opts.runtimeMs;
   const source: JellyfinMediaSource = {
-    Protocol: 'Http',
+    Protocol: opts.protocol ?? 'Http',
     Id: opts.id,
     Path: record.url,
     Type: 'Default',
@@ -506,15 +727,17 @@ export function buildMediaSource(
     Name: record.label,
     IsRemote: true,
     ETag: record.msid,
-    RunTimeTicks: durationMs ? durationMs * TICKS_PER_MS : undefined,
+    RunTimeTicks: durationMs ? msToTicks(durationMs) : undefined,
     IsInfiniteStream: record.live,
     ...SOURCE_FLAGS,
     HasSegments: opts.hasSegments ?? false,
     MediaStreams: mediaStreams,
     Bitrate: record.bitrate,
-    DefaultAudioStreamIndex: audioIndex >= 0 ? audioIndex : undefined,
+    DefaultAudioStreamIndex: defaults.audio,
+    DefaultSubtitleStreamIndex: defaults.subtitle,
   };
-  if (opts.includeExtension) source.aiostreams = record.extension;
+  if (opts.includeExtension)
+    source.aiostreams = { ...record.extension, id: record.msid };
   return source;
 }
 

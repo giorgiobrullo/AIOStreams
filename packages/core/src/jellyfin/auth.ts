@@ -15,6 +15,10 @@ export interface TokenPayload {
   k?: string;
   /** API key id; the token then acts for every user. */
   a?: string;
+  /** Set on a user session that began with the configuration password. */
+  o?: 1;
+  /** Tags the PIN the user had when signed in, so changing it signs them out. */
+  l?: string;
   iat: number;
 }
 
@@ -47,9 +51,10 @@ export function serverId(): string {
   ).slice(0, 32);
 }
 
+/** Form-decoded: a client may send spaces as `+`. */
 function decodeValue(v: string): string {
   try {
-    return decodeURIComponent(v);
+    return decodeURIComponent(v.replace(/\+/g, ' '));
   } catch {
     return v;
   }

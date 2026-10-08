@@ -32,6 +32,7 @@ import {
   knownHealthCheckIds,
   validateConditionalActivation,
   validateVariants,
+  withOwnAccountLock,
 } from '../variants/runtime.js';
 import { parseSyncedUrl } from './sync/index.js';
 import { ZodError } from 'zod';
@@ -110,6 +111,8 @@ export function getEnvironmentServiceDetails(): typeof constants.SERVICE_DETAILS
 }
 
 export interface ValidateConfigOptions {
+  /** Read paths only: variants have already been applied and schema-checked. */
+  skipVariantValidation?: boolean;
   skipErrorsFromAddonsOrProxies?: boolean;
   decryptValues?: boolean;
   increasedManifestTimeout?: boolean;
@@ -365,13 +368,15 @@ export async function validateConfig(
 
   // Static only: a full validateConfig per variant would recurse here and
   // refetch every addon manifest.
-  validateVariants(config, (patched) => {
-    const parsed = UserDataSchema.safeParse(patched);
-    return {
-      success: parsed.success,
-      error: parsed.success ? undefined : parsed.error.issues[0]?.message,
-    };
-  });
+  if (!options?.skipVariantValidation) {
+    validateVariants(config, (patched) => {
+      const parsed = UserDataSchema.safeParse(patched);
+      return {
+        success: parsed.success,
+        error: parsed.success ? undefined : parsed.error.issues[0]?.message,
+      };
+    });
+  }
 
   await validateConditionalActivation(
     config,
@@ -1521,7 +1526,7 @@ const METADATA_FIELDS: (keyof UserData)[] = [
 const MISC_FIELDS: (keyof UserData)[] = [
   'autoPlay', 'areYouStillThere', 'statistics', 'dynamicAddonFetching',
   'failover', 'serviceWrap', 'cacheAndPlay', 'preloadStreams', 'precacheSelector',
-  'hideErrors', 'hideErrorsForResources', 'addonCategoryColors', 'catalogModifications', 'mergedCatalogs',
+  'hideErrors', 'hideErrorsForResources', 'addonCategoryColors', 'catalogModifications', 'newCatalogsDisabled', 'upstreamCatalogOrder', 'mergedCatalogs',
   'accessKey', 'externalDownloads', 'autoRemoveDownloads', 'checkOwned', 'showChanges',
 ];
 
@@ -1723,6 +1728,5 @@ export function mergeConfigs(parent: UserData, child: UserData): UserData {
   } else if (result.jellyfin?.personas) {
     result.jellyfin = { ...result.jellyfin, personas: undefined };
   }
-
-  return result;
+  return withOwnAccountLock(result, child);
 }

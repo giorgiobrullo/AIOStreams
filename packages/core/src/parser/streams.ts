@@ -194,8 +194,15 @@ class StreamParser {
 
     parsedStream.parsedFile = this.getParsedFile(stream, parsedStream);
 
+    const infoHash = stream.infoHash ?? this.getInfoHash(stream, parsedStream);
     parsedStream.torrent = {
-      infoHash: stream.infoHash ?? this.getInfoHash(stream, parsedStream),
+      infoHash,
+      file: infoHash
+        ? this.getTorrentFile(stream, parsedStream)?.trim() || undefined
+        : undefined,
+      title: infoHash
+        ? this.getTorrentTitle(stream, parsedStream)?.trim() || undefined
+        : undefined,
       seeders: this.getSeeders(stream, parsedStream),
       sources: stream.sources ?? undefined,
       fileIdx:
@@ -393,6 +400,10 @@ class StreamParser {
     stream: Stream,
     currentParsedStream: ParsedStream
   ): number | undefined {
+    const seeders = stream.behaviorHints?.seeders;
+    if (typeof seeders === 'number' && seeders >= 0) {
+      return Math.round(seeders);
+    }
     const regex = this.seedersRegex;
     if (!regex) {
       return undefined;
@@ -409,6 +420,13 @@ class StreamParser {
     stream: Stream,
     currentParsedStream: ParsedStream
   ): number | undefined {
+    const publishDate = stream.behaviorHints?.publishDate;
+    if (typeof publishDate === 'string') {
+      const published = Date.parse(publishDate);
+      if (!Number.isNaN(published)) {
+        return Math.max(0, (Date.now() - published) / 3_600_000);
+      }
+    }
     const regex = this.ageRegex;
     if (!regex) {
       return undefined;
@@ -449,6 +467,10 @@ class StreamParser {
     stream: Stream,
     currentParsedStream: ParsedStream
   ): string | undefined {
+    const indexer = stream.behaviorHints?.indexer;
+    if (typeof indexer === 'string' && indexer.trim()) {
+      return indexer.trim();
+    }
     const regex = this.indexerRegex;
     if (!regex) {
       return undefined;
@@ -476,6 +498,16 @@ class StreamParser {
     stream: Stream,
     currentParsedStream: ParsedStream
   ): ParsedStream['service'] | undefined {
+    const service = stream.behaviorHints?.service;
+    if (
+      typeof service === 'string' &&
+      (constants.SERVICES as readonly string[]).includes(service)
+    ) {
+      return {
+        id: service as ServiceId,
+        cached: stream.behaviorHints?.cached === true,
+      };
+    }
     return this.parseServiceData(stream.name || '');
   }
 
@@ -500,10 +532,29 @@ class StreamParser {
     return undefined;
   }
 
+  /** A file inside the torrent, only where the addon names one reliably. */
+  protected getTorrentFile(
+    _stream: Stream,
+    _currentParsedStream: ParsedStream
+  ): string | undefined {
+    return undefined;
+  }
+
+  protected getTorrentTitle(
+    _stream: Stream,
+    _currentParsedStream: ParsedStream
+  ): string | undefined {
+    return undefined;
+  }
+
   protected getDuration(
     stream: Stream,
     currentParsedStream: ParsedStream
   ): number | undefined {
+    const duration = stream.behaviorHints?.duration;
+    if (typeof duration === 'number' && duration > 0) {
+      return Math.round(duration * 1000);
+    }
     return parseDuration(stream.description || '');
   }
 
@@ -525,16 +576,23 @@ class StreamParser {
     return undefined;
   }
 
+  /** An HLS playlist, whatever query string the url carries. */
+  protected isHlsUrl(url: string | null | undefined): boolean {
+    if (!url) return false;
+    const path = url.split('#')[0].split('?')[0];
+    return /\.m3u8?$/i.test(path);
+  }
+
   protected getStreamType(
     stream: Stream,
     service: ParsedStream['service'],
     currentParsedStream: ParsedStream
   ): ParsedStream['type'] {
-    if (stream.url?.endsWith('.m3u8')) {
+    if (this.isHlsUrl(stream.url)) {
       return 'live';
     }
 
-    if (stream.externalUrl) {
+    if (stream.externalUrl && !stream.url) {
       return 'external';
     }
 

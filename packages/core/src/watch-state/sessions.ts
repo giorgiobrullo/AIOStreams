@@ -10,6 +10,7 @@ import { dispatchPlayback } from './handoff/dispatch.js';
 import type { ResolvedPlaybackSink } from './handoff/resolve.js';
 import type { PlaybackEventKind } from './handoff/capability.js';
 import { getWatchStateProvider } from './index.js';
+import { playedThrough } from './local-provider.js';
 import { scopeOf, type ContentRef, type WatchScope } from './types.js';
 import { watchIdentityFor } from './canonical.js';
 
@@ -48,9 +49,9 @@ export async function openWatchSession(
   ctx: SessionContext,
   ref: ContentRef,
   opts: { positionMs?: number; durationMs?: number; paused?: boolean } = {}
-): Promise<void> {
+): Promise<WatchSessionRow | null> {
   const identity = await watchIdentityFor(ref);
-  await WatchSessionRepository.open(ctx.scope, ctx.sessionKey, {
+  return WatchSessionRepository.open(ctx.scope, ctx.sessionKey, {
     userPersona: ctx.user ?? null,
     itemKey: identity.itemKey,
     kind: identity.kind,
@@ -90,8 +91,10 @@ export async function checkInWatchSession(
   return { transition: patch.paused ? 'pause' : 'start', row: existing };
 }
 
-export async function closeWatchSession(ctx: SessionContext): Promise<void> {
-  await WatchSessionRepository.close(ctx.scope, ctx.sessionKey, Date.now());
+export async function closeWatchSession(
+  ctx: SessionContext
+): Promise<WatchSessionRow | null> {
+  return WatchSessionRepository.close(ctx.scope, ctx.sessionKey, Date.now());
 }
 
 /** Rebuilds the routing a stop needs from the sink row, with no config in hand. */
@@ -170,7 +173,11 @@ export async function sweepIdleWatchSessions(): Promise<{
         at,
         positionMs: session.positionMs,
         durationMs: session.durationMs || undefined,
-        played: row ? row.played : undefined,
+        played: playedThrough(
+          session.positionMs,
+          session.durationMs || row?.durationMs
+        ),
+        sessionStartedAt: session.startedAt,
       });
       reported++;
     } catch (error) {

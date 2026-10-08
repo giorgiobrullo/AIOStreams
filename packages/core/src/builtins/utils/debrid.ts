@@ -23,10 +23,12 @@ import {
   isCountryWrong,
   DebridDownload,
   isNotVideoFile,
+  hasTooManySelectableFiles,
   isTorrentDebridService,
   isUsenetDebridService,
   TitleMetadata,
   hashNzbUrl,
+  sentNzbHash,
   parseFileNames,
 } from '../../debrid/index.js';
 import { ParsedResult } from '@viren070/parse-torrent-title';
@@ -35,6 +37,7 @@ import {
   preprocessTitle,
   normaliseTitle,
   extractInfoHashFromMagnet,
+  base32ToHex,
 } from '../../parser/utils.js';
 export { extractInfoHashFromMagnet };
 
@@ -50,9 +53,10 @@ type Metadata = TitleMetadata;
 export function validateInfoHash(
   infoHash: string | undefined
 ): string | undefined {
-  return infoHash && /^[a-f0-9]{40}$/i.test(infoHash)
-    ? infoHash.toLowerCase()
-    : undefined;
+  if (!infoHash) return undefined;
+  if (/^[a-f0-9]{40}$/i.test(infoHash)) return infoHash.toLowerCase();
+  if (/^[a-z2-7]{32}$/i.test(infoHash)) return base32ToHex(infoHash);
+  return undefined;
 }
 
 export function extractTrackersFromMagnet(magnet: string): string[] {
@@ -446,6 +450,15 @@ async function processTorrentsForDebridService(
       }
     }
 
+    if (hasTooManySelectableFiles(magnetCheckResult?.files)) {
+      logger.debug(`Skipping torrent with too many files to select from`, {
+        service: service.id,
+        torrent: torrent.title,
+        files: magnetCheckResult?.files?.length,
+      });
+      continue;
+    }
+
     validTorrents.push({
       torrent,
       magnetCheckResult,
@@ -508,9 +521,9 @@ async function processTorrentsForDebridService(
         parsedMediaInfo,
         service: {
           id: service.id,
+          // The account lists queued and stalled items too, so it is not proof.
           cached:
-            magnetCheckResult?.status === 'cached' ||
-            (magnetCheckResult?.library || torrent.library) === true,
+            magnetCheckResult?.status === 'cached' || torrent.library === true,
           library: (magnetCheckResult?.library || torrent.library) === true,
         },
       });
@@ -572,6 +585,13 @@ export async function processTorrentsForP2P(
       if (isEpisodeWrong(parsedTorrent, metadata)) {
         continue;
       }
+    }
+    if (hasTooManySelectableFiles(torrent.files)) {
+      logger.debug(`Skipping torrent with too many files to select from`, {
+        torrent: torrent.title,
+        files: torrent.files?.length,
+      });
+      continue;
     }
     validTorrents.push({ torrent, parsedTitle: parsedTorrent! });
   }
@@ -715,20 +735,20 @@ async function processNZBsForDebridService(
 
   const results: NZBWithSelectedFile[] = [];
 
-  if (service.id === 'torbox') {
-    // update the hashes to be the md5 of the URL without cleaning.
-    // torbox still hash entire URl instead of removing query params.
-    // TODO: remove once torbox hashes after cleaning.
-    nzbs = nzbs.map((nzb) => {
-      if (nzb.nzb) {
-        const hash = hashNzbUrl(nzb.nzb, false);
-        return {
-          ...nzb,
-          hash,
-        };
-      }
-      return nzb;
-    });
+  // A service checks the hash of the URL it is sent, which can be our NZB
+  // proxy's rather than the one behind it. TorBox hashes it without cleaning.
+  if (service.id !== constants.AIOSTREAMS_SERVICE) {
+    nzbs = nzbs.map((nzb) =>
+      nzb.nzb
+        ? {
+            ...nzb,
+            hash:
+              service.id === 'torbox'
+                ? hashNzbUrl(nzb.nzb, false)
+                : sentNzbHash(nzb.nzb),
+          }
+        : nzb
+    );
   }
 
   const nzbCheckResults = await debridService.checkNzbs(
@@ -797,6 +817,15 @@ async function processNZBsForDebridService(
       }
     }
 
+    if (hasTooManySelectableFiles(nzbCheckResult?.files)) {
+      logger.debug(`Skipping NZB with too many files to select from`, {
+        service: service.id,
+        nzb: nzb.title,
+        files: nzbCheckResult?.files?.length,
+      });
+      continue;
+    }
+
     validNZBs.push({ nzb, nzbCheckResult, parsedTitle: parsedNzb! });
   }
 
@@ -840,11 +869,13 @@ async function processNZBsForDebridService(
         size: nzbCheckResult?.size || nzb.size,
         indexer: nzb.library ? undefined : nzb.indexer,
         file,
+        parsedMediaInfo: mergeParsedMediaInfos(
+          nzb.parsedMediaInfo,
+          parseMediaInfo(file.mediaInfo)
+        ),
         service: {
           id: service.id,
-          cached:
-            nzbCheckResult?.status === 'cached' ||
-            (nzbCheckResult?.library || nzb.library) === true,
+          cached: nzbCheckResult?.status === 'cached' || nzb.library === true,
           library: (nzbCheckResult?.library || nzb.library) === true,
         },
       });

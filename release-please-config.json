@@ -16,7 +16,9 @@
         "compose.yaml",
         "release-please-config.json",
         "packages/seanime-extensions",
-        "packages/seanime-extension"
+        "packages/seanime-extension",
+        "packages/desktop",
+        "packages/tv"
       ],
       "pull-request-title-pattern": "chore: release ${version}"
     },
@@ -42,6 +44,32 @@
           "jsonpath": "$.version"
         }
       ]
+    },
+    "packages/desktop": {
+      "release-type": "simple",
+      "component": "desktop",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "pull-request-title-pattern": "chore(desktop): release ${version}",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value == 'aiostreams-desktop' || @.name.value == 'aiostreams-desktop-core')].version"
+        }
+      ]
+    },
+    "packages/tv": {
+      "release-type": "node",
+      "component": "tv",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "pull-request-title-pattern": "chore(tv): release ${version}"
     }
   }
 }

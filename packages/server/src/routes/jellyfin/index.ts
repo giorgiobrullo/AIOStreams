@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import express, { type Router } from 'express';
 import {
   APIError,
@@ -12,7 +14,7 @@ import {
   stremioStreamRateLimiter,
 } from '../../middlewares/ratelimit.js';
 import { jellyfinContext } from './context.js';
-import systemRouter from './system.js';
+import systemRouter, { serverName } from './system.js';
 import usersRouter from './users.js';
 import quickConnectRouter from './quickconnect.js';
 import segmentsRouter from './segments.js';
@@ -22,6 +24,8 @@ import playbackRouter from './playback.js';
 import subtitlesRouter from './subtitles.js';
 import imagesRouter from './images.js';
 import playstateRouter from './playstate.js';
+import webRouter from './web.js';
+import { jellyfinWebRoot } from '../../app.js';
 
 export const jellyfinCors: express.RequestHandler = (req, res, next) => {
   // The global middleware sets Allow-Credentials, which browsers reject
@@ -62,38 +66,6 @@ const STREAM_LIKE = /^\/items\/[^/]+\/(playbackinfo|mediasources)$/i;
 const CACHEABLE =
   /^\/(items\/[^/]+\/images|persons\/[^/]+\/images|userimage|users\/[^/]+\/images|images\/general|videos\/)/i;
 
-/** Stands in for the web client a real server hosts here. */
-function landingPage(req: express.Request): string {
-  const configure = `${req.protocol}://${req.get('host')}/stremio/configure`;
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AIOStreams for Jellyfin</title>
-<style>
-  body { font: 16px/1.6 system-ui, sans-serif; margin: 0; padding: 3rem 1.5rem;
-         background: #101418; color: #e6e9ee; }
-  main { max-width: 34rem; margin: 0 auto; }
-  h1 { font-size: 1.3rem; margin: 0 0 1rem; }
-  p { margin: 0 0 1rem; color: #aab3c0; }
-  code { background: #1c2430; padding: .15rem .4rem; border-radius: .25rem; color: #e6e9ee; }
-  a { color: #7aa7ff; }
-</style>
-</head>
-<body>
-<main>
-  <h1>AIOStreams for Jellyfin</h1>
-  <p>This address is a Jellyfin-compatible API, not a web client. Add
-     <code>${req.protocol}://${req.get('host')}${req.baseUrl}</code> as a server
-     in a Jellyfin app and sign in with your configuration UUID or alias.</p>
-  <p>Streams are played directly, so nothing is transcoded here.</p>
-  <p><a href="${configure}">Open the AIOStreams configuration page</a></p>
-</main>
-</body>
-</html>`;
-}
-
 export function createJellyfinRouter(): Router {
   const router = express.Router({
     mergeParams: true,
@@ -117,7 +89,7 @@ export function createJellyfinRouter(): Router {
   );
   router.use(express.urlencoded({ extended: false }));
 
-  /* pre-authenticated mount, but the second segment is not an encrypted password */
+  /* picker mount, but the second segment is not an encrypted password */
   router.use((req, _res, next) => {
     const p = req.params as Record<string, string | undefined>;
     if (p.uuid && p.encryptedPassword && !isEncrypted(p.encryptedPassword)) {
@@ -161,14 +133,42 @@ export function createJellyfinRouter(): Router {
   router.all('/', (req, res) => {
     res.redirect(302, `${req.baseUrl}/web/`);
   });
-  router.all(['/web', '/web/index.html'], (req, res) => {
-    res.type('html').send(landingPage(req));
+  router.all(['/web', '/web/index.html'], async (req, res) => {
+    const html = await fs.promises
+      .readFile(path.join(jellyfinWebRoot, 'index.html'), 'utf8')
+      .catch(() => null);
+    if (html === null) {
+      res.status(404).json({ Message: 'The web app is not built' });
+      return;
+    }
+    // No config lookup here: this route runs ahead of the rate limiters.
+    const name = serverName().replace(
+      /[&<>"]/g,
+      (c) => `&#${c.charCodeAt(0)};`
+    );
+    res
+      .type('html')
+      .send(
+        html
+          .replace(
+            'href="/manifest.json"',
+            `href="${req.baseUrl}/web/manifest.json"`
+          )
+          .replace(
+            /(name="apple-mobile-web-app-title" content=")[^"]*/,
+            `$1${name}`
+          )
+      );
+  });
+  /* An app hosting the web client swaps this request for its native bridge. */
+  router.get('/web/main.:name.bundle.js', (_req, res) => {
+    res.type('js').send('');
   });
 
   router.use((req, res, next) => {
     if (UNLIMITED.test(req.path)) {
       next();
-    } else if (LOGIN_LIKE.test(req.path) && !req.params.encryptedPassword) {
+    } else if (LOGIN_LIKE.test(req.path)) {
       jellyfinLoginRateLimiter(req, res, next);
     } else if (IMAGE_LIKE.test(req.path)) {
       jellyfinImageRateLimiter(req, res, next);
@@ -201,6 +201,7 @@ export function createJellyfinRouter(): Router {
   );
 
   router.use(jellyfinContext);
+  router.use(webRouter);
   router.use(systemRouter);
   router.use(usersRouter);
   router.use(quickConnectRouter);

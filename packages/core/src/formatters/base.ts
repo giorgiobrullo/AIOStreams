@@ -2,6 +2,7 @@
 import * as constants from '../utils/constants.js';
 import { formatHours, makeSmall } from './utils.js';
 import { languageToCode, languageToEmoji } from '../utils/languages.js';
+import { describedTracks } from '../utils/media-info.js';
 import { compileTemplate as engineCompileTemplate } from './engine/compile.js';
 import { canonicaliseField } from './engine/fields.js';
 import { NEW_LINE_SENTINEL, REMOVE_LINE_SENTINEL } from './engine/sentinels.js';
@@ -37,7 +38,7 @@ import { comparatorFunctions } from './engine/comparators.js';
  */
 
 type FormatterTrack = {
-  [K in keyof MediaTrack]-?: NonNullable<MediaTrack[K]> | null;
+  [K in keyof Omit<MediaTrack, 'index'>]-?: NonNullable<MediaTrack[K]> | null;
 };
 
 // stored tracks omit unset fields, which would read as unknown properties
@@ -45,6 +46,7 @@ const TRACK_DEFAULTS: FormatterTrack = {
   lang: null,
   codec: null,
   tag: null,
+  tags: null,
   channels: null,
   title: null,
   default: false,
@@ -57,7 +59,10 @@ const TRACK_DEFAULTS: FormatterTrack = {
 };
 
 function formatterTracks(tracks: MediaTrack[] | undefined): FormatterTrack[] {
-  return (tracks ?? []).map((track) => ({ ...TRACK_DEFAULTS, ...track }));
+  return describedTracks(tracks).map(({ index: _index, ...track }) => ({
+    ...TRACK_DEFAULTS,
+    ...track,
+  }));
 }
 
 export interface FormatterConfig {
@@ -869,7 +874,9 @@ export abstract class BaseFormatter {
   /**
    */
   private compileWithEngine(str: string): CompiledParseFunction {
-    return engineCompileTemplate<ParseValue>(str, {
+    // Cached templates outlive this formatter, so no hook may reach `this`.
+    let warn = this.formatterContext.onWarning;
+    const compiled = engineCompileTemplate<ParseValue>(str, {
       resolveVariable: (source, parseValue) => {
         const value = readField(source, parseValue);
         return value == null ? undefined : String(value);
@@ -883,9 +890,11 @@ export abstract class BaseFormatter {
       },
       comparators: comparatorFunctions,
       onDepthExceeded: (max) =>
-        this.formatterContext.onWarning?.(
+        warn?.(
           `Template nesting depth exceeded (max ${max}). Returning literal text.`
         ),
     });
+    warn = undefined;
+    return compiled;
   }
 }

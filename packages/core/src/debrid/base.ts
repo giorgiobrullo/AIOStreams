@@ -213,11 +213,18 @@ const TitleMetadataSchema = z.object({
   country: z.string().optional(),
   season: z.number().optional(),
   episode: z.number().optional(),
+  imdbId: z.string().nullable().optional(),
+  tmdbId: z.number().nullable().optional(),
+  tvdbId: z.number().nullable().optional(),
   absoluteEpisode: z.number().optional(),
   relativeAbsoluteEpisode: z.number().optional(),
+  // the same episode as tvdb numbers it, when that differs
+  tvdbSeason: z.number().optional(),
+  tvdbEpisode: z.number().optional(),
   // local air dates ('YYYY-MM-DD') of the requested episode for date-based shows
   airDates: z.array(z.string()).optional(),
   isDateBased: z.boolean().optional(),
+  originalLanguage: z.string().optional(),
 });
 
 const BasePlaybackInfoSchema = z.object({

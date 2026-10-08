@@ -3,11 +3,11 @@ import { useQuery } from '@tanstack/react-query';
 import { ArrowDownLeft, ArrowUpRight, History } from 'lucide-react';
 import { FiExternalLink } from 'react-icons/fi';
 import { useUserData } from '@/context/userData';
-import { Button } from '@/components/ui/button';
-import { Skeleton } from '@/components/ui/skeleton';
+import { Button } from '@aiostreams/ui/button';
+import { Skeleton } from '@aiostreams/ui/skeleton';
 import { watchStateTrackersQuery } from '@/lib/queries';
 import { DOCS_BASE_URL } from '@/lib/changelog';
-import { relativeTime } from '@/lib/format';
+import { relativeTime } from '@aiostreams/ui/core/format';
 import type { TrackerExchange, WatchStateTracker } from '@/lib/api';
 
 const RESOURCE_DOCS_URL = `${DOCS_BASE_URL}/reference/addon-protocol/watch-state`;
@@ -79,7 +79,13 @@ function TrackerRow({
           {tracker.addon}
           {owner && <span className="text-[--muted]"> · {owner}</span>}
         </p>
-        {tracker.push && (
+        {tracker.refused && (
+          <p className="text-xs text-[--orange]">
+            Not used: this addon is on a private address, and this instance
+            doesn&apos;t connect to private addresses.
+          </p>
+        )}
+        {!tracker.refused && tracker.push && (
           <ExchangeLine
             icon={<ArrowUpRight className="h-3.5 w-3.5" />}
             label="Records your plays"
@@ -88,7 +94,7 @@ function TrackerRow({
             idle="Nothing played yet"
           />
         )}
-        {tracker.pull && (
+        {!tracker.refused && tracker.pull && (
           <ExchangeLine
             icon={<ArrowDownLeft className="h-3.5 w-3.5" />}
             label="Imports your history"
@@ -98,7 +104,7 @@ function TrackerRow({
           />
         )}
       </div>
-      {tracker.status !== 'connected' && (
+      {!tracker.refused && tracker.status !== 'connected' && (
         <span
           className="shrink-0 rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300"
           title={
@@ -186,7 +192,7 @@ export function JellyfinTrackers() {
           </Button>
         }
       >
-        An addon that supports Watch State can record what you play in Jellyfin
+        An addon that supports Watch State can record what you play in the apps
         and bring in what you watched elsewhere. None of yours do yet.
       </EmptyState>
     );

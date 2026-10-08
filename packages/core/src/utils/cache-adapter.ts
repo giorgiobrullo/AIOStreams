@@ -89,9 +89,12 @@ export class MemoryCacheBackend<K, V> implements CacheBackend<K, V> {
   private static sweepIntervalTime: number = 60_000;
   private static sweepYieldEvery: number = 5000;
 
-  constructor(maxSize: number) {
+  private clone: <T>(value: T) => T;
+
+  constructor(maxSize: number, options: { clone?: boolean } = {}) {
     this.cache = new Map<K, CacheItem<V>>();
     this.maxSize = maxSize;
+    this.clone = options.clone === false ? (value) => value : structuredClone;
     MemoryCacheBackend.instances.add(this);
     MemoryCacheBackend.startSweepInterval();
   }
@@ -138,7 +141,7 @@ export class MemoryCacheBackend<K, V> implements CacheBackend<K, V> {
         item.createdAt = now;
       }
 
-      return structuredClone(item.value);
+      return this.clone(item.value);
     }
     return undefined;
   }
@@ -158,12 +161,7 @@ export class MemoryCacheBackend<K, V> implements CacheBackend<K, V> {
     }
     this.cache.set(
       key,
-      new CacheItem<V>(
-        structuredClone(value),
-        Date.now(),
-        Date.now(),
-        ttl * 1000
-      )
+      new CacheItem<V>(this.clone(value), Date.now(), Date.now(), ttl * 1000)
     );
   }
 
@@ -606,6 +604,9 @@ export class SQLCacheBackend<K, V> implements CacheBackend<K, V> {
     }
   }
 
+  private static sizeEstimate: { rows: number; at: number } | null = null;
+  private static readonly SIZE_RECHECK_MS = 5 * 60_000;
+
   private static async drainWriteBuffer(): Promise<void> {
     const bufferToFlush = new Map(SQLCacheBackend.writeBuffer);
     SQLCacheBackend.writeBuffer.clear();
@@ -624,12 +625,20 @@ export class SQLCacheBackend<K, V> implements CacheBackend<K, V> {
     const start = Date.now();
 
     try {
-      let currentSize = await db.count(
-        sql`SELECT COUNT(*) AS count FROM cache`
-      );
-      let overflow =
-        currentSize + bufferToFlush.size - appConfig.resources.cache.sqlMaxSize;
+      const cap = appConfig.resources.cache.sqlMaxSize;
+      const known = SQLCacheBackend.sizeEstimate;
+      const trusted =
+        known !== null &&
+        Date.now() - known.at < SQLCacheBackend.SIZE_RECHECK_MS &&
+        known.rows + bufferToFlush.size < cap * 0.9;
+      let currentSize = trusted
+        ? known.rows
+        : await db.count(sql`SELECT COUNT(*) AS count FROM cache`);
+      if (!trusted)
+        SQLCacheBackend.sizeEstimate = { rows: currentSize, at: Date.now() };
+      let overflow = currentSize + bufferToFlush.size - cap;
       if (overflow > 0) {
+        SQLCacheBackend.sizeEstimate = null;
         const removed = await SQLCacheBackend.flushStaleEntries(db);
         logger.debug(
           `Removed ${removed} stale entries from SQL cache during flush.`
@@ -675,6 +684,8 @@ export class SQLCacheBackend<K, V> implements CacheBackend<K, V> {
                  last_accessed = CURRENT_TIMESTAMP`,
         values
       );
+      if (SQLCacheBackend.sizeEstimate)
+        SQLCacheBackend.sizeEstimate.rows += placeholders.length;
 
       logger.debug('Flushed SQL write buffer', {
         items: bufferToFlush.size,
@@ -854,12 +865,13 @@ export class SQLCacheBackend<K, V> implements CacheBackend<K, V> {
 
   async delete(key: K): Promise<boolean> {
     const sqlKey = this.getKey(key);
+    const wasBuffered = SQLCacheBackend.writeBuffer.delete(sqlKey);
 
     try {
       const result = await this.db.exec(
         sql`DELETE FROM cache WHERE key = ${sqlKey}`
       );
-      return result.rowCount > 0;
+      return wasBuffered || result.rowCount > 0;
     } catch (err) {
       logger.error(`Error deleting key ${String(key)} from SQL cache: ${err}`);
       return false;

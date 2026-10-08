@@ -1,5 +1,5 @@
 ﻿import { createLogger } from '../logging/logger.js';
-import { config as appConfig } from '../config/index.js';
+import { config as appConfig, settingsStore } from '../config/index.js';
 
 const logger = createLogger('startup');
 
@@ -48,9 +48,7 @@ export const logStartupInfo = () => {
   logger.info(`  Log Level:     ${appConfig.logging.logLevel.toUpperCase()}`);
   logger.info(`  Log Format:    ${appConfig.logging.logFormat.toUpperCase()}`);
   if (appConfig.logging.logSensitiveInfo) {
-    logger.warn(
-      '  Sensitive Info logging is ENABLED =€” disable in production'
-    );
+    logger.warn('  Sensitive Info logging is ENABLED - disable in production');
   }
   logger.info('');
 
@@ -61,6 +59,24 @@ export const logStartupInfo = () => {
     logger.info(`  Auth Required: /stremio/configure requires login`);
   }
   logger.info('');
+
+  const contributeSource = settingsStore.metadata.find(
+    (m) => m.key === 'remuxdb.contribute'
+  )?.source;
+  if (
+    appConfig.remuxdb.enabled &&
+    appConfig.remuxdb.contribute &&
+    contributeSource === 'default'
+  ) {
+    logger.info('  RemuxDB:       contributing played files (on by default)');
+    logger.info(
+      "                 Sends RemuxDB the tracks of played files it doesn't have, with the release, file name and title."
+    );
+    logger.info(
+      '                 Set REMUXDB_CONTRIBUTE=false, or turn it off in /dashboard/settings, to stop.'
+    );
+    logger.info('');
+  }
 
   logger.info(
     '  Runtime settings are viewable and editable at /dashboard/settings'

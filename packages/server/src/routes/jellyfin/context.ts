@@ -13,23 +13,27 @@ import {
   getSimpleTextHash,
   isConfigUuid,
   isEncrypted,
+  PERSONA_PIN_PATTERN,
+  verifyHash,
   mintToken,
   readToken,
   resolveConfigAlias,
   memoScope,
   personaUserId,
-  resolveVariantSelector,
+  recordClientAgent,
   serverId as instanceServerId,
   sql,
   UserRepository,
   validateConfig,
-  VARIANT_PATH_PARAM,
-  VARIANT_QUERY_PARAM,
   decryptString,
   type ClientInfo,
   type ItemBuildContext,
   type JellyfinApiKey,
   type JellyfinPersona,
+  exposedCatalogs,
+  guessLeaf,
+  leafEvidenceFor,
+  type LeafEvidence,
   listViews,
   type ParsedMeta,
   type ViewEntry,
@@ -38,8 +42,15 @@ import {
 } from '@aiostreams/core';
 import { syncUserDataUrls } from '../../utils/syncUserData.js';
 import { buildVariantRequestContext } from '../../utils/variant-context.js';
+import { attemptLimiter } from '../../middlewares/ratelimit.js';
 
 const logger = createLogger('jellyfin');
+
+/**
+ * The Android app's own player, which plays an `Http` source's `Path` as a
+ * live HLS playlist, so it is sent through the stream route instead.
+ */
+export const ANDROID_PLAYER_CLIENT = 'Jellyfin for Android';
 
 export interface JellyfinRequestContext {
   uuid: string;
@@ -57,7 +68,6 @@ export interface JellyfinRequestContext {
   baseUrl: string;
   token: string;
   client: ClientInfo;
-  preAuthenticated: boolean;
   build: ItemBuildContext;
   engine(): Promise<AIOStreams>;
   /** The primary user's configuration, whose sinks are the ones trackers sync with. */
@@ -68,6 +78,8 @@ export interface JellyfinRequestContext {
   metas: Map<string, Promise<ParsedMeta | null>>;
   /** The libraries, resolved once per request; one cache read per catalog. */
   views(): Promise<ViewEntry[]>;
+  /** Which types play on their own, and a guess for the ones not yet swept. */
+  leafEvidence(): Promise<LeafEvidence>;
 }
 
 /*
@@ -77,7 +89,10 @@ export interface JellyfinRequestContext {
  */
 interface CachedConfig {
   userData: UserData;
+  /** As saved, for variants to patch before the sync and validation. */
+  stored: UserData;
   updatedAt: string;
+  loadedAt: number;
   checkedAt: number;
 }
 const CONFIG_TTL = 300;
@@ -87,7 +102,8 @@ const RECHECK_MS = 30_000;
 const configCache = Cache.getInstance<string, CachedConfig>(
   'jellyfin-config',
   5000,
-  'memory'
+  'memory',
+  { clone: false }
 );
 const inFlight = new Map<string, Promise<CachedConfig | null>>();
 
@@ -121,16 +137,36 @@ async function loadConfig(
   userData.uuid = uuid;
   userData.encryptedPassword = encryptedPassword;
   userData.ip = undefined;
-  userData = await syncUserDataUrls(userData);
-  userData = await validateConfig(userData, {
+  const stored = structuredClone(userData);
+  return {
+    userData: await syncAndValidate(userData),
+    stored,
+    updatedAt: await configUpdatedAt(uuid),
+    loadedAt: Date.now(),
+    checkedAt: Date.now(),
+  };
+}
+
+async function syncAndValidate(userData: UserData): Promise<UserData> {
+  return validateConfig(await syncUserDataUrls(userData), {
+    skipVariantValidation: true,
     skipErrorsFromAddonsOrProxies: true,
     decryptValues: true,
   });
-  return {
-    userData,
-    updatedAt: await configUpdatedAt(uuid),
-    checkedAt: Date.now(),
-  };
+}
+
+/**
+ * The configuration a `/u/<alias>` picker address names. Aliases are lowercase,
+ * and a TV keyboard may capitalise what was typed.
+ */
+export async function resolvePickerAlias(
+  alias: string
+): Promise<{ uuid: string; encryptedPassword: string } | null> {
+  const lower = alias.toLowerCase();
+  return (
+    (await resolveConfigAlias(alias)) ??
+    (lower !== alias ? await resolveConfigAlias(lower) : null)
+  );
 }
 
 export async function resolveUuid(uuidOrAlias: string): Promise<string | null> {
@@ -147,8 +183,9 @@ export async function resolveConfigEntry(
   const key = `${uuid}|${getSimpleTextHash(encryptedPassword)}`;
   let entry = await configCache.get(key).catch(() => undefined);
   if (entry && Date.now() - entry.checkedAt > RECHECK_MS) {
-    const updatedAt = await configUpdatedAt(uuid);
-    if (updatedAt !== entry.updatedAt) {
+    // Synced lists were merged in at load, so an unchanged config still expires.
+    const expired = Date.now() - entry.loadedAt > CONFIG_TTL * 1000;
+    if (expired || (await configUpdatedAt(uuid)) !== entry.updatedAt) {
       await configCache.delete(key).catch(() => undefined);
       entry = undefined;
     } else {
@@ -167,16 +204,14 @@ export async function resolveConfigEntry(
     const loaded = await pending;
     if (!loaded) return null;
     void configCache.set(key, loaded, CONFIG_TTL).catch(() => undefined);
-    // Cold loads share one promise, and the caller stamps its IP onto the
-    // result, so each needs its own copy. A cache hit is already a clone.
-    entry = structuredClone(loaded);
+    entry = loaded;
   }
   return entry;
 }
 
 /**
- * A fresh copy of the resolved config, or null when the credentials are wrong.
- * Not cloned here: the forced-memory cache already clones on read.
+ * The resolved config, or null when the credentials are wrong. Shared with the
+ * cache: copy it before changing anything.
  */
 export async function resolveConfig(
   uuid: string,
@@ -204,6 +239,16 @@ export async function resolveConfigFor(
   return entry ? { uuid, userData: entry.userData } : null;
 }
 
+/** A persona with a history of its own keeps its watch state and preferences apart. */
+export function watchScopeOf(
+  uuid: string,
+  persona: JellyfinPersona | null | undefined
+): WatchScope {
+  return persona && persona.history !== 'shared'
+    ? { uuid, persona: persona.id }
+    : accountScope(uuid);
+}
+
 export function personasOf(userData: UserData): JellyfinPersona[] {
   return userData.jellyfin?.personas ?? [];
 }
@@ -227,6 +272,64 @@ export function personaByName(
       (p) => p.id === wanted || p.name.trim().toLowerCase() === wanted
     ) ?? null
   );
+}
+
+export function personaLocked(
+  persona: JellyfinPersona | null | undefined
+): boolean {
+  return !!persona?.lock;
+}
+
+/** The PIN hash of a persona, or of the account for `null`. */
+function lockOf(
+  userData: Pick<UserData, 'jellyfin'>,
+  persona: JellyfinPersona | null
+): string | undefined {
+  return persona ? persona.lock : userData.jellyfin?.primary?.lock;
+}
+
+export function accountLocked(userData: Pick<UserData, 'jellyfin'>): boolean {
+  return !!lockOf(userData, null);
+}
+
+export function lockTag(
+  userData: Pick<UserData, 'jellyfin'>,
+  persona: JellyfinPersona | null
+): string {
+  const lock = lockOf(userData, persona);
+  return lock ? getSimpleTextHash(lock).slice(0, 12) : '';
+}
+
+/** Sent when the credential was right but a PIN is missing or wrong, so a client can ask for it. */
+export const PIN_REQUIRED = 'PIN required';
+
+// Shared across replicas when Redis is set, so a guess cannot be spread over them.
+const pinAttempts = attemptLimiter(15 * 60, 5, 'jellyfin-pin');
+
+/**
+ * Whether `pin` opens the user, a persona or the account for `null`. Past the
+ * attempt limit even the right PIN is refused for a while.
+ */
+export async function userUnlocks(
+  uuid: string,
+  userData: Pick<UserData, 'jellyfin'>,
+  persona: JellyfinPersona | null,
+  pin: string
+): Promise<boolean> {
+  const lock = lockOf(userData, persona);
+  if (!lock) return true;
+  // No PIN at all is a prompt, not a guess.
+  if (!pin) return false;
+  const key = `${uuid}:${persona?.id ?? ''}`;
+  if (!(await pinAttempts.take(key))) {
+    logger.warn({ uuid, persona: persona?.id }, 'user pin locked out');
+    return false;
+  }
+  if (PERSONA_PIN_PATTERN.test(pin) && (await verifyHash(pin, lock))) {
+    await pinAttempts.reset(key);
+    return true;
+  }
+  return false;
 }
 
 export function requestOrigin(req: Request): string {
@@ -290,6 +393,17 @@ export function bodyOf(req: Request): Record<string, unknown> {
     : {};
 }
 
+/** A body field by name in any case, as Jellyfin reads JSON. */
+export function bodyField(req: Request, name: string): unknown {
+  const body = bodyOf(req);
+  if (name in body) return body[name];
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(body)) {
+    if (key.toLowerCase() === lower) return value;
+  }
+  return undefined;
+}
+
 /** Routes that must answer without a credential (clients send none). */
 const ANONYMOUS_OK = [
   /^\/system\/info\/public$/i,
@@ -309,7 +423,6 @@ const ANONYMOUS_OK = [
   /^\/videos\/[^/]+\/stream(\.|\/|$)/i,
   /^\/videos\/[^/]+\/[^/]+\/subtitles\//i,
   /^\/items\/[^/]+\/(download|file)$/i,
-  /^\/items\/[^/]+$/i,
   /^\/items\/[^/]+\/playbackinfo$/i,
   /^\/items\/[^/]+\/mediasources$/i,
   /^\/web\/manifest\.json$/i,
@@ -350,20 +463,29 @@ interface ApiKeyClaim {
 
 const UNKNOWN_USER = 'unknown-user';
 
+/** Clients name themselves in the auth header, hidden from conditions. */
+function withClientName(userAgent: string, client: ClientInfo): string {
+  if (client.name === 'Unknown') return userAgent;
+  let product =
+    client.version === '0' ? client.name : `${client.name}/${client.version}`;
+  if (client.device !== 'Unknown') product += ` (${client.device})`;
+  return userAgent ? `${userAgent} ${product}` : product;
+}
+
 async function buildContext(
   req: Request,
   uuid: string,
   encryptedPassword: string,
   token: string | undefined,
   client: ClientInfo,
-  preAuthenticated: boolean,
   personaKey: string,
-  keyClaim?: ApiKeyClaim
+  keyClaim?: ApiKeyClaim,
+  /** The token's PIN tag; absent when the context is not built from a token. */
+  lockClaim?: string
 ): Promise<JellyfinRequestContext | typeof UNKNOWN_USER | null> {
   const entry = await resolveConfigEntry(uuid, encryptedPassword);
   if (!entry) return null;
-  let userData = entry.userData;
-  userData.ip = req.userIp;
+  let userData: UserData = { ...entry.userData, ip: req.userIp };
   const baseUserData = userData;
 
   let apiKey: JellyfinApiKey | null = null;
@@ -375,38 +497,52 @@ async function buildContext(
     const named = keyClaim.userId
       ? userForId(uuid, userData, keyClaim.userId)
       : null;
-    if (named === undefined) return UNKNOWN_USER;
+    // A key goes to a tool, not a person, so it must not open a PIN.
+    if (named === undefined || personaLocked(named)) return UNKNOWN_USER;
     persona = named;
   } else {
     // A token naming a persona that no longer exists is no longer valid.
     persona = personaKey ? personaById(userData, personaKey) : null;
     if (personaKey && !persona) return null;
+    if (lockClaim !== undefined && lockClaim !== lockTag(userData, persona))
+      return null;
   }
   const primaryVariants = userData.jellyfin?.primary?.variants ?? [];
-  const variantContext = buildVariantRequestContext(req, 'jellyfin');
-
-  try {
-    const { ids: fromUrl, location } = resolveVariantSelector(
-      (req.params as Record<string, unknown>)[VARIANT_PATH_PARAM],
-      req.query[VARIANT_QUERY_PARAM]
-    );
-    // The URL is the more immediate choice, so it applies last and wins.
-    const own = persona ? (persona.variants ?? []) : primaryVariants;
-    const linked = own.filter((id) => !fromUrl.includes(id));
-    const selected = [...linked, ...fromUrl];
-    const result = await activateVariants(userData, selected, variantContext);
-    userData = result.userData;
-    if (fromUrl.length) userData.variantSelectorLocation = location;
-  } catch (error) {
-    logger.warn(
-      {
-        uuid,
-        persona: persona?.id,
-        err: error instanceof Error ? error.message : String(error),
-      },
-      'variant activation failed for jellyfin request'
-    );
-  }
+  const request = buildVariantRequestContext(req, 'jellyfin');
+  const variantContext = {
+    ...request,
+    userAgent: withClientName(request.userAgent, client),
+  };
+  // Tokenless contexts also serve the configuration page's own requests.
+  if (token) void recordClientAgent(uuid, variantContext.userAgent, 'jellyfin');
+  const configFor = async (selected: string[]): Promise<UserData> => {
+    try {
+      // Activation sets `healthResults` on its argument.
+      const { userData: activated, applied } = await activateVariants(
+        { ...entry.stored },
+        selected,
+        variantContext
+      );
+      const data = applied.length
+        ? await syncAndValidate(activated)
+        : { ...baseUserData, healthResults: activated.healthResults };
+      return { ...data, ip: req.userIp };
+    } catch (error) {
+      logger.warn(
+        {
+          uuid,
+          persona: persona?.id,
+          variants: selected,
+          err: error instanceof Error ? error.message : String(error),
+        },
+        'variant activation failed for jellyfin request'
+      );
+      return baseUserData;
+    }
+  };
+  userData = await configFor(
+    persona ? (persona.variants ?? []) : primaryVariants
+  );
 
   const serverIdValue = instanceServerId();
   const baseUrl = `${requestOrigin(req)}${req.baseUrl}`.replace(/\/$/, '');
@@ -414,28 +550,28 @@ async function buildContext(
   let primaryEngine: Promise<AIOStreams> | null = null;
   let scope: string | null = null;
   let views: Promise<ViewEntry[]> | null = null;
+  let leafEvidence: Promise<LeafEvidence> | null = null;
   const finalUserData = userData;
   const engineOf = (data: UserData) =>
-    new AIOStreams(data, { skipFailedAddons: true }).initialise();
+    new AIOStreams(data, {
+      skipFailedAddons: true,
+      path: 'jellyfin',
+    }).initialise();
   const getEngine = () => (engine ??= engineOf(finalUserData));
   const getViews = () =>
     (views ??= getEngine().then((e) => listViews(e, finalUserData)));
+  const getLeafEvidence = () =>
+    (leafEvidence ??= getEngine().then(async (engine) => ({
+      ...(await leafEvidenceFor(finalUserData, exposedCatalogs(engine))),
+      guess: (entry: { id: string; type: string }) =>
+        guessLeaf(entry, (type, id) => engine.canGetMeta(type, id)),
+    })));
   const getPrimaryEngine = () => {
     if (!persona) return getEngine();
-    return (primaryEngine ??= activateVariants(
-      baseUserData,
-      primaryVariants,
-      variantContext
-    ).then(
-      (r) => engineOf(r.userData),
-      () => engineOf(baseUserData)
-    ));
+    return (primaryEngine ??= configFor(primaryVariants).then(engineOf));
   };
   const userId = personaUserId(uuid, persona?.id ?? '');
-  const watch: WatchScope =
-    persona && persona.history !== 'shared'
-      ? { uuid, persona: persona.id }
-      : accountScope(uuid);
+  const watch = watchScopeOf(uuid, persona);
   return {
     uuid,
     encryptedPassword,
@@ -453,19 +589,21 @@ async function buildContext(
         p: encryptedPassword,
         d: client.deviceId,
         k: persona?.id,
+        l: lockTag(baseUserData, persona) || undefined,
       }),
     client,
-    preAuthenticated,
     build: {
       serverId: serverIdValue,
       userId,
       uuid,
       listVersions: wantsListVersions(req, client),
+      markUnaired: finalUserData.jellyfin?.markUnaired ?? true,
     },
     engine: getEngine,
     primaryEngine: getPrimaryEngine,
     metas: new Map(),
     views: getViews,
+    leafEvidence: getLeafEvidence,
     scope: () => (scope ??= memoScope(finalUserData, entry.updatedAt)),
   };
 }
@@ -480,24 +618,35 @@ export const jellyfinContext: RequestHandler = async (req, res, next) => {
 
     let uuid: string | undefined;
     let encryptedPassword: string | undefined;
-    let preAuthenticated = false;
-    // Read on both branches: the path proves the credential, the token names the persona.
     const payload = token ? readToken(token) : null;
 
+    // A picker address only names the configuration; a token still signs in.
     if (params.uuid && params.encryptedPassword) {
       if (!isEncrypted(params.encryptedPassword)) {
         next('router');
         return;
       }
-      const resolved = await resolveUuid(params.uuid);
-      if (!resolved) {
+      if (!isConfigUuid(params.uuid)) {
         res.status(401).json({ Message: 'Unknown configuration' });
         return;
       }
-      uuid = resolved;
-      encryptedPassword = params.encryptedPassword;
-      preAuthenticated = true;
-    } else if (payload) {
+      req.jfMount = {
+        uuid: params.uuid,
+        encryptedPassword: params.encryptedPassword,
+      };
+    } else if (params.alias) {
+      const target = await resolvePickerAlias(params.alias);
+      if (!target) {
+        res.status(401).json({ Message: 'Unknown configuration' });
+        return;
+      }
+      req.jfMount = target;
+    }
+    if (
+      payload &&
+      (!req.jfMount ||
+        payload.u.toLowerCase() === req.jfMount.uuid.toLowerCase())
+    ) {
       uuid = payload.u;
       encryptedPassword = payload.p;
     }
@@ -512,17 +661,15 @@ export const jellyfinContext: RequestHandler = async (req, res, next) => {
       return;
     }
 
-    // A token minted for another configuration lends it no persona or key.
-    const ownToken = payload && payload.u === uuid ? payload : null;
     const ctx = await buildContext(
       req,
       uuid,
       encryptedPassword,
       token,
       client,
-      preAuthenticated,
-      ownToken?.k ?? '',
-      ownToken?.a ? { id: ownToken.a, userId: urlUserId(req) } : undefined
+      payload?.k ?? '',
+      payload?.a ? { id: payload.a, userId: urlUserId(req) } : undefined,
+      payload?.l ?? ''
     );
     if (ctx === UNKNOWN_USER) {
       res.status(404).json({ Message: 'User not found' });
@@ -634,7 +781,6 @@ export async function contextFromCredentials(
       deviceId: 'unknown',
       version: '0',
     },
-    false,
     personaKey
   );
   return ctx === UNKNOWN_USER ? null : ctx;

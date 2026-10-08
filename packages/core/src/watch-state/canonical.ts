@@ -11,11 +11,13 @@ import type {
 } from '../anime-database/types.js';
 import { IdMappingDataset } from '../metadata/id-mappings.js';
 import { config as appConfig } from '../config/index.js';
+import { Cache } from '../utils/cache.js';
 import { IdParser, type ParsedId } from '../utils/id-parser.js';
 import { createLogger } from '../logging/logger.js';
 import {
   identityFor,
   itemKeyFor,
+  seriesKeyOf,
   type ContentRef,
   type WatchIdentity,
 } from './types.js';
@@ -92,19 +94,61 @@ function tvdbEpisodeOf(
   return { season: range.tvdbSeason, episode: episode + range.offset };
 }
 
+const HINTED_TYPES: ParsedId['type'][] = [...ENTRY_NUMBERED, 'anidbId'];
+
+/** The IMDb title an entry's hints number it under, when that is not its mapped show. */
+function hintedElsewhere(
+  type: ParsedId['type'],
+  entry: AnimeEntry
+): string | null {
+  const hinted = entry.imdb?.id;
+  const mapped = entry.mappings?.imdbId;
+  if (!hinted || !mapped || hinted === mapped) return null;
+  return HINTED_TYPES.includes(type) ? hinted : null;
+}
+
+/**
+ * An entry the IMDb hints number under another title than its mapped show is
+ * placed in that show by its TVDB season and offset, which is how metadata
+ * addons number its episodes there (not by the anime-list's AniDB pairs), or
+ * failing that, under the hints' own title.
+ */
+function hintedElsewhereEpisodeOf(
+  parsed: ParsedId,
+  entry: AnimeEntry
+): { base?: string; season: number; episode: number } | null {
+  const hinted = hintedElsewhere(parsed.type, entry);
+  if (!hinted) return null;
+  const episode = Number(parsed.episode);
+  if (!Number.isInteger(episode)) return null;
+  const { seasonNumber, fromEpisode } = entry.tvdb;
+  if (typeof seasonNumber === 'number') {
+    return { season: seasonNumber, episode: (fromEpisode ?? 1) + episode - 1 };
+  }
+  if (entry.imdb?.seasonNumber == null) return null;
+  return {
+    base: hinted,
+    season: entry.imdb.seasonNumber,
+    episode: (entry.imdb.fromEpisode ?? 1) + episode - 1,
+  };
+}
+
 function matchKeyWith(
   ref: ContentRef,
   lookup: Lookup,
   entry: AnimeEntry | null
 ): string | null {
   if (!entry) return null;
-  const base = preferredBase(entry.mappings);
-  if (!base) return null;
+  const mapped = preferredBase(entry.mappings);
+  if (!mapped) return null;
   if (ref.kind === 'movie') {
-    return itemKeyFor({ ...ref, baseId: base, videoId: base });
+    return itemKeyFor({ ...ref, baseId: mapped, videoId: mapped });
   }
 
-  const placed = tvdbEpisodeOf(lookup.parsed, entry);
+  const placed: { base?: string; season: number; episode: number } | null =
+    tvdbEpisodeOf(lookup.parsed, entry) ??
+    hintedElsewhereEpisodeOf(lookup.parsed, entry);
+  const base = placed?.base ?? mapped;
   if (placed) {
     lookup.parsed.season = String(placed.season);
     lookup.parsed.episode = String(placed.episode);
@@ -158,6 +202,36 @@ function mappedMatchKey(ref: ContentRef, lookup: Lookup): string | null {
   });
 }
 
+/**
+ * A show under its preferred id, so a drop made under one spelling covers the
+ * others; under its hints' own title when that is where all its episodes key.
+ */
+async function showMatchKey(ref: ContentRef): Promise<string | null> {
+  const parsed = IdParser.parse(ref.baseId, ref.type);
+  if (!parsed) return null;
+  const entry = await AnimeDatabase.getInstance().getEntryById(
+    parsed.type,
+    parsed.value
+  );
+  const hinted = entry && hintedElsewhere(parsed.type, entry);
+  let base =
+    hinted &&
+    typeof entry.tvdb.seasonNumber !== 'number' &&
+    entry.imdb?.seasonNumber != null
+      ? hinted
+      : preferredBase(entry?.mappings);
+  const provider = MAPPED[parsed.type];
+  if (!base && provider && appConfig.metadata.idMappings.enabled) {
+    base =
+      IdMappingDataset.getInstance().imdbIdFor(
+        'series',
+        provider,
+        Number(parsed.value)
+      ) ?? null;
+  }
+  return base ? seriesKeyOf(base) : null;
+}
+
 function logMiss(ref: ContentRef, error: unknown) {
   logger.debug(
     {
@@ -170,6 +244,7 @@ function logMiss(ref: ContentRef, error: unknown) {
 
 export async function matchKeyFor(ref: ContentRef): Promise<string | null> {
   try {
+    if (ref.kind === 'series') return await showMatchKey(ref);
     const lookup = lookupOf(ref);
     if (!lookup) return null;
     const entry = await AnimeDatabase.getInstance().getEntryById(
@@ -185,6 +260,26 @@ export async function matchKeyFor(ref: ContentRef): Promise<string | null> {
   }
 }
 
+const MATCH_KEY_TTL = 60 * 60;
+
+const matchKeyCache = Cache.getInstance<string, string | null>(
+  'watch-match-keys',
+  50_000,
+  'memory'
+);
+
+/** Every field a match key is derived from; the item key leaves some out. */
+function refAddress(ref: ContentRef): string {
+  return [
+    ref.kind,
+    ref.type,
+    ref.baseId,
+    ref.season ?? '',
+    ref.episode ?? '',
+    ref.videoId ?? '',
+  ].join('|');
+}
+
 /** Keyed by each reference's own key; one anime-database read per distinct id. */
 export async function matchKeysFor(
   refs: ContentRef[]
@@ -192,33 +287,46 @@ export async function matchKeysFor(
   type Selector = (season?: number, episode?: number) => AnimeEntry | null;
   const out = new Map<string, string | null>();
   const selectors = new Map<string, Promise<Selector | null>>();
-  for (const ref of refs) {
+  const addresses = refs.map(refAddress);
+  const cached = await matchKeyCache.getMany(addresses);
+  for (const [i, ref] of refs.entries()) {
     const key = itemKeyFor(ref);
     if (out.has(key)) continue;
+    if (cached[i] !== undefined) {
+      out.set(key, cached[i]);
+      continue;
+    }
     try {
-      const lookup = lookupOf(ref);
-      if (!lookup) {
-        out.set(key, null);
-        continue;
+      let match: string | null = null;
+      if (ref.kind === 'series') {
+        match = await showMatchKey(ref);
+      } else {
+        const lookup = lookupOf(ref);
+        if (lookup) {
+          const id = `${lookup.parsed.type}:${lookup.parsed.value}`;
+          let selector = selectors.get(id);
+          if (!selector) {
+            selector = AnimeDatabase.getInstance()
+              .selectorFor(lookup.parsed.type, lookup.parsed.value)
+              .catch((error: unknown) => {
+                logMiss(ref, error);
+                return null;
+              });
+            selectors.set(id, selector);
+          }
+          const select = await selector;
+          if (!select) {
+            // A failed read is not cached.
+            out.set(key, mappedMatchKey(ref, lookup));
+            continue;
+          }
+          match =
+            matchKeyWith(ref, lookup, select(lookup.season, lookup.episode)) ??
+            mappedMatchKey(ref, lookup);
+        }
       }
-      const id = `${lookup.parsed.type}:${lookup.parsed.value}`;
-      let selector = selectors.get(id);
-      if (!selector) {
-        selector = AnimeDatabase.getInstance()
-          .selectorFor(lookup.parsed.type, lookup.parsed.value)
-          .catch((error: unknown) => {
-            logMiss(ref, error);
-            return null;
-          });
-        selectors.set(id, selector);
-      }
-      const select = await selector;
-      out.set(
-        key,
-        (select
-          ? matchKeyWith(ref, lookup, select(lookup.season, lookup.episode))
-          : null) ?? mappedMatchKey(ref, lookup)
-      );
+      out.set(key, match);
+      void matchKeyCache.set(addresses[i], match, MATCH_KEY_TTL);
     } catch (error) {
       logMiss(ref, error);
       out.set(key, null);

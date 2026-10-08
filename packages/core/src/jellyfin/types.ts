@@ -1,4 +1,6 @@
 import type { ParsedFile } from '../db/schemas.js';
+import type { TitleMetadata } from '../debrid/base.js';
+import type { MediaInfoIdentity } from '../media-info/lookup.js';
 
 /**
  * What a Jellyfin item id stands for. `t` is always the Stremio type used
@@ -52,7 +54,12 @@ export interface AiostreamsSourceExtension {
   indexer?: string;
   mediaInfoQuality?: string;
   filename?: string;
+  externalUrl?: string;
   type: string;
+  /** Stremio's: the next episode's version with the same group plays on. */
+  bingeGroup?: string;
+  /** The version's own id, as the first version's `Id` is the item's. Set when sent. */
+  id?: string;
 }
 
 export interface MediaSourceRecord {
@@ -68,6 +75,7 @@ export interface MediaSourceRecord {
   parsedFile?: ParsedFile;
   subtitles: SubtitleTrack[];
   subtitlesEnriched?: boolean;
+  mediaInfo?: MediaInfoIdentity;
   videoHash?: string;
   live: boolean;
   /** Carries text only: an addon notice, a pipeline error or a statistic. */
@@ -86,6 +94,8 @@ export interface PlaybackMemo {
   psid: string;
   sources: MediaSourceRecord[];
   addonSubtitles: SubtitleTrack[];
+  /** The requested title, for its original language and a pack's probed files. */
+  titleMetadata?: TitleMetadata;
   runtimeMs?: number;
   createdAt: number;
 }
@@ -94,6 +104,9 @@ export interface MemoPointer {
   uuid: string;
   encryptedPassword: string;
   itemId: string;
+  persona?: string;
+  /** Only on a play session's pointer. */
+  scope?: string;
 }
 
 export type ImageKind = 'Primary' | 'Backdrop' | 'Logo' | 'Thumb';
@@ -103,6 +116,9 @@ export interface UserItemDataDto {
   PlaybackPositionTicks: number;
   PlayCount: number;
   IsFavorite: boolean;
+  Likes?: boolean;
+  /** 0 to 10. */
+  Rating?: number;
   Played: boolean;
   LastPlayedDate?: string;
   PlayedPercentage?: number;

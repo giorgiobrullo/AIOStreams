@@ -169,6 +169,7 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
   syncedRankedStreamExpressionUrls: { label: 'Synced Ranked Expression URLs', group: 'filters', type: 'list', menu: 'filters', subTab: 'stream-expression' },
 
   enableSeadex: { label: 'SeaDex', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'miscellaneous', keywords: ['anime', 'releases.moe'] },
+  remuxDb: { label: 'RemuxDB', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'miscellaneous', keywords: ['probe', 'media info'] },
   excludeSeasonPacks: { label: 'Exclude Season Packs', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'miscellaneous', ignoreForCommandPalette: true },
 
   excludeCached: { label: 'Exclude Cached Streams', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'cache' },
@@ -238,6 +239,8 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
   dynamicAddonFetching: { label: 'Dynamic Addon Fetching', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'addons', sectionId: 'fetchStrategy', keywords: ['exit condition', 'dynamic fetching', 'fetch strategy'] },
   addonCategoryColors: { label: 'Addon Category Colors', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'addons' },
   catalogModifications: { label: 'Catalog Modifications', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'catalogs' },
+  newCatalogsDisabled: { label: 'New Catalogs Disabled', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'catalogs' },
+  upstreamCatalogOrder: { label: 'Upstream Catalog Order', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'catalogs' },
   mergedCatalogs: { label: 'Merged Catalogs', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'catalogs' },
 
   failover: { label: 'Failover', group: 'misc', type: 'scalar', menu: 'services', subTab: 'builtin' },

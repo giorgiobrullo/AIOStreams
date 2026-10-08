@@ -21,8 +21,9 @@ import {
   viewId,
 } from './ids.js';
 import { imageTagsFor, rememberImages } from './images.js';
-import { listPlaceholderSources, TICKS_PER_MS } from './media.js';
+import { listPlaceholderSources, msToTicks } from './media.js';
 import { getSimpleTextHash } from '../utils/crypto.js';
+import { decodeEntities } from '../utils/entities.js';
 import type {
   ContentDescriptor,
   ItemImages,
@@ -41,6 +42,7 @@ export interface ItemBuildContext {
   uuid: string;
   /** Whether list rows advertise placeholder versions, see `listPlaceholderSources`. */
   listVersions: boolean;
+  markUnaired: boolean;
 }
 
 type AnyMeta = (MetaPreview | Meta) & Record<string, unknown>;
@@ -51,6 +53,11 @@ const DTO_VERSION = 1;
 
 function etagFor(id: string): string {
   return getSimpleTextHash(`${DTO_VERSION}|${id}`).slice(0, 32);
+}
+
+/** Addon text can carry HTML entities, which plain-text clients print as written. */
+function overviewText(text: string | null | undefined): string | undefined {
+  return text == null ? undefined : decodeEntities(text);
 }
 
 export function listResult<T>(
@@ -75,6 +82,34 @@ export function descriptorOf(
 ): JellyfinDescriptor | undefined {
   return (item as { _aio?: { descriptor?: JellyfinDescriptor } })._aio
     ?.descriptor;
+}
+
+/** Set even when the episode is not sent as `Virtual`. */
+export function isUnairedEpisode(item: JellyfinItem): boolean {
+  return !!(item as { _aio?: { unaired?: boolean } })._aio?.unaired;
+}
+
+export function isUnairedVideo(video: SeasonGroup['videos'][number]): boolean {
+  const premiere = toIso(video.released);
+  return (
+    (video as { available?: unknown }).available === false ||
+    (premiere ? new Date(premiere).getTime() > Date.now() : false)
+  );
+}
+
+/**
+ * A video timed by a tracker. It airs at the later of the two times, so neither
+ * a fallback time in the meta nor a stale tracker airs it early, and the time
+ * then decides whether it has aired.
+ */
+export function withTrackerAirTime<V extends SeasonGroup['videos'][number]>(
+  video: V,
+  trackerAt: number
+): V {
+  const own = video.released ? Date.parse(video.released) : NaN;
+  const at = Number.isFinite(own) ? Math.max(own, trackerAt) : trackerAt;
+  const { available: _, ...rest } = video as V & { available?: unknown };
+  return { ...rest, released: new Date(at).toISOString() } as V;
 }
 
 export function defaultUserData(itemId: string): UserItemDataDto {
@@ -111,6 +146,20 @@ export function withPlayedCounts(
   };
 }
 
+/** Jellyfin reads a rating from 6.5 up as a like. */
+const MIN_LIKE_RATING = 6.5;
+
+export function ratingUserData(
+  row: Pick<WatchStateRow, 'dropped' | 'likes' | 'rating'>
+): Pick<UserItemDataDto, 'Likes' | 'Rating'> {
+  const out: Pick<UserItemDataDto, 'Likes' | 'Rating'> = {};
+  if (row.rating != null) out.Rating = row.rating;
+  if (row.dropped) out.Likes = false;
+  else if (row.likes != null) out.Likes = row.likes;
+  else if (row.rating != null) out.Likes = row.rating >= MIN_LIKE_RATING;
+  return out;
+}
+
 export function userDataFromRow(
   itemId: string,
   row: WatchStateRow | undefined,
@@ -119,16 +168,17 @@ export function userDataFromRow(
   if (!row) return defaultUserData(itemId);
   const duration = runtimeMs || row.durationMs;
   const ud: UserItemDataDto = {
-    PlaybackPositionTicks: row.played ? 0 : row.positionMs * TICKS_PER_MS,
+    PlaybackPositionTicks: msToTicks(row.positionMs),
     PlayCount: row.playCount,
     IsFavorite: row.favorite,
     Played: row.played,
     Key: itemId,
     ItemId: itemId,
   };
+  Object.assign(ud, ratingUserData(row));
   if (row.lastPlayedAt)
     ud.LastPlayedDate = new Date(row.lastPlayedAt).toISOString();
-  if (!row.played && duration > 0 && row.positionMs > 0) {
+  if (duration > 0 && row.positionMs > 0) {
     ud.PlayedPercentage = Math.min(100, (row.positionMs / duration) * 100);
   }
   return ud;
@@ -162,7 +212,7 @@ export function providerIdsFor(
 
 function externalUrls(
   providerIds: Record<string, string>,
-  kind: 'movie' | 'series' | 'episode'
+  kind: 'movie' | 'series' | 'season' | 'episode'
 ) {
   const urls: { Name: string; Url: string }[] = [];
   if (providerIds.Imdb)
@@ -170,8 +220,8 @@ function externalUrls(
       Name: 'IMDb',
       Url: `https://www.imdb.com/title/${providerIds.Imdb}`,
     });
-  // TMDB, TVDB and Trakt ids name a movie or a show; an episode's do not.
-  if (kind !== 'episode') {
+  // TMDB, TVDB and Trakt ids name a movie or a show, not its parts.
+  if (kind === 'movie' || kind === 'series') {
     const show = kind === 'series';
     if (providerIds.Tmdb)
       urls.push({
@@ -278,6 +328,10 @@ function baseItem(
   };
 }
 
+export function requiresGenre(c: Catalog): boolean {
+  return !!c.extra?.some((e) => e.name === 'genre' && e.isRequired);
+}
+
 export function buildView(
   ctx: ItemBuildContext,
   catalog: Catalog,
@@ -297,6 +351,7 @@ export function buildView(
     ChildCount: 0,
     Path: `/aiostreams/${catalog.type}/${catalog.id}`,
     PrimaryImageAspectRatio: 1.7777,
+    ...(requiresGenre(catalog) && { aiostreams: { genreRequired: true } }),
     _aio: { descriptor: { k: 'view', t: catalog.type, c: catalog.id } },
   };
 }
@@ -337,14 +392,61 @@ export interface ContentBuildOptions {
   childCount?: number;
   /** Which catalog's genre ids to point genre chips at. */
   genreCatalog?: { type: string; id: string };
+  /** Plays on its own rather than opening a video list. */
+  leaf?: boolean;
+}
+
+export function defaultVideoIdOf(entry: unknown): string | undefined {
+  const hints = (entry as { behaviorHints?: { defaultVideoId?: unknown } })
+    ?.behaviorHints;
+  const id = hints?.defaultVideoId;
+  return typeof id === 'string' && id ? id : undefined;
+}
+
+/**
+ * Videos that are a broadcast schedule rather than episodes. Not the
+ * `hasScheduledVideos` hint, which ordinary shows with dated episodes set too.
+ */
+export function hasProgrammeVideos(
+  meta: Pick<Meta, 'videos'> | null | undefined
+): boolean {
+  const videos = meta?.videos ?? [];
+  return videos.length > 0 && videos.every((v) => !!v.startTime);
+}
+
+/** What a request knows about which types play on their own. */
+export interface LeafEvidence {
+  /** Types a sweep has decided, whichever way it decided them. */
+  decided: ReadonlySet<string>;
+  /** Of those, the ones that play. */
+  leaves: ReadonlySet<string>;
+  /** Stands in until a sweep decides. */
+  guess?: (entry: { id: string; type: string }) => boolean;
+}
+
+/**
+ * Whether an entry plays on its own, the way Stremio decides it: the
+ * `defaultVideoId` hint wins, then a meta with no videos is itself the video.
+ * A list only has previews, so the evidence answers that second question.
+ */
+export function isLeafEntry(
+  entry: { id: string; type: string; collection?: unknown },
+  evidence?: LeafEvidence
+): boolean {
+  if (entry.collection) return false;
+  if (entry.type === 'movie') return true;
+  if (defaultVideoIdOf(entry)) return true;
+  if (evidence?.decided.has(entry.type)) return evidence.leaves.has(entry.type);
+  return evidence?.guess?.(entry) ?? false;
 }
 
 export function contentDescriptor(
   meta: { id: string; type: string },
-  boxset = false
+  boxset = false,
+  leaf = meta.type === 'movie'
 ): ContentDescriptor {
   if (boxset) return { k: 'boxset', t: meta.type, i: meta.id };
-  return meta.type === 'movie'
+  return leaf
     ? { k: 'movie', t: meta.type, i: meta.id }
     : { k: 'series', t: meta.type, i: meta.id };
 }
@@ -352,10 +454,11 @@ export function contentDescriptor(
 /** The `Type` a catalog entry carries as a list item. */
 export function contentItemType(
   type: string,
-  boxset = false
+  boxset = false,
+  leaf = type === 'movie'
 ): 'Movie' | 'Series' | 'BoxSet' {
   if (boxset) return 'BoxSet';
-  return type === 'movie' ? 'Movie' : 'Series';
+  return leaf ? 'Movie' : 'Series';
 }
 
 /**
@@ -370,13 +473,19 @@ export function buildContentItem(
   opts: ContentBuildOptions = {}
 ): JellyfinItem {
   const meta = input as AnyMeta;
+  const leaf = opts.leaf ?? meta.type === 'movie';
   const descriptor = contentDescriptor(
     { id: meta.id, type: meta.type },
-    opts.boxset
+    opts.boxset,
+    leaf
   );
   const id = encodeItemId(descriptor);
   const enrichment = readEnrichment(input);
-  const jellyfinType = contentItemType(meta.type, descriptor.k === 'boxset');
+  const jellyfinType = contentItemType(
+    meta.type,
+    descriptor.k === 'boxset',
+    leaf
+  );
   const folder = jellyfinType !== 'Movie';
   const name = (meta.name as string | undefined) ?? meta.id;
   const genres = genresFrom(input);
@@ -402,7 +511,7 @@ export function buildContentItem(
     MediaType: jellyfinType === 'Movie' ? 'Video' : undefined,
     DateCreated: premiere ?? EPOCH_DATE,
     CanDownload: jellyfinType === 'Movie',
-    Overview: (meta.description as string | undefined) ?? undefined,
+    Overview: overviewText(meta.description as string | undefined),
     Taglines: enrichment.tagline ? [enrichment.tagline] : [],
     ProductionYear: year,
     PremiereDate: premiere,
@@ -411,7 +520,7 @@ export function buildContentItem(
     CriticRating: enrichment.criticRating,
     OfficialRating: enrichment.certification,
     CustomRating: enrichment.customRating,
-    RunTimeTicks: runtimeMs ? runtimeMs * TICKS_PER_MS : undefined,
+    RunTimeTicks: runtimeMs ? msToTicks(runtimeMs) : undefined,
     Genres: genres,
     GenreItems: genres.map((g) => {
       const target =
@@ -473,8 +582,17 @@ export interface SeasonGroup {
 }
 
 /** Groups `videos[]` by season; unnumbered videos become episode 1..n of season 1. */
-export function groupSeasons(meta: ParsedMeta): SeasonGroup[] {
+export function groupSeasons(
+  meta: ParsedMeta,
+  /** Stand in for a meta with no videos, whose id is its own video. */
+  synthesise = false
+): SeasonGroup[] {
   const videos = [...(meta.videos ?? [])];
+  if (!videos.length && synthesise)
+    videos.push({
+      id: defaultVideoIdOf(meta) ?? meta.id,
+      title: meta.name ?? meta.id,
+    });
   const groups = new Map<number, SeasonGroup>();
   const numbered = videos.some((v) => typeof v.episode === 'number');
   videos.forEach((v, idx) => {
@@ -529,7 +647,8 @@ export function buildSeason(
   seriesItem: JellyfinItem,
   group: SeasonGroup,
   playstates?: Map<string, WatchStateRow>,
-  episodeKeyOf?: (video: SeasonGroup['videos'][number]) => string
+  episodeKeyOf?: (video: SeasonGroup['videos'][number]) => string,
+  own: { row?: WatchStateRow; providerIds?: Record<string, string> } = {}
 ): JellyfinItem {
   const id = encodeItemId({
     k: 'season',
@@ -560,7 +679,7 @@ export function buildSeason(
     ...baseItem(ctx, id, details?.name ?? group.name, 'Season', true),
     SortName: String(group.season).padStart(4, '0'),
     IndexNumber: group.season,
-    Overview: details?.overview,
+    Overview: overviewText(details?.overview),
     PremiereDate: details?.premiere,
     SeriesId: seriesItem.Id,
     SeriesName: seriesItem.Name,
@@ -575,7 +694,16 @@ export function buildSeason(
     ParentLogoImageTag: seriesTags?.Logo,
     PrimaryImageAspectRatio: 0.6666,
     ProductionYear: seriesItem.ProductionYear,
-    UserData: withPlayedCounts(defaultUserData(id), played, counted),
+    UserData: {
+      ...withPlayedCounts(defaultUserData(id), played, counted),
+      ...(own.row ? ratingUserData(own.row) : {}),
+    },
+    ...(own.providerIds
+      ? {
+          ProviderIds: own.providerIds,
+          ExternalUrls: externalUrls(own.providerIds, 'season'),
+        }
+      : {}),
     Path: `/aiostreams/${meta.type}/${meta.id}/${group.name}`,
     _aio: {
       descriptor: { k: 'season', t: meta.type, i: meta.id, s: group.season },
@@ -599,7 +727,6 @@ export function buildEpisode(
     i: meta.id,
     s: group.season,
   });
-  const v = video as typeof video & Record<string, unknown>;
   const images: ItemImages = {};
   if (typeof video.thumbnail === 'string') images.Primary = video.thumbnail;
   if (typeof meta.background === 'string') images.Backdrop = meta.background;
@@ -608,9 +735,8 @@ export function buildEpisode(
   const extra = readVideoEnrichment(video);
   const runtimeMs = extra.runtimeMs ?? parseRuntimeMs(meta.runtime);
   const premiere = toIso(video.released);
-  const unaired =
-    v.available === false ||
-    (premiere ? new Date(premiere).getTime() > Date.now() : false);
+  const unaired = isUnairedVideo(video);
+  const missing = unaired && ctx.markUnaired;
   const title = video.title ?? video.name ?? `Episode ${video.episode}`;
   const path = `/aiostreams/${meta.type}/${meta.id}/${group.name}/${title}${PLAYABLE_EXT}`;
   const seriesTags = seriesItem.ImageTags as Record<string, string>;
@@ -619,8 +745,8 @@ export function buildEpisode(
     SortName: `${String(group.season).padStart(4, '0')}-${String(video.episode ?? 0).padStart(4, '0')}`,
     MediaType: 'Video',
     VideoType: 'VideoFile',
-    LocationType: unaired ? 'Virtual' : 'FileSystem',
-    CanDownload: !unaired,
+    LocationType: missing ? 'Virtual' : 'FileSystem',
+    CanDownload: !missing,
     IndexNumber: video.episode,
     ParentIndexNumber: group.season,
     SeriesId: seriesItem.Id,
@@ -628,13 +754,13 @@ export function buildEpisode(
     SeasonId: seasonId,
     SeasonName: seasonDetailsOf(seriesItem, group.season)?.name ?? group.name,
     ParentId: seasonId,
-    Overview: video.overview ?? undefined,
+    Overview: overviewText(video.overview),
     PremiereDate: premiere,
     DateCreated: premiere ?? EPOCH_DATE,
     ProductionYear: premiere
       ? new Date(premiere).getUTCFullYear()
       : seriesItem.ProductionYear,
-    RunTimeTicks: runtimeMs ? runtimeMs * TICKS_PER_MS : undefined,
+    RunTimeTicks: runtimeMs ? msToTicks(runtimeMs) : undefined,
     ...imageTagsFor({ Primary: images.Primary }),
     ParentBackdropItemId: images.Backdrop ? seriesItem.Id : undefined,
     ParentBackdropImageTags: seriesItem.BackdropImageTags,
@@ -646,14 +772,20 @@ export function buildEpisode(
     PrimaryImageAspectRatio: 1.7777,
     Genres: seriesItem.Genres,
     GenreItems: seriesItem.GenreItems,
-    CommunityRating: extra.rating ?? seriesItem.CommunityRating,
+    CommunityRating: extra.rating,
     OfficialRating: seriesItem.OfficialRating,
     People: peopleDtos(extra.people),
     ProviderIds: extra.providerIds,
     ExternalUrls: externalUrls(extra.providerIds, 'episode'),
     UserData: userDataFromRow(id, playstate, runtimeMs),
     Path: path,
-    ...(unaired || !ctx.listVersions
+    ...((extra.filler || extra.recap) && {
+      aiostreams: {
+        ...(extra.filler && { filler: true }),
+        ...(extra.recap && { recap: true }),
+      },
+    }),
+    ...(missing || !ctx.listVersions
       ? {}
       : {
           EnableMediaSourceDisplay: true,
@@ -664,7 +796,7 @@ export function buildEpisode(
             path
           ),
         }),
-    _aio: { descriptor },
+    _aio: { descriptor, ...(unaired ? { unaired: true } : {}) },
   };
 }
 
@@ -700,11 +832,11 @@ export function buildBoxSetChild(
     CanDownload: true,
     IndexNumber: index + 1,
     ParentId: boxset.Id,
-    Overview: video.overview ?? undefined,
+    Overview: overviewText(video.overview),
     PremiereDate: premiere,
     DateCreated: premiere ?? EPOCH_DATE,
     ProductionYear: premiere ? new Date(premiere).getUTCFullYear() : undefined,
-    RunTimeTicks: runtimeMs ? runtimeMs * TICKS_PER_MS : undefined,
+    RunTimeTicks: runtimeMs ? msToTicks(runtimeMs) : undefined,
     ProviderIds: providerIds,
     ExternalUrls: externalUrls(providerIds, 'movie'),
     ...imageTagsFor(images),

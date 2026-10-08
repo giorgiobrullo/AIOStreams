@@ -9,6 +9,7 @@ import {
   getSimpleTextHash,
   encryptString,
   toUrlSafeBase64,
+  fromUrlSafeBase64,
   ParsedMediaInfo,
 } from '../utils/index.js';
 import { promises as fs } from 'fs';
@@ -31,6 +32,7 @@ import { normaliseCountryCode } from '../utils/countries.js';
 import { partial_ratio } from 'fuzzball';
 import { ParsedResult } from '@viren070/parse-torrent-title';
 import { parseTorrentTitleCached } from '../parser/title.js';
+import { unwrapProxyUrl } from '../proxy/token.js';
 
 const logger = createLogger('debrid');
 
@@ -79,10 +81,8 @@ const NZB_URL_SHAPES: ReadonlyArray<{
 const md5 = (value: string): string =>
   createHash('md5').update(value).digest('hex');
 
-/**
- * Compute an MD5 hash identifying an NZB URL.
- */
-export function hashNzbUrl(url: string, clean: boolean = true): string {
+/** The URL reduced to its identifying params, when it has a known shape. */
+function shapedNzbUrl(url: string): string | undefined {
   try {
     const u = new URL(url);
     const pathName = u.pathname.replace(/\/$/, '');
@@ -95,10 +95,37 @@ export function hashNzbUrl(url: string, clean: boolean = true): string {
           u.searchParams.delete(key);
         }
       }
-      return md5(u.toString());
+      return u.toString();
     }
   } catch {}
-  return md5(clean ? cleanNzbUrl(url) : url);
+  return undefined;
+}
+
+/**
+ * The default hashes what our proxy fetches, so it survives proxy changes;
+ * `clean: false` hashes the URL a remote service receives.
+ */
+export function hashNzbUrl(url: string, clean: boolean = true): string {
+  if (clean) return canonicalNzbHash(url).hash;
+  const shaped = shapedNzbUrl(url);
+  return md5(shaped ?? url);
+}
+
+/** {@link hashNzbUrl}'s default, and whether the URL had a known shape. */
+export function canonicalNzbHash(url: string): {
+  hash: string;
+  known: boolean;
+} {
+  const source = unwrapProxyUrl(url);
+  const shaped = shapedNzbUrl(source);
+  return shaped
+    ? { hash: md5(shaped), known: true }
+    : { hash: md5(cleanNzbUrl(source)), known: false };
+}
+
+/** The hash a service that cleans the URL it is sent files the NZB under. */
+export function sentNzbHash(url: string): string {
+  return md5(shapedNzbUrl(url) ?? cleanNzbUrl(url));
 }
 
 /**
@@ -279,6 +306,7 @@ export const isSeasonWrong = (
     season?: number;
     episode?: number;
     absoluteEpisode?: number;
+    tvdbSeason?: number;
   }
 ) => {
   if (
@@ -286,6 +314,12 @@ export const isSeasonWrong = (
     metadata?.season &&
     !parsed.seasons.includes(metadata.season)
   ) {
+    if (
+      metadata.tvdbSeason !== undefined &&
+      parsed.seasons.includes(metadata.tvdbSeason)
+    ) {
+      return false;
+    }
     // Allow S01 files when they use absolute episode numbering.
     // Only applies when the absolute episode differs from the relative episode,
     // which proves the torrent is genuinely using absolute numbering
@@ -314,20 +348,23 @@ export const isEpisodeWrong = (
   if (parsedDate && metadata?.airDates?.length) {
     return !metadata.airDates.includes(parsedDate);
   }
+  if (!parsed.episodes?.length || !metadata?.episode) return false;
+  // in tvdb's season the request's own episode number belongs to another cour
   if (
-    parsed.episodes?.length &&
-    metadata?.episode &&
-    !(
-      parsed.episodes.includes(metadata.episode) ||
-      (metadata.absoluteEpisode &&
-        parsed.episodes.includes(metadata.absoluteEpisode)) ||
-      (metadata.relativeAbsoluteEpisode &&
-        parsed.episodes.includes(metadata.relativeAbsoluteEpisode))
-    )
+    metadata.tvdbSeason !== undefined &&
+    metadata.tvdbEpisode !== undefined &&
+    parsed.seasons?.includes(metadata.tvdbSeason) &&
+    !(metadata.season && parsed.seasons.includes(metadata.season))
   ) {
-    return true;
+    return !parsed.episodes.includes(metadata.tvdbEpisode);
   }
-  return false;
+  return !(
+    parsed.episodes.includes(metadata.episode) ||
+    (metadata.absoluteEpisode &&
+      parsed.episodes.includes(metadata.absoluteEpisode)) ||
+    (metadata.relativeAbsoluteEpisode &&
+      parsed.episodes.includes(metadata.relativeAbsoluteEpisode))
+  );
 };
 /**
  * A country tag identifies which same-name show a release belongs to, even
@@ -398,6 +435,41 @@ export function selectableFileNames(
     if (!isNotVideoFile(file)) names.push(file.name ?? '');
   }
   return names;
+}
+
+function isSampleName(name: string | undefined): boolean {
+  const lower = name?.toLowerCase();
+  return (
+    !!lower &&
+    ['sample', 'trailer', 'preview'].some((keyword) => lower.includes(keyword))
+  );
+}
+
+function isCreditlessName(name: string | undefined): boolean {
+  return !!name && /nc(ed|op)/i.test(name);
+}
+
+/** Anime opening/ending clips (e.g. "Series - OP1.mkv"), creditless or not. */
+function isOpeningEndingName(name: string | undefined): boolean {
+  return !!name && /\b(NC)?(?:OP|ED|Opening|Ending)\d*\b/i.test(name);
+}
+
+/** Below this share of the largest video, a file is a clip, not a feature. */
+const FEATURE_MIN_SHARE = 0.1;
+
+/** A release's video files, without samples, creditless clips or disc extras. */
+export function featureFiles<T extends DebridFile & { streamable?: boolean }>(
+  files: T[]
+): T[] {
+  const videos = files.filter(
+    (file) =>
+      file.streamable !== false &&
+      !isNotVideoFile(file) &&
+      !isSampleName(file.name) &&
+      !isCreditlessName(file.name)
+  );
+  const largest = videos.reduce((max, file) => Math.max(max, file.size), 0);
+  return videos.filter((file) => file.size >= largest * FEATURE_MIN_SHARE);
 }
 
 /** Keeps one file when none are selectable, so nothing is still selected. */
@@ -492,21 +564,13 @@ export async function selectFileInTorrentOrNZB(
       continue;
     }
 
-    if (
-      file.name &&
-      ['sample', 'trailer', 'preview'].some((keyword) =>
-        file.name!.toLowerCase().includes(keyword)
-      )
-    ) {
+    if (isSampleName(file.name)) {
       score -= 500;
       fileReport.scoreBreakdown.sampleTrailerPenalty = -500;
     }
 
     // Penalize anime OP/ED/NCOP/NCED files that get parsed as episode numbers
-    if (
-      file.name &&
-      /\b(NC)?(?:OP|ED|Opening|Ending)\d*\b/i.test(file.name)
-    ) {
+    if (isCreditlessName(file.name) || isOpeningEndingName(file.name)) {
       score -= 500;
       fileReport.scoreBreakdown.openingEndingPenalty = -500;
     }
@@ -572,6 +636,11 @@ export async function selectFileInTorrentOrNZB(
       const parsedHasSeason = parsed.seasons && parsed.seasons.length > 0;
       const isExactMatch = parsedEpisodesCount === 1;
       const isBatchMatch = parsedEpisodesCount > 1;
+      const requestedEpisode =
+        metadata?.tvdbSeason !== undefined &&
+        parsed.seasons?.includes(metadata.tvdbSeason)
+          ? metadata.tvdbEpisode
+          : metadata?.episode;
 
       // For files without season info: prefer absolute episode matches over regular episode
       if (
@@ -627,11 +696,11 @@ export async function selectFileInTorrentOrNZB(
         parsedHasSeason &&
         metadata?.season &&
         metadata?.absoluteEpisode &&
-        metadata?.episode &&
-        metadata.absoluteEpisode !== metadata.episode
+        requestedEpisode &&
+        metadata.absoluteEpisode !== requestedEpisode
       ) {
         // File has season info: prefer regular episode over absolute.
-        const matchesRegular = parsed.episodes?.includes(metadata.episode);
+        const matchesRegular = parsed.episodes?.includes(requestedEpisode);
         const matchesAbsolute = parsed.episodes?.includes(
           metadata.absoluteEpisode
         );
@@ -871,89 +940,128 @@ export function isVideoFile(file: DebridFile): boolean {
   );
 }
 
+// Single-dot entries only: names are matched on the text from their last '.'.
+const NON_VIDEO_EXTENSIONS = new Set([
+  '.txt',
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.bmp',
+  '.svg',
+  '.webp',
+  '.nfo',
+  '.sfv',
+  '.srt',
+  '.ass',
+  '.sub',
+  '.idx',
+  '.cue',
+  '.log',
+  '.doc',
+  '.docx',
+  '.xls',
+  '.xlsx',
+  '.ppt',
+  '.pptx',
+  '.pdf',
+  '.rtf',
+  '.odt',
+  '.ods',
+  '.odp',
+  '.csv',
+  '.tsv',
+  '.exe',
+  '.bat',
+  '.cmd',
+  '.com',
+  '.scr',
+  '.msi',
+  '.lnk',
+  '.pif',
+  '.scf',
+  '.vbs',
+  '.vbe',
+  '.jse',
+  '.wsf',
+  '.wsh',
+  '.hta',
+  '.ps1',
+  '.reg',
+  '.apk',
+  '.dll',
+  '.zip',
+  '.rar',
+  '.7z',
+  '.tar',
+  '.gz',
+  '.bz2',
+  '.xz',
+  '.md',
+  '.json',
+  '.xml',
+  '.ini',
+  '.dat',
+  '.db',
+  '.dbf',
+  '.bak',
+  '.par2',
+  '.clpi',
+  '.jar',
+  '.mpls',
+  '.otf',
+  '.properties',
+  '.bdjo',
+  '.bdmv',
+  '.crt',
+  '.crl',
+  '.sig',
+  '.mp3',
+  '.wav',
+  '.flac',
+  '.aac',
+  '.m4a',
+  '.m4b',
+  '.opus',
+  '.wma',
+  '.mka',
+  '.ac3',
+  '.eac3',
+  '.dts',
+  '.ape',
+  '.aiff',
+  '.epub',
+  '.mobi',
+  '.azw',
+  '.azw3',
+  '.fb2',
+  '.djvu',
+  '.cbz',
+  '.cbr',
+  '.cb7',
+]);
+const NON_VIDEO_PATTERNS = [/\.7z\.\d+$/];
+
 export function isNotVideoFile(file: DebridFile): boolean {
-  const nonVideoExtensions = [
-    '.txt',
-    '.jpg',
-    '.jpeg',
-    '.png',
-    '.gif',
-    '.bmp',
-    '.svg',
-    '.webp',
-    '.nfo',
-    '.sfv',
-    '.srt',
-    '.ass',
-    '.sub',
-    '.idx',
-    '.cue',
-    '.log',
-    '.doc',
-    '.docx',
-    '.xls',
-    '.xlsx',
-    '.ppt',
-    '.pptx',
-    '.pdf',
-    '.rtf',
-    '.odt',
-    '.ods',
-    '.odp',
-    '.csv',
-    '.tsv',
-    '.exe',
-    '.bat',
-    '.cmd',
-    '.com',
-    '.scr',
-    '.msi',
-    '.lnk',
-    '.pif',
-    '.scf',
-    '.vbs',
-    '.vbe',
-    '.jse',
-    '.wsf',
-    '.wsh',
-    '.hta',
-    '.ps1',
-    '.reg',
-    '.apk',
-    '.dll',
-    '.zip',
-    '.rar',
-    '.7z',
-    '.tar',
-    '.gz',
-    '.bz2',
-    '.xz',
-    '.md',
-    '.json',
-    '.xml',
-    '.ini',
-    '.dat',
-    '.db',
-    '.dbf',
-    '.bak',
-    '.par2',
-    '.clpi',
-    '.jar',
-    '.mpls',
-    '.otf',
-    '.properties',
-    '.bdjo',
-    '.bdmv',
-    '.crt',
-    '.crl',
-    '.sig',
-  ];
-  const patterns = [/\.7z\.\d+$/];
+  const name = file.name;
   return (
     (file.mimeType && !file.mimeType.includes('video')) ||
-    nonVideoExtensions.some((ext) => file.name?.endsWith(ext) ?? false) ||
-    patterns.some((pattern) => pattern.test(file.name || ''))
+    (!!name && NON_VIDEO_EXTENSIONS.has(name.slice(name.lastIndexOf('.')))) ||
+    NON_VIDEO_PATTERNS.some((pattern) => pattern.test(name || ''))
   );
+}
+
+const MAX_SELECTABLE_FILES = 10_000;
+
+export function hasTooManySelectableFiles(files?: DebridFile[]): boolean {
+  if (!files || files.length <= MAX_SELECTABLE_FILES) return false;
+  let selectable = 0;
+  for (const file of files) {
+    if (!isNotVideoFile(file) && ++selectable > MAX_SELECTABLE_FILES) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export const metadataStore = () => {
@@ -1023,6 +1131,66 @@ export function generatePlaybackUrl(
 
 /** Marker that prefixes the path of a playback URL we generated. */
 export const PLAYBACK_PATH_PREFIX = '/api/v1/debrid/playback/';
+
+/** The raw, URL-borne pieces needed to resolve one owned playback item. */
+export interface PlaybackTarget {
+  encryptedStoreAuth: string;
+  /** base64url-encoded FileInfo, or a fileInfo-store hash key. */
+  fileInfoRaw: string;
+  metadataId: string;
+  filename: string;
+}
+
+/** Split an owned playback URL back into its resolvable pieces. */
+export function parsePlaybackUrl(url: string): PlaybackTarget | undefined {
+  const idx = url.indexOf(PLAYBACK_PATH_PREFIX);
+  if (idx === -1) return undefined;
+  const rest = url.slice(idx + PLAYBACK_PATH_PREFIX.length);
+  // {storeAuth}/{fallbackKey}/{fileInfo}/{metadataId}/{filename}
+  const segments = rest.split('/');
+  if (segments.length < 5) return undefined;
+  return {
+    encryptedStoreAuth: segments[0],
+    // segments[1] is the fallback key, not needed to re-resolve a target.
+    fileInfoRaw: segments[2],
+    metadataId: segments[3],
+    filename: decodeURIComponent(segments[4].split(/[?#]/)[0]),
+  };
+}
+
+/** Our playback and proxy URLs carry the client path they were listed for. */
+export function withPlayPath(
+  url: string,
+  path: 'stremio' | 'jellyfin'
+): string {
+  if (
+    !url.includes(PLAYBACK_PATH_PREFIX) &&
+    !url.includes(constants.BUILTIN_PROXY_PATH_PREFIX)
+  ) {
+    return url;
+  }
+  try {
+    const u = new URL(url);
+    u.searchParams.set(constants.PLAY_PATH_MARKER, path);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+/** The NZB hash in an owned usenet playback URL, when its file info is inline. */
+export function playbackNzbHash(url: string): string | undefined {
+  const target = parsePlaybackUrl(url);
+  if (!target) return undefined;
+  try {
+    const info = JSON.parse(fromUrlSafeBase64(target.fileInfoRaw));
+    return info?.type === 'usenet' && typeof info.hash === 'string'
+      ? info.hash
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Rewrite the fallback-key segment of a playback URL produced by

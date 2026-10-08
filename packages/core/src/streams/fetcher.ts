@@ -20,6 +20,11 @@ import {
   type AnalyticsErrorKind,
   type AnalyticsStatus,
 } from '../analytics/index.js';
+import {
+  resolveRemuxDbMediaInfo,
+  startRemuxDbLookup,
+} from '../remuxdb/wrap.js';
+import { resolveStoredMediaInfo } from '../media-info/lookup.js';
 
 /**
  * Per-addon outcome tracked through {@link StreamFetcher.fetch} and surfaced
@@ -76,10 +81,13 @@ class StreamFetcher {
     }[];
     /** Per-addon outcome map used by per-user analytics. */
     dispositions: AddonDispositionMap;
+    /** Summed across addon groups. */
+    mediaInfoMs: number;
   }> {
     const { type, id, queryType } = context;
 
     context.startAllFetches();
+    startRemuxDbLookup(context, this.userData);
 
     const allErrors: {
       title: string;
@@ -90,6 +98,7 @@ class StreamFetcher {
       description: string;
     }[] = [];
     let allStreams: ParsedStream[] = [];
+    let mediaInfoMs = 0;
     const start = Date.now();
 
     // Seed every input addon with `not_started` so anything filtered out (or
@@ -246,6 +255,11 @@ class StreamFetcher {
       // Run SeaDex precompute BEFORE filter so seadex() works in Included SEL
       // Now uses context's cached SeaDex data when available
       await this.precompute.precomputeSeaDexOnly(groupStreams, context);
+
+      const mediaInfoStart = Date.now();
+      await resolveStoredMediaInfo(groupStreams, context);
+      await resolveRemuxDbMediaInfo(groupStreams, context, this.userData);
+      mediaInfoMs += Date.now() - mediaInfoStart;
 
       // Blocklist runs before dedup so a flagged candidate never survives
       // as a failover variant harvested from discarded duplicates.
@@ -479,11 +493,17 @@ class StreamFetcher {
             group.addons.includes(addon.preset.id)
           )
       );
-      if (unassignedAddons.length > 0 && this.userData.groups.groupings[0]) {
-        this.userData.groups.groupings[0].addons.push(
-          ...unassignedAddons.map((addon) => addon.preset.id)
-        );
-      }
+      const groupings = this.userData.groups.groupings.map((group, i) =>
+        i === 0 && unassignedAddons.length > 0
+          ? {
+              ...group,
+              addons: [
+                ...group.addons,
+                ...unassignedAddons.map((addon) => addon.preset.id),
+              ],
+            }
+          : group
+      );
 
       const behaviour = this.userData.groups.behaviour || 'parallel';
       const onConditionFailure =
@@ -494,7 +514,7 @@ class StreamFetcher {
 
       if (behaviour === 'parallel') {
         // Fetch all groups in parallel but still evaluate conditions
-        const groupPromises = this.userData.groups.groupings.map((group, i) => {
+        const groupPromises = groupings.map((group, i) => {
           const groupAddons = addons.filter(
             (addon) => addon.preset.id && group.addons.includes(addon.preset.id)
           );
@@ -533,7 +553,7 @@ class StreamFetcher {
 
         let stopWaiting = false;
 
-        for (let i = 0; i < this.userData.groups.groupings.length; i++) {
+        for (let i = 0; i < groupings.length; i++) {
           const groupPromise = groupPromises[i];
 
           if (i === 0) {
@@ -541,7 +561,7 @@ class StreamFetcher {
             continue;
           }
           // For groups other than the first, check their condition
-          const group = this.userData.groups.groupings[i];
+          const group = groupings[i];
           if (!group.condition || !group.addons.length) continue;
 
           const evaluator = new GroupConditionEvaluator(
@@ -592,8 +612,8 @@ class StreamFetcher {
         }
       } else {
         // Sequential behavior - fetch and evaluate one group at a time
-        for (let i = 0; i < this.userData.groups.groupings.length; i++) {
-          const group = this.userData.groups.groupings[i];
+        for (let i = 0; i < groupings.length; i++) {
+          const group = groupings[i];
 
           // For groups after the first, check condition before fetching
           if (i > 0 && group.condition) {
@@ -681,6 +701,7 @@ class StreamFetcher {
       errors: allErrors,
       statistics: allStatisticStreams,
       dispositions,
+      mediaInfoMs,
     };
   }
 }

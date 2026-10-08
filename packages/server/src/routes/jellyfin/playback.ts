@@ -4,6 +4,7 @@ import {
   createLogger,
   lookupFor,
   couldHaveSegments,
+  isMemoFresh,
   playableSources,
   resolveByItem,
   segmentsFor,
@@ -15,6 +16,7 @@ import {
   type PlaybackMemo,
 } from '@aiostreams/core';
 import {
+  bodyField,
   bodyOf,
   contextFromCredentials,
   jfOptional,
@@ -25,10 +27,15 @@ import {
 import {
   decodeForRequest,
   mediaSourcesFrom,
+  trackPreferences,
   nothingToPlayPath,
   placeholderSources,
 } from './items.js';
-import { enrichSourceSubtitles, resolvePlayback } from './resolve.js';
+import {
+  applyProbedMediaInfo,
+  enrichSourceSubtitles,
+  resolvePlayback,
+} from './resolve.js';
 
 const logger = createLogger('jellyfin');
 const router: Router = Router({ mergeParams: true });
@@ -50,19 +57,28 @@ interface Located {
 async function locate(
   req: Request,
   rawItemId: string,
-  /* Routes that carry the source id in the path rather than the query. */
-  hintMsid?: string
+  opts: {
+    /* Routes that carry the source id in the path rather than the query. */
+    hintMsid?: string;
+    /* The session's list, which the request itself may no longer select. */
+    bySession?: boolean;
+  } = {}
 ): Promise<Located | null> {
   const psid = qs(req, 'PlaySessionId');
+  const bodyMsid = bodyField(req, 'MediaSourceId');
   const rawMsid =
     qs(req, 'MediaSourceId') ??
-    (bodyOf(req).MediaSourceId as string | undefined) ??
-    hintMsid;
+    (typeof bodyMsid === 'string' && bodyMsid ? bodyMsid : undefined) ??
+    opts.hintMsid;
   let ctx = req.jf;
+  const session =
+    psid && (!ctx || opts.bySession)
+      ? await resolveByPlaySession(psid)
+      : undefined;
 
   if (!ctx) {
     const pointer =
-      (psid ? await resolveByPlaySession(psid) : undefined) ??
+      session ??
       (rawMsid &&
       rawMsid.replace(/-/g, '').toLowerCase() !==
         rawItemId.replace(/-/g, '').toLowerCase()
@@ -74,7 +90,8 @@ async function locate(
       (await contextFromCredentials(
         req,
         pointer.uuid,
-        pointer.encryptedPassword
+        pointer.encryptedPassword,
+        pointer.persona
       )) ?? undefined;
     if (!ctx) return null;
   }
@@ -102,7 +119,12 @@ async function locate(
     const norm = rawMsid.replace(/-/g, '').toLowerCase();
     if (norm !== itemId) requestedMsid = norm;
   }
-  const memo = await resolveByItem(ctx.uuid, ctx.scope(), itemId).then(
+  // No persona check: personas on the same variants share a memo and its session.
+  const scope =
+    opts.bySession && session?.scope && session.uuid === ctx.uuid
+      ? session.scope
+      : ctx.scope();
+  const memo = await resolveByItem(ctx.uuid, scope, itemId).then(
     (m) => m ?? null
   );
   return {
@@ -117,24 +139,56 @@ async function locate(
 /* A client retrying a failed play must not rerun the pipeline against an addon that is failing. */
 const EMPTY_MEMO_REUSE_MS = 30_000;
 
-async function ensureMemo(loc: Located): Promise<PlaybackMemo | null> {
-  if (loc.memo && playableSources(loc.memo.sources).length) return loc.memo;
-  if (loc.descriptor.k !== 'movie' && loc.descriptor.k !== 'episode')
-    return null;
-  if (loc.memo && Date.now() - loc.memo.createdAt < EMPTY_MEMO_REUSE_MS)
-    return loc.memo;
-  return resolvePlayback(loc.ctx, loc.descriptor, { force: true });
+async function ensureMemo(
+  loc: Located,
+  /* `current` reruns a memo past its reuse window, `force` any memo. */
+  opts: { current?: boolean; force?: boolean } = {}
+): Promise<PlaybackMemo | null> {
+  const { memo, descriptor } = loc;
+  const resolvable = descriptor.k === 'movie' || descriptor.k === 'episode';
+  const rerun =
+    resolvable && (opts.force || (opts.current && memo && !isMemoFresh(memo)));
+  if (!rerun) {
+    if (memo && playableSources(memo.sources).length) return memo;
+    if (!resolvable) return null;
+    if (memo && Date.now() - memo.createdAt < EMPTY_MEMO_REUSE_MS) return memo;
+  }
+  return resolvePlayback(loc.ctx, descriptor, { force: true });
+}
+
+/**
+ * A client that lists versions here rather than from the item page can ask
+ * for a list no older than the reuse window (`Fresh`) or a new run that
+ * retries failed addons (`Refresh`). A named version keeps its list.
+ */
+function listingOptions(req: Request, loc: Located) {
+  if (!req.jf || loc.requestedMsid) return {};
+  const body = bodyOf(req);
+  return { current: body.Fresh === true, force: body.Refresh === true };
+}
+
+// These clients ask for PlaybackInfo only from their player, without IsPlayback.
+const PLAY_ONLY_CLIENTS =
+  /^(jellyfin for android|swiftfin|wholphin|fladder|pelagica|blink)\b/i;
+// ARVIO's Android app sends IsPlayback while listing versions, then plays the
+// listed URL without asking again.
+const LISTING_CLIENTS = /^arvio$/i;
+
+function isPlaying(req: Request, loc: Located): boolean {
+  if (loc.requestedMsid) return true;
+  if (LISTING_CLIENTS.test(loc.ctx.client.name)) return false;
+  const flag = qs(req, 'IsPlayback') ?? bodyField(req, 'IsPlayback');
+  if (flag !== undefined) return flag === 'true' || flag === true;
+  return PLAY_ONLY_CLIENTS.test(loc.ctx.client.name);
 }
 
 function pickSource(
   memo: PlaybackMemo,
   requestedMsid?: string
 ): MediaSourceRecord | undefined {
-  if (requestedMsid)
-    return (
-      memo.sources.find((s) => s.msid === requestedMsid) ?? memo.sources[0]
-    );
-  return memo.sources[0];
+  return requestedMsid
+    ? memo.sources.find((s) => s.msid === requestedMsid)
+    : memo.sources[0];
 }
 
 /**
@@ -162,7 +216,7 @@ async function playbackInfo(req: Request, res: Response) {
     return;
   }
   const profile = bodyOf(req).DeviceProfile as DeviceProfile | undefined;
-  const memo = await ensureMemo(loc);
+  const memo = await ensureMemo(loc, listingOptions(req, loc));
   if (!memo || !memo.sources.length) {
     res.json({
       MediaSources: placeholderSources(req, loc.ctx, loc.itemId, true),
@@ -172,9 +226,17 @@ async function playbackInfo(req: Request, res: Response) {
     return;
   }
   await enrichSourceSubtitles(loc.ctx, memo, loc.requestedMsid);
+  await applyProbedMediaInfo(loc.ctx, memo, loc.requestedMsid, {
+    playing: isPlaying(req, loc),
+  });
+  // A version no longer listed must not lend its id to another.
+  const requested = memo.sources.some((s) => s.msid === loc.requestedMsid)
+    ? loc.requestedMsid
+    : undefined;
   const sources = mediaSourcesFrom(req, loc.ctx, memo, {
-    firstId: loc.requestedMsid ?? loc.itemId,
-    requestedMsid: loc.requestedMsid,
+    firstId: requested ?? loc.itemId,
+    tracks: await trackPreferences(loc.ctx),
+    requestedMsid: requested,
     profile,
     hasSegments: hasSegments(loc.ctx, memo),
   });
@@ -186,7 +248,7 @@ router.post('/Items/:itemId/PlaybackInfo', jfOptional(playbackInfo));
 router.get('/Items/:itemId/MediaSources', jfOptional(playbackInfo));
 
 async function streamHandler(req: Request, res: Response) {
-  const loc = await locate(req, param(req, 'itemId'));
+  const loc = await locate(req, param(req, 'itemId'), { bySession: true });
   if (!loc) {
     res.status(404).json({ Message: 'Item not found' });
     return;

@@ -44,6 +44,7 @@ import { blocklistEvalOptions } from '../../release-blocklist/filter.js';
 import { ReleaseBlocklistRepository } from '../../db/repositories/release-blocklist.js';
 import {
   UsenetLibraryRepository,
+  usenetLibraryBus,
   type UsenetLibraryEntry,
   type UsenetLibraryFile,
   type UsenetLibrarySource,
@@ -1005,6 +1006,10 @@ async function importNzbInBackground(args: {
           jobSignal
         ),
     });
+    usenetLibraryBus.emit('imported', {
+      nzbHash: args.nzbHash,
+      origin: args.origin,
+    });
   } catch (err) {
     logger.warn(
       { err, nzbHash: args.nzbHash },
@@ -1450,6 +1455,30 @@ export async function requeueUsenetNzb(nzbHash: string): Promise<void> {
     });
   }
   await requeueEntry(entry, entry.nzbUrl, providers, options);
+}
+
+/**
+ * Alias entries recorded under our NZB proxy's URL, which changes with its
+ * credential, by the URL behind it.
+ */
+export async function backfillProxiedNzbAliases(): Promise<{
+  proxied: number;
+  added: number;
+}> {
+  const rows = await UsenetLibraryRepository.proxiedSourceUrls();
+  if (rows.length === 0) return { proxied: 0, added: 0 };
+  const added = await UsenetLibraryRepository.addMissingAliases(
+    rows.map((r) => ({
+      aliasHash: hashNzbUrl(r.nzbUrl),
+      nzbHash: r.nzbHash,
+      nzbUrl: r.nzbUrl,
+    }))
+  );
+  logger.debug(
+    { proxied: rows.length, added },
+    'aliased proxied nzbs by their source'
+  );
+  return { proxied: rows.length, added };
 }
 
 /**

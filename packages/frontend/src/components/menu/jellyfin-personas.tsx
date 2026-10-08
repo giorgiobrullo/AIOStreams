@@ -4,17 +4,17 @@ import { useUserData } from '@/context/userData';
 import { useStatus } from '@/context/status';
 import { watchStateTrackersQuery } from '@/lib/queries';
 import type { WatchStateTrackerOption } from '@/lib/api';
-import { cn } from '@/components/ui/core/styling';
+import { cn } from '@aiostreams/ui/core/styling';
 import { pill, VariantPills } from '../shared/variant-pills';
 import {
   ConfirmationDialog,
   useConfirmationDialog,
-} from '../shared/confirmation-dialog';
-import { Button, IconButton } from '@/components/ui/button';
-import { TextInput } from '@/components/ui/text-input';
-import { Select } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
-import { Modal } from '@/components/ui/modal';
+} from '@aiostreams/ui/shared/confirmation-dialog';
+import { Button, IconButton } from '@aiostreams/ui/button';
+import { TextInput } from '@aiostreams/ui/text-input';
+import { Select } from '@aiostreams/ui/select';
+import { Switch } from '@aiostreams/ui/switch';
+import { Modal } from '@aiostreams/ui/modal';
 import { toast } from 'sonner';
 import { FiEdit2, FiPlus, FiTrash2 } from 'react-icons/fi';
 import type { UserData } from '@aiostreams/core';
@@ -30,17 +30,23 @@ const UUID_SHAPE =
 const DEFAULT_MAX_PERSONAS = 20;
 const NO_TRACKER_OPTIONS: WatchStateTrackerOption[] = [];
 
+/** Tracker addons repeat this rule to match a name to its id, so it must not change. */
+function slugOf(name: string): string {
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 28) || 'user'
+  );
+}
+
 /**
  * The id keys the user's history, so it is minted once from the name and never
  * edited: the same name gets the same history back.
  */
 function idFor(name: string, existing: Persona[]): string {
-  const base =
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 28) || 'user';
+  const base = slugOf(name);
   let id = base;
   for (let i = 2; existing.some((p) => p.id === id); i++) id = `${base}-${i}`;
   return id;
@@ -184,6 +190,13 @@ function TrackersField({
           >
             Automatic
           </button>
+          <button
+            type="button"
+            onClick={() => onChange([])}
+            className={pill(!!value && !value.length)}
+          >
+            None
+          </button>
           {choices.map((choice) => {
             const selected = !!value?.includes(choice.presetId);
             return (
@@ -219,8 +232,9 @@ function TrackersField({
         </p>
       )}
       <p className="text-xs text-[--muted]">
-        A tracker syncs with one history at a time, and moving it to another
-        user brings along what it already recorded.{' '}
+        A tracker syncs with one history at a time, unless it keeps each user
+        apart, and moving it to another user brings along what it already
+        recorded.{' '}
         {!loading && !choices.length
           ? 'No tracker addons in your saved configuration yet; add one and save.'
           : 'Added a tracker addon? Save, and it shows here.'}
@@ -230,6 +244,96 @@ function TrackersField({
 }
 
 /** Jellyfin clients show these as users of the server. */
+const PIN_SHAPE = /^\d{4,12}$/;
+/** Must match the server's floor for signing in with a PIN alone. */
+const PIN_ONLY_LENGTH = 6;
+const PIN_ONLY_SHAPE = new RegExp(`^\\d{${PIN_ONLY_LENGTH},12}$`);
+
+/** A saved PIN comes back as its hash, never as the digits. */
+function isSavedPin(lock: string | undefined): lock is string {
+  return !!lock && lock.startsWith('$2');
+}
+
+function PinField({
+  value,
+  onChange,
+  help = 'Signing in as this user needs it, typed after the password as password/PIN. Anyone who can edit this configuration can still change or remove it.',
+}: {
+  value: string | undefined;
+  onChange(value: string | undefined): void;
+  help?: string;
+}) {
+  const [saved] = useState(isSavedPin(value) ? value : undefined);
+  const [mode, setMode] = useState<'saved' | 'edit' | 'removed'>(
+    saved ? 'saved' : 'edit'
+  );
+
+  if (mode !== 'edit') {
+    return (
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">PIN</p>
+          <p className="text-xs text-[--muted]">
+            {mode === 'saved' ? 'Set. ' + help : 'Removed when you save.'}
+          </p>
+        </div>
+        <div className="flex flex-none gap-2">
+          {mode === 'saved' ? (
+            <>
+              <Button
+                size="sm"
+                intent="gray-outline"
+                rounded
+                onClick={() => setMode('edit')}
+              >
+                Change
+              </Button>
+              <Button
+                size="sm"
+                intent="alert-subtle"
+                rounded
+                onClick={() => {
+                  setMode('removed');
+                  onChange(undefined);
+                }}
+              >
+                Remove
+              </Button>
+            </>
+          ) : (
+            <Button
+              size="sm"
+              intent="gray-outline"
+              rounded
+              onClick={() => {
+                setMode('saved');
+                onChange(saved);
+              }}
+            >
+              Undo
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <TextInput
+      label="PIN"
+      type="password"
+      inputMode="numeric"
+      autoComplete="new-password"
+      placeholder={saved ? 'Unchanged' : 'None'}
+      help={`Optional, 4 to 12 digits. ${help}`}
+      value={isSavedPin(value) ? '' : (value ?? '')}
+      onValueChange={(typed) => {
+        const digits = typed.replace(/\D/g, '').slice(0, 12);
+        onChange(digits || saved);
+      }}
+    />
+  );
+}
+
 export function JellyfinPersonas() {
   const { userData, setUserData, uuid, password } = useUserData();
   const credentials = React.useMemo(
@@ -245,6 +349,7 @@ export function JellyfinPersonas() {
   const maxPersonas =
     status?.settings?.jellyfin?.maxPersonas ?? DEFAULT_MAX_PERSONAS;
   const maxTrackers = status?.settings?.jellyfin?.maxTrackers;
+  const pinSignIn = status?.settings?.jellyfin?.pinSignIn ?? false;
   const personas = userData.jellyfin?.personas ?? [];
   const primary = userData.jellyfin?.primary;
   const primaryName = primary?.name || userData.addonName || 'Primary user';
@@ -261,6 +366,10 @@ export function JellyfinPersonas() {
   const [primaryDraft, setPrimaryDraft] = useState<Primary | null>(null);
   const [pendingRemoval, setPendingRemoval] = useState<number | null>(null);
 
+  const shared = new Set(
+    trackerOptions.filter((o) => o.viewers).map((o) => o.presetId)
+  );
+
   /** Other users' trackers; `automatic` adds an automatic primary user's. */
   const takenFor = (index: number | null, automatic: boolean) => {
     const taken = new Map<string, string>();
@@ -270,12 +379,12 @@ export function JellyfinPersonas() {
         : automatic
           ? trackerOptions.filter((o) => o.user === '').map((o) => o.presetId)
           : [];
-      for (const id of held) taken.set(id, primaryName);
+      for (const id of held) if (!shared.has(id)) taken.set(id, primaryName);
     }
     personas.forEach((persona, i) => {
       if (i === index || persona.history === 'shared') return;
       for (const id of persona.trackers ?? [])
-        if (!taken.has(id)) taken.set(id, persona.name);
+        if (!shared.has(id) && !taken.has(id)) taken.set(id, persona.name);
     });
     return taken;
   };
@@ -335,6 +444,20 @@ export function JellyfinPersonas() {
       toast.error('A linked variant no longer exists or is disabled.');
       return;
     }
+    if (draft.lock && !isSavedPin(draft.lock) && !PIN_SHAPE.test(draft.lock)) {
+      toast.error('A PIN is 4 to 12 digits.');
+      return;
+    }
+    if (
+      pinSignIn &&
+      draft.lock &&
+      !isSavedPin(draft.lock) &&
+      !PIN_ONLY_SHAPE.test(draft.lock)
+    ) {
+      toast.warning(
+        `A PIN under ${PIN_ONLY_LENGTH} digits cannot sign in without your password.`
+      );
+    }
     const trackers = draft.history === 'shared' ? undefined : draft.trackers;
     const taken = takenFor(editing, false);
     const clash = trackers?.find((id) => taken.has(id));
@@ -353,6 +476,7 @@ export function JellyfinPersonas() {
       variants: draft.variants?.length ? draft.variants : undefined,
       trackers,
       hidden: draft.hidden || undefined,
+      lock: draft.lock || undefined,
     };
     if (editing !== null && editing < personas.length) next[editing] = value;
     else next.push(value);
@@ -362,6 +486,14 @@ export function JellyfinPersonas() {
 
   const commitPrimary = () => {
     if (!primaryDraft) return;
+    if (
+      primaryDraft.lock &&
+      !isSavedPin(primaryDraft.lock) &&
+      !PIN_SHAPE.test(primaryDraft.lock)
+    ) {
+      toast.error('A PIN is 4 to 12 digits.');
+      return;
+    }
     const name = primaryDraft.name?.trim() || '';
     if (name && personas.some((p) => sameName(p.name, name))) {
       toast.error('Another user already has this name.');
@@ -377,7 +509,10 @@ export function JellyfinPersonas() {
     }
     if (
       !primaryDraft.trackers &&
-      personas.some((p) => p.history !== 'shared' && p.trackers?.length)
+      personas.some(
+        (p) =>
+          p.history !== 'shared' && p.trackers?.some((id) => !shared.has(id))
+      )
     ) {
       toast.warning(
         'Trackers picked for other users stay unused while the primary user syncs with every tracker.'
@@ -390,6 +525,7 @@ export function JellyfinPersonas() {
         ? primaryDraft.variants
         : undefined,
       trackers: primaryDraft.trackers,
+      lock: primaryDraft.lock || undefined,
     };
     patch({ primary: Object.values(value).some(Boolean) ? value : undefined });
     setPrimaryDraft(null);
@@ -427,17 +563,28 @@ export function JellyfinPersonas() {
     <div className="space-y-3">
       <p className="text-xs text-gray-400">
         Shown as users of the server. Everyone signs in with this
-        configuration&apos;s password. The primary user is this configuration
-        itself; each other user can keep a history and trackers of its own.
+        configuration&apos;s password, and a user with a PIN also needs that,
+        typed after the password as password/PIN. The primary user is this
+        configuration itself; each other user can keep a history and trackers of
+        its own.
+        {pinSignIn &&
+          ` On the sign-in picker address, a user with a PIN of ${PIN_ONLY_LENGTH} or more digits can sign in with that PIN alone, so each person needs only their own PIN.`}
       </p>
 
       <ul className="divide-y divide-gray-800 rounded-md border border-gray-800">
         <UserRow
           name={primaryName}
           avatar={primary?.avatar}
-          summary={`Primary user · ${variantsLabel(primary?.variants)} · ${
-            primary?.trackers ? trackersLabel(primary.trackers) : 'all trackers'
-          }`}
+          summary={[
+            'Primary user',
+            variantsLabel(primary?.variants),
+            primary?.trackers
+              ? trackersLabel(primary.trackers)
+              : 'all trackers',
+            primary?.lock ? 'PIN' : null,
+          ]
+            .filter(Boolean)
+            .join(' · ')}
           onEdit={() => setPrimaryDraft({ ...primary })}
         />
         {personas.map((persona, index) => (
@@ -453,7 +600,12 @@ export function JellyfinPersonas() {
               persona.history !== 'shared' && persona.trackers
                 ? trackersLabel(persona.trackers)
                 : null,
+              persona.history !== 'shared' &&
+              persona.id !== slugOf(persona.name)
+                ? `tracker id ${persona.id}`
+                : null,
               persona.hidden ? 'hidden from the picker' : null,
+              persona.lock ? 'PIN' : null,
             ]
               .filter(Boolean)
               .join(' · ')}
@@ -502,7 +654,7 @@ export function JellyfinPersonas() {
           <div className="space-y-4">
             <TextInput
               label="Name"
-              help="Shown by clients. Defaults to your addon name."
+              help="Shown in apps. Defaults to your addon name."
               placeholder={userData.addonName || 'Primary user'}
               value={primaryDraft.name ?? ''}
               onValueChange={(value) =>
@@ -540,6 +692,11 @@ export function JellyfinPersonas() {
                 setPrimaryDraft({ ...primaryDraft, avatar: value || undefined })
               }
             />
+            <PinField
+              value={primaryDraft.lock}
+              onChange={(lock) => setPrimaryDraft({ ...primaryDraft, lock })}
+              help="Needed every time someone signs in as the primary user, even with your configuration password (typed after it as password/PIN), and asked whenever someone switches to it in the web app, so other users can't reach your history. Anyone who can edit this configuration can still change or remove it."
+            />
             <div className="flex items-center justify-end gap-2">
               <Button
                 size="sm"
@@ -557,11 +714,11 @@ export function JellyfinPersonas() {
       )}
 
       {draft && (
-        <Modal open onOpenChange={close} title="Jellyfin user">
+        <Modal open onOpenChange={close} title="User">
           <div className="space-y-4">
             <TextInput
               label="Name"
-              help="Shown by clients, and typed to sign in."
+              help="Shown in apps, and typed to sign in."
               value={draft.name}
               onValueChange={(value) => setDraft({ ...draft, name: value })}
             />
@@ -600,7 +757,7 @@ export function JellyfinPersonas() {
                 choices={choicesFor(draft.id, takenFor(editing, true))}
                 value={draft.trackers}
                 onChange={(trackers) => setDraft({ ...draft, trackers })}
-                automatic="Syncs only with a tracker addon its variants add."
+                automatic="Syncs with a tracker addon its variants add, and with any that keeps each user apart."
                 note={
                   primary?.trackers
                     ? undefined
@@ -628,6 +785,16 @@ export function JellyfinPersonas() {
               value={draft.hidden ?? false}
               onValueChange={(value) =>
                 setDraft({ ...draft, hidden: value || undefined })
+              }
+            />
+
+            <PinField
+              value={draft.lock}
+              onChange={(lock) => setDraft({ ...draft, lock })}
+              help={
+                pinSignIn
+                  ? `Signing in as this user needs it, typed after the password as password/PIN. On the sign-in picker address, a PIN of ${PIN_ONLY_LENGTH} or more digits also works on its own, without your configuration password. Anyone who can edit this configuration can still change or remove it.`
+                  : undefined
               }
             />
 

@@ -11,9 +11,9 @@ export const jellyfinSchema = {
   enabled: {
     schema: z.boolean(),
     default: true,
-    label: 'Enable Jellyfin API',
+    label: 'Enable media server',
     description:
-      'Presents every configuration as a Jellyfin server at /jellyfin. Clients sign in with the configuration UUID or alias and its password, approve a Quick Connect code from the configuration page, or use the pre-authenticated /jellyfin/<uuid>/<encryptedPassword> address.',
+      'Presents every configuration as a Jellyfin-compatible server at /jellyfin, for the AIOStreams web and desktop app and for Jellyfin apps. Apps sign in with the configuration UUID or alias and its password, or approve a Quick Connect code from the configuration page.',
     env: 'JELLYFIN_ENABLED',
     requiresRestart: false,
     secret: false,
@@ -86,25 +86,25 @@ export const jellyfinSchema = {
   },
   upcomingDays: {
     schema: z.number().int().min(1).max(365),
-    default: 14,
+    default: 90,
     label: 'Upcoming window (days)',
     description:
-      'How far ahead the Upcoming row looks for episodes of shows you are part way through. A library only holds what exists, so Jellyfin itself needs no window, but metadata addons announce episodes months out and the row becomes a schedule rather than a shelf.',
+      'How far ahead the Upcoming row looks for the next episode of each show you are caught up on.',
     env: 'JELLYFIN_UPCOMING_DAYS',
     requiresRestart: false,
     secret: false,
     ui: { min: 1, max: 365 },
   },
   maxVersions: {
-    schema: z.number().int().min(1).max(50),
-    default: 10,
+    schema: z.number().int().min(1).max(500),
+    default: 25,
     label: 'Max versions per item',
     description:
       'Upper bound on how many streams an item offers as versions. Configurations can pick a lower number.',
     env: 'JELLYFIN_MAX_VERSIONS',
     requiresRestart: false,
     secret: false,
-    ui: { min: 1, max: 50 },
+    ui: { min: 1, max: 500 },
   },
   maxPersonas: {
     schema: z.number().int().min(0).max(100),
@@ -117,12 +117,22 @@ export const jellyfinSchema = {
     secret: false,
     ui: { min: 0, max: 100 },
   },
+  pinSignIn: {
+    schema: z.boolean(),
+    default: false,
+    label: 'Sign in with a PIN alone',
+    description:
+      "Lets a user with a PIN of 6 or more digits sign in on a configuration's /jellyfin/<uuid>/<encryptedPassword> address with that PIN instead of the configuration password, so its owner can hand each person their own user without sharing the password. That address holds the same credential as the configuration's Stremio manifest URL, so anyone with that URL who learns or guesses a PIN can use that user. The primary user and users without a PIN still need the password. Leave this off on a public instance.",
+    env: 'JELLYFIN_PIN_SIGN_IN',
+    requiresRestart: false,
+    secret: false,
+  },
   resolveOnOpen: {
     schema: z.enum(['always', 'never', 'user']),
     default: 'user',
     label: 'Resolve streams when an item is opened',
     description:
-      'Stock clients build their version picker from the item page, which means fetching streams before playback starts. **always** does that for everyone, **never** only resolves on play (the picker shows a placeholder until then), **user** lets each configuration choose.',
+      'Stock clients build their version picker from the item page, which means fetching streams before playback starts. **always** does that for everyone, **never** only resolves on play (the picker shows a placeholder until then), **user** lets each configuration choose, though an app that asks the item for its versions gets them either way.',
     env: 'JELLYFIN_RESOLVE_ON_OPEN',
     requiresRestart: false,
     secret: false,

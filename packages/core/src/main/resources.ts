@@ -17,6 +17,11 @@ import { FeatureControl } from '../utils/feature.js';
 import { StreamContext, StreamUtils } from '../streams/index.js';
 import { buildPlayChain, type FailoverContentType } from './play-chain.js';
 import { resolveServiceWrappedStreams } from './serviceWrapper.js';
+import { resolveRemuxDbMediaInfo } from '../remuxdb/wrap.js';
+import { resolveStoredMediaInfo } from '../media-info/lookup.js';
+import { idsFromVideoId, onPreloadRedirect } from '../media-info/play.js';
+import { PLAYBACK_PATH_PREFIX, withPlayPath } from '../debrid/utils.js';
+import type { ContributionIds } from '../media-info/contribute.js';
 import type { ServiceWrapServiceTiming } from './serviceWrapper.js';
 import type { PrecomputeSubTimings } from '../streams/precomputer.js';
 import { StreamSelector } from '../parser/streamExpression.js';
@@ -70,18 +75,25 @@ const pipelineResultCache = Cache.getInstance<string, StreamsResponse>(
   appConfig.bootstrap.redisUri ? undefined : 'memory'
 );
 
-async function pingStream(stream: ParsedStream, timeoutMs = PING_TIMEOUT_MS) {
-  if (!stream.url) {
+async function pingStream(
+  stream: ParsedStream,
+  timeoutMs = PING_TIMEOUT_MS,
+  url = stream.url
+) {
+  if (!url) {
     throw new Error('pingStream: stream has no URL');
   }
   const wrapper = new Wrapper(stream.addon);
-  return wrapper.makeRequest(stream.url, {
+  return wrapper.makeRequest(url, {
     timeout: timeoutMs,
     rawOptions: { redirect: 'manual' },
   });
 }
 
-async function pingStreamUrls(streams: ParsedStream[]): Promise<void> {
+async function pingStreamUrls(
+  streams: ParsedStream[],
+  play: { path: 'stremio' | 'jellyfin'; ids: ContributionIds }
+): Promise<void> {
   const eligible = streams.filter((s) => s.url);
   if (eligible.length === 0) {
     logger.debug('No streams to ping');
@@ -93,8 +105,16 @@ async function pingStreamUrls(streams: ParsedStream[]): Promise<void> {
     eligible.map((stream) =>
       limit(async () => {
         try {
-          const response = await pingStream(stream);
+          const response = await pingStream(
+            stream,
+            PING_TIMEOUT_MS,
+            withPlayPath(stream.url!, play.path)
+          );
           response.body?.cancel().catch(() => undefined);
+          const location = response.headers.get('location');
+          if (location && !stream.url!.includes(PLAYBACK_PATH_PREFIX)) {
+            onPreloadRedirect(play.path, stream, location, play.ids);
+          }
           logger.debug('Ping request sent', {
             url: makeUrlLogSafe(stream.url!),
             status: response.status,
@@ -154,7 +174,7 @@ function getAddonsForResource(
  *  1. Addons with a matching idPrefix (tried first, errors are reported)
  *  2. Addons with general type support and no idPrefixes (fallback, errors are silently skipped)
  */
-function getMetaCandidates(
+export function getMetaCandidates(
   ctx: Pick<AIOStreamsContext, 'supportedResources' | 'addons'>,
   type: string,
   id: string
@@ -258,6 +278,7 @@ export async function processStreams(
     metaFilterMs: number;
     serviceWrapMs: number;
     serviceWrapTimings?: Record<string, ServiceWrapServiceTiming>;
+    mediaInfoMs: number;
     filterMs: number;
     deduplicationMs: number;
     precomputeMs: number;
@@ -274,6 +295,7 @@ export async function processStreams(
   let metaFilterMs = 0;
   let serviceWrapMs = 0;
   let serviceWrapTimings: Record<string, ServiceWrapServiceTiming> | undefined;
+  let mediaInfoMs = 0;
   let filterMs = 0;
   let deduplicationMs = 0;
   let precomputeMs = 0;
@@ -282,8 +304,16 @@ export async function processStreams(
   let limitMs = 0;
   let selMs = 0;
 
+  const withMediaInfo = async (streams: ParsedStream[]) => {
+    const start = Date.now();
+    await resolveStoredMediaInfo(streams, context);
+    await resolveRemuxDbMediaInfo(streams, context, ctx.userData);
+    mediaInfoMs += Date.now() - start;
+  };
+
   if (isMeta) {
     await ctx.precomputer.precomputeSeaDexOnly(processedStreams, context);
+    await withMediaInfo(processedStreams);
     const metaFilterStart = Date.now();
     processedStreams = await ctx.filterer.filter(processedStreams, context);
     metaFilterMs = Date.now() - metaFilterStart;
@@ -305,6 +335,9 @@ export async function processStreams(
   }
 
   if (resolvedResults.hasNewStreams) {
+    await withMediaInfo(
+      processedStreams.filter((s) => !preServiceWrapIds.has(s.id))
+    );
     const filterStart = Date.now();
     processedStreams = await ctx.filterer.filter(processedStreams, context);
     filterMs = Date.now() - filterStart;
@@ -481,6 +514,7 @@ export async function processStreams(
       metaFilterMs,
       serviceWrapMs,
       serviceWrapTimings,
+      mediaInfoMs,
       filterMs,
       deduplicationMs,
       precomputeMs,
@@ -595,7 +629,10 @@ async function precacheNextEpisode(
     appConfig.resources.precache.nextEpisodeMinInterval
   );
 
-  await pingStreamUrls(streamsToCache);
+  await pingStreamUrls(streamsToCache, {
+    path: ctx.options?.path ?? 'stremio',
+    ids: idsFromVideoId(precacheId),
+  });
 
   logger.debug(
     { count: streamsToCache.length, id, type },
@@ -726,6 +763,7 @@ export async function getStreams(
     errors,
     statistics: addonStatistics,
     dispositions,
+    mediaInfoMs: fetcherMediaInfoMs,
   } = await ctx.fetcher.fetch(supportedAddons, context);
   const fetchMs = Date.now() - fetchStart;
 
@@ -793,6 +831,7 @@ export async function getStreams(
   );
   let finalStreams = processResults.streams;
   const pipelineTimings = processResults.timings;
+  pipelineTimings.mediaInfoMs += fetcherMediaInfoMs;
   errors.push(...processResults.errors);
 
   if (FeatureControl.disabledStreamTypes.size > 0) {
@@ -910,7 +949,10 @@ export async function getStreams(
           }
         }
         setImmediate(() => {
-          pingStreamUrls(streamsToPreload).catch((error) => {
+          pingStreamUrls(streamsToPreload, {
+            path: ctx.options?.path ?? 'stremio',
+            ids: idsFromVideoId(id),
+          }).catch((error) => {
             logger.error('Error during stream preloading:', {
               error: error instanceof Error ? error.message : String(error),
               type,

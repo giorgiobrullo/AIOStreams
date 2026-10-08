@@ -1,10 +1,13 @@
 import {
   addonSubtitleTracks,
+  applyStoredMediaInfo,
+  idsFromVideoId,
   config as appConfig,
   constants,
   createFormatter,
   createLogger,
   DistributedLock,
+  hasProgrammeVideos,
   encodeItemId,
   requestLockType,
   isPlayable,
@@ -14,10 +17,13 @@ import {
   parseRuntimeMs,
   playableSources,
   rememberShowEpisodes,
+  requestTitleMetadata,
   labelFrom,
   isMemoFresh,
   resolveByItem,
+  sourceIdentities,
   sourceRecordFrom,
+  generateBingeGroup,
   writePlaybackMemo,
   type ContentDescriptor,
   type MediaSourceRecord,
@@ -30,8 +36,7 @@ import type { JellyfinRequestContext } from './context.js';
 
 const logger = createLogger('jellyfin');
 
-/** Anime metas are often served under `series`, and the other way round. */
-export function getMetaLoose(
+export function getMeta(
   ctx: JellyfinRequestContext,
   type: string,
   id: string
@@ -39,45 +44,36 @@ export function getMetaLoose(
   const key = `${type}|${id}`;
   let pending = ctx.metas.get(key);
   if (!pending) {
-    pending = fetchMetaLoose(ctx, type, id);
+    pending = fetchMeta(ctx, type, id);
     ctx.metas.set(key, pending);
   }
   return pending;
 }
 
-async function fetchMetaLoose(
+async function fetchMeta(
   ctx: JellyfinRequestContext,
   type: string,
   id: string
 ): Promise<ParsedMeta | null> {
   const engine = await ctx.engine();
-  const order =
-    type === 'anime'
-      ? [type, 'series']
-      : type === 'series'
-        ? [type, 'anime']
-        : [type];
-  for (const t of order) {
-    try {
-      const res = await engine.getMeta(t, id);
-      if (res.data) {
-        if (type !== 'movie' && res.data.videos?.length) {
-          rememberShowEpisodes(ctx.scope(), type, id, res.data);
-        }
-        return res.data;
-      }
-    } catch (error) {
-      logger.debug(
-        {
-          type: t,
-          id,
-          err: error instanceof Error ? error.message : String(error),
-        },
-        'meta failed'
-      );
+  try {
+    const res = await engine.getMeta(type, id);
+    if (!res.data) return null;
+    if (
+      type !== 'movie' &&
+      res.data.videos?.length &&
+      !hasProgrammeVideos(res.data)
+    ) {
+      rememberShowEpisodes(ctx.scope(), type, id, res.data);
     }
+    return res.data;
+  } catch (error) {
+    logger.debug(
+      { type, id, err: error instanceof Error ? error.message : String(error) },
+      'meta failed'
+    );
+    return null;
   }
-  return null;
 }
 
 export interface PlayTarget {
@@ -99,7 +95,7 @@ export async function playTargetFor(
   d: ContentDescriptor
 ): Promise<PlayTarget | null> {
   if (d.k === 'episode') {
-    const meta = await getMetaLoose(ctx, d.t, d.i).catch(() => null);
+    const meta = await getMeta(ctx, d.t, d.i).catch(() => null);
     const video = meta?.videos?.find((v) => v.id === d.v) as
       | MetaVideo
       | undefined;
@@ -113,7 +109,7 @@ export async function playTargetFor(
   }
   if (d.k === 'movie') {
     // A collection's movie is one of its parent's videos.
-    const meta = await getMetaLoose(ctx, d.t, d.p ?? d.i).catch(() => null);
+    const meta = await getMeta(ctx, d.t, d.p ?? d.i).catch(() => null);
     const hinted = d.p ? undefined : meta?.behaviorHints?.defaultVideoId;
     const videoId = typeof hinted === 'string' && hinted ? hinted : d.i;
     const video = meta?.videos?.find((v) => v.id === videoId) as
@@ -123,7 +119,7 @@ export async function playTargetFor(
       parseRuntimeMs(video?.runtime) ??
       (d.p
         ? parseRuntimeMs(
-            (await getMetaLoose(ctx, d.t, d.i).catch(() => null))?.runtime
+            (await getMeta(ctx, d.t, d.i).catch(() => null))?.runtime
           )
         : parseRuntimeMs(meta?.runtime));
     return {
@@ -164,6 +160,17 @@ function noticeStreamsOf(
       NOTICE_TYPES.includes(stream.type) &&
       !(stream.externalUrl && playableUrls.has(stream.externalUrl))
   );
+}
+
+/** Clients open this as a link, so nothing but a web page gets through. */
+function webUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const { protocol } = new URL(url);
+    return protocol === 'http:' || protocol === 'https:' ? url : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function showErrors(ctx: JellyfinRequestContext): boolean {
@@ -219,6 +226,32 @@ export async function resolvePlayback(
   return (await resolveByItem(ctx.uuid, scope, itemId)) ?? null;
 }
 
+/**
+ * A version kept by a new run keeps the subtitles a lookup for its file added:
+ * a player still showing it asks for them by their position in that list.
+ */
+function keepEnrichedSubtitles(
+  memo: PlaybackMemo,
+  previous: PlaybackMemo | null | undefined
+): void {
+  const enriched = new Map(
+    (previous?.sources ?? [])
+      .filter((s) => s.subtitlesEnriched)
+      .map((s) => [s.msid, s])
+  );
+  for (const source of memo.sources) {
+    const before = enriched.get(source.msid);
+    if (!before) continue;
+    source.subtitles = before.subtitles;
+    source.subtitlesEnriched = true;
+  }
+}
+
+/** Live by the content when the url says nothing: a channel, or a schedule. */
+function isLiveContent(type: string, meta: ParsedMeta | null): boolean {
+  return type === 'tv' || type === 'channel' || hasProgrammeVideos(meta);
+}
+
 async function resolveUncached(
   ctx: JellyfinRequestContext,
   d: ContentDescriptor,
@@ -229,6 +262,17 @@ async function resolveUncached(
   if (!target) return null;
 
   const engine = await ctx.engine();
+  const liveContent = isLiveContent(
+    target.type,
+    await getMeta(ctx, d.t, d.k === 'movie' ? (d.p ?? d.i) : d.i).catch(
+      () => null
+    )
+  );
+  /* Copied, not marked in place: the pipeline result is cached and shared. */
+  const asLive = (stream: ParsedStream): ParsedStream =>
+    liveContent && stream.type !== 'live'
+      ? { ...stream, type: constants.LIVE_STREAM_TYPE }
+      : stream;
   const inline = (target.streams ?? []) as ParsedStream[];
   const ownPlayable = inline.filter(isPlayable);
   const streamsRes = ownPlayable.length
@@ -257,17 +301,21 @@ async function resolveUncached(
     }
   };
   const top = playable.slice(0, maxVersionsFor(ctx));
+  const identities = sourceIdentities(itemId, top);
 
   const sources: MediaSourceRecord[] = [];
-  for (const stream of top) {
+  for (const [index, raw] of top.entries()) {
+    const stream = asLive(raw);
     const formatted = await format(stream);
     sources.push(
       sourceRecordFrom(
         ctx.uuid,
+        identities[index],
         stream,
         formatted,
         labelFrom(formatted, stream),
-        addonSubtitles
+        addonSubtitles,
+        generateBingeGroup(stream, index, ctx.userData)
       )
     );
   }
@@ -278,24 +326,23 @@ async function resolveUncached(
     label: string,
     type: string,
     text: { name: string; description: string },
-    addon = ''
+    extra: { addon?: string; externalUrl?: string } = {}
   ) =>
     sources.push(
       noticeRecordFrom(ctx.uuid, `notice|${itemId}|${sources.length}`, label, {
         ...text,
-        addon,
+        addon: extra.addon ?? '',
+        externalUrl: extra.externalUrl,
         type,
       })
     );
 
   for (const stream of noticeStreamsOf(all, playable)) {
     const formatted = await format(stream);
-    notice(
-      labelFrom(formatted, stream),
-      stream.type,
-      formatted,
-      stream.addon?.name ?? ''
-    );
+    notice(labelFrom(formatted, stream), stream.type, formatted, {
+      addon: stream.addon?.name ?? '',
+      externalUrl: webUrl(stream.externalUrl),
+    });
   }
   if (showErrors(ctx)) {
     for (const error of streamsRes?.errors ?? []) {
@@ -325,10 +372,14 @@ async function resolveUncached(
     psid: newPlaySessionId(),
     sources,
     addonSubtitles,
+    titleMetadata: streamContext
+      ? await requestTitleMetadata(streamContext).catch(() => undefined)
+      : undefined,
     runtimeMs: target.runtimeMs,
     createdAt: Date.now(),
   };
-  await writePlaybackMemo(memo, scope);
+  keepEnrichedSubtitles(memo, await resolveByItem(ctx.uuid, scope, itemId));
+  await writePlaybackMemo(memo, scope, ctx.persona?.id);
   if (!playableSources(sources).length) {
     const reason = (streamsRes?.errors ?? [])
       .map((e) => [e.title, e.description].filter(Boolean).join(': '))
@@ -361,9 +412,9 @@ export async function enrichSourceSubtitles(
   memo: PlaybackMemo,
   msid?: string
 ): Promise<void> {
-  const record =
-    (msid ? memo.sources.find((s) => s.msid === msid) : undefined) ??
-    memo.sources[0];
+  const record = msid
+    ? memo.sources.find((s) => s.msid === msid)
+    : memo.sources[0];
   if (!record || record.notice || record.subtitlesEnriched) return;
   const extras = fileExtrasFor(record);
 
@@ -396,7 +447,33 @@ export async function enrichSourceSubtitles(
     { itemId: memo.itemId, msid: record.msid, added },
     'file-matched subtitles merged'
   );
-  await writePlaybackMemo(memo, ctx.scope());
+  await writePlaybackMemo(memo, ctx.scope(), ctx.persona?.id);
+}
+
+export async function applyProbedMediaInfo(
+  ctx: JellyfinRequestContext,
+  memo: PlaybackMemo,
+  msid?: string,
+  /* A play, rather than a listing, may wait for its version's probe. */
+  opts: { playing?: boolean } = {}
+): Promise<void> {
+  const record = msid
+    ? memo.sources.find((s) => s.msid === msid)
+    : memo.sources[0];
+  if (!record) return;
+  const applied = await applyStoredMediaInfo(record, memo.titleMetadata, {
+    waitMs: opts.playing
+      ? (ctx.userData.jellyfin?.playWait ?? appConfig.mediaInfo.playWait) * 1000
+      : 0,
+    clientIp: ctx.userData.ip,
+    ids: idsFromVideoId(memo.videoId),
+  }).catch(() => false);
+  if (!applied) return;
+  logger.debug(
+    { itemId: memo.itemId, msid: record.msid },
+    'stored media info applied on play'
+  );
+  await writePlaybackMemo(memo, ctx.scope(), ctx.persona?.id);
 }
 
 export function resolveMarkerId(

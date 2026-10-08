@@ -3,7 +3,7 @@ import { config as appConfig, subscribeToConfig } from '../../config/index.js';
 import { TaskManager } from '../../tasks/index.js';
 import { SyncFetcher } from './fetcher.js';
 import { UrlAllowlist } from './allowlist.js';
-import { assertFetchable, partitionUrls } from './policy.js';
+import { partitionUrls } from './policy.js';
 import type {
   AllowlistSource,
   FetchResult,
@@ -84,7 +84,8 @@ export class SyncService<T extends Record<string, any>> {
   public setSource(source: AllowlistSource, urls: string[]): void {
     const { added, removed } = this.allowlist.setSource(source, urls);
     if (added.length === 0 && removed.length === 0) return;
-    void this.refresh().catch((error) =>
+    if (!this.initialisation) return;
+    void this.refresh(added).catch((error) =>
       logger.warn(
         { type: this.config.cacheKey, error: error.message },
         'failed to refresh after allowlist change'
@@ -99,8 +100,7 @@ export class SyncService<T extends Record<string, any>> {
     return partitionUrls(this.config.kind, urls, this.allowlist, userData);
   }
 
-  public async fetch(url: string, vouched: boolean): Promise<T[]> {
-    if (!vouched) await assertFetchable(url);
+  public fetch(url: string, vouched: boolean): Promise<T[]> {
     return this.fetcher.fetch(url, {
       ttl: vouched ? this.vouchedTtl : this.userTtl,
     });
@@ -127,10 +127,13 @@ export class SyncService<T extends Record<string, any>> {
   }
 
   /**
-   * Re-read every vouched URL. A failure falls back to the cached copy so a
-   * transient outage does not revoke permissions.
+   * Re-read every vouched URL, or just `only` and anything uncached. A failure
+   * falls back to the cached copy so a transient outage does not revoke
+   * permissions.
    */
-  public async refresh(): Promise<{ urls: number; items: number }> {
+  public async refresh(
+    only?: string[]
+  ): Promise<{ urls: number; items: number }> {
     this.allowlist.setSource('settings', this.config.settingsUrls());
     const urls = this.allowlist.urls;
     if (urls.length === 0) {
@@ -139,14 +142,19 @@ export class SyncService<T extends Record<string, any>> {
     }
 
     const cached = await this.fetcher.readCached(urls);
+    const refetch = only ? new Set(only) : null;
     const snapshot = new Map<string, T[]>();
 
     await Promise.all(
       urls.map(async (url) => {
+        const fallback = cached.get(url);
+        if (fallback && refetch && !refetch.has(url)) {
+          snapshot.set(url, fallback);
+          return;
+        }
         try {
           snapshot.set(url, await this.fetcher.refetch(url, this.vouchedTtl));
         } catch (error: any) {
-          const fallback = cached.get(url);
           if (fallback) {
             snapshot.set(url, fallback);
             logger.warn(
@@ -241,12 +249,7 @@ export class SyncService<T extends Record<string, any>> {
         : ['userLimits.sel.urls'];
     this.unsubscribe = subscribeToConfig(({ changed }) => {
       if (!keys.some((key) => changed.has(key))) return;
-      void this.refresh().catch((error) =>
-        logger.warn(
-          { type: this.config.cacheKey, error: error.message },
-          'failed to refresh after settings change'
-        )
-      );
+      this.setSource('settings', this.config.settingsUrls());
     });
   }
 }

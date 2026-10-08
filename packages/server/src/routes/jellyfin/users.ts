@@ -1,25 +1,25 @@
 import { createHash } from 'crypto';
 import { Router, type Request } from 'express';
 import {
-  Cache,
+  config as appConfig,
   createLogger,
-  descriptorForWatchRow,
   encryptString,
   getSimpleTextHash,
   isConfigUuid,
+  JellyfinRepository,
   mintToken,
   personaUserId,
   quickConnectConsume,
   resolveConfigAlias,
   serverId as instanceServerId,
   sessionKeyFor,
-  stripInternal,
-  TICKS_PER_MS,
+  msToTicks,
+  SUBTITLE_MODES,
   WatchSessionRepository,
   type ClientInfo,
-  type JellyfinItem,
   type JellyfinPersona,
   type UserData,
+  type WatchScope,
   type WatchSessionRow,
 } from '@aiostreams/core';
 import {
@@ -28,12 +28,19 @@ import {
   param,
   personaById,
   personaByName,
+  accountLocked,
+  PIN_REQUIRED,
+  personaLocked,
+  lockTag,
+  userUnlocks,
   personasOf,
+  watchScopeOf,
   qs,
   resolveConfig,
+  resolvePickerAlias,
   type JellyfinRequestContext,
 } from './context.js';
-import { itemFromDescriptor } from './items.js';
+import { summaryItem } from './items.js';
 import { serverName } from './system.js';
 
 const logger = createLogger('jellyfin');
@@ -41,9 +48,10 @@ const router: Router = Router({ mergeParams: true });
 
 export function userConfiguration() {
   return {
+    AudioLanguagePreference: '',
     PlayDefaultAudioTrack: true,
     SubtitleLanguagePreference: '',
-    DisplayMissingEpisodes: false,
+    DisplayMissingEpisodes: true,
     GroupedFolders: [],
     SubtitleMode: 'Default',
     DisplayCollectionsView: false,
@@ -57,6 +65,31 @@ export function userConfiguration() {
     EnableNextEpisodeAutoPlay: true,
     CastReceiverId: '',
   };
+}
+
+/** The playback preferences a user can set and this server keeps. */
+const USER_PREFERENCES: Record<string, (value: unknown) => boolean> = {
+  AudioLanguagePreference: (v) => typeof v === 'string' && v.length <= 16,
+  SubtitleLanguagePreference: (v) => typeof v === 'string' && v.length <= 16,
+  SubtitleMode: (v) => SUBTITLE_MODES.some((mode) => mode === v),
+  PlayDefaultAudioTrack: (v) => typeof v === 'boolean',
+  RememberAudioSelections: (v) => typeof v === 'boolean',
+  RememberSubtitleSelections: (v) => typeof v === 'boolean',
+  EnableNextEpisodeAutoPlay: (v) => typeof v === 'boolean',
+};
+
+function userPreferences(body: unknown): Record<string, unknown> {
+  const source = body && typeof body === 'object' ? body : {};
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) =>
+      USER_PREFERENCES[key]?.(value)
+    )
+  );
+}
+
+export async function storedUserConfiguration(scope: WatchScope) {
+  const stored = await JellyfinRepository.getUserConfiguration(scope);
+  return { ...userConfiguration(), ...userPreferences(stored) };
 }
 
 export function userPolicy(opts: { admin?: boolean; hidden?: boolean } = {}) {
@@ -111,7 +144,7 @@ export function userPolicy(opts: { admin?: boolean; hidden?: boolean } = {}) {
 type Faced = Pick<UserData, 'addonName' | 'jellyfin'>;
 
 /** The primary user's name, which stood in for a configuration before it had one. */
-function accountName(userData: Faced): string {
+export function accountName(userData: Faced): string {
   return userData.jellyfin?.primary?.name || userData.addonName || serverName();
 }
 
@@ -120,18 +153,14 @@ function avatarTag(avatar: string | undefined): string | undefined {
   return avatar ? getSimpleTextHash(avatar).slice(0, 16) : undefined;
 }
 
-/**
- * `pickable` rows come from the pre-authenticated address, which already
- * proved the credential, so a client signs in with one tap and no password.
- * `forKey` rows make the primary user the administrator an API key acts as.
- */
+/** `forKey` rows make the primary user the administrator an API key acts as. */
 export function userDto(
   uuid: string,
   userData: Faced,
   persona: JellyfinPersona | null,
-  opts: { pickable?: boolean; forKey?: boolean } = {}
+  opts: { forKey?: boolean } = {}
 ) {
-  const pickable = opts.pickable ?? false;
+  const locked = persona ? personaLocked(persona) : accountLocked(userData);
   const now = new Date().toISOString();
   const tag = avatarTag(
     persona ? persona.avatar : userData.jellyfin?.primary?.avatar
@@ -142,10 +171,10 @@ export function userDto(
     ServerName: serverName(),
     Id: personaUserId(uuid, persona?.id ?? ''),
     ...(tag ? { PrimaryImageTag: tag } : {}),
-    HasPassword: !pickable,
-    HasConfiguredPassword: !pickable,
+    HasPassword: true,
+    HasConfiguredPassword: true,
     HasConfiguredEasyPassword: false,
-    EnableAutoLogin: true,
+    EnableAutoLogin: !locked,
     LastLoginDate: now,
     LastActivityDate: now,
     Configuration: userConfiguration(),
@@ -217,37 +246,43 @@ function clientOf(req: Request): ClientInfo {
   );
 }
 
-async function authenticationResult(
+export async function authenticationResult(
   req: Request,
   uuid: string,
   encryptedPassword: string,
   userData: UserData,
-  persona: JellyfinPersona | null
+  persona: JellyfinPersona | null,
+  opts: { provedPassword?: boolean } = {}
 ) {
   const client = clientOf(req);
   return {
-    User: userDto(uuid, userData, persona),
+    User: {
+      ...userDto(uuid, userData, persona),
+      Configuration: await storedUserConfiguration(watchScopeOf(uuid, persona)),
+    },
     SessionInfo: sessionInfo(uuid, userData, persona, client, req.userIp),
     AccessToken: mintToken({
       u: uuid,
       p: encryptedPassword,
       d: client.deviceId,
       k: persona?.id,
+      l: lockTag(userData, persona) || undefined,
+      ...(persona && opts.provedPassword ? { o: 1 as const } : {}),
     }),
     ServerId: instanceServerId(),
   };
 }
 
 /** Every user of one configuration, the account first. */
-function allUsers(
+export function allUsers(
   uuid: string,
   userData: UserData,
-  opts: { pickable?: boolean; forKey?: boolean } = {}
+  opts: { forKey?: boolean } = {}
 ) {
   return [
     userDto(uuid, userData, null, opts),
     ...personasOf(userData)
-      .filter((p) => opts.forKey || !p.hidden)
+      .filter((p) => (opts.forKey ? !personaLocked(p) : !p.hidden))
       .map((p) => userDto(uuid, userData, p, opts)),
   ];
 }
@@ -272,72 +307,151 @@ function resolveSignIn(
 
 router.get(
   '/Users/Public',
-  jfOptional(async (req, res, ctx) => {
-    if (ctx?.preAuthenticated) {
-      res.json(allUsers(ctx.uuid, ctx.userData, { pickable: true }));
-      return;
-    }
-    // No configuration to list for, and an empty list is what makes a client
-    // show the manual form that takes a uuid or alias.
-    res.json([]);
+  jfOptional(async (req, res) => {
+    const mount = req.jfMount;
+    const userData = mount
+      ? await resolveConfig(mount.uuid, mount.encryptedPassword)
+      : null;
+    // Without a configuration to list for, an empty list is what makes a
+    // client show the manual form that takes a uuid or alias.
+    res.json(mount && userData ? allUsers(mount.uuid, userData) : []);
   })
 );
 
+/** `Pw` may be `<password>/<pin>`; the whole value is tried first, so a password holding a slash works. */
+async function checkPassword(
+  uuid: string,
+  pw: string
+): Promise<{ encryptedPassword: string; pin: string } | null> {
+  const slash = pw.lastIndexOf('/');
+  const candidates: [string, string][] = [[pw, '']];
+  if (slash > 0) candidates.push([pw.slice(0, slash), pw.slice(slash + 1)]);
+  for (const [password, pin] of candidates) {
+    const enc = encryptString(password);
+    if (!enc.success || !enc.data) throw new Error('Encryption failure');
+    if (await resolveConfig(uuid, enc.data))
+      return { encryptedPassword: enc.data, pin };
+  }
+  return null;
+}
+
+/** A bare user name, alias or the uuid on a picker address; `<uuid or alias>/<user>` elsewhere. */
+function parseSignIn(
+  username: string,
+  mount: { uuid: string } | undefined
+): { account: string; personaName: string } | null {
+  if (mount) {
+    if (username.includes('/')) return null;
+    return isConfigUuid(username)
+      ? { account: username, personaName: '' }
+      : { account: mount.uuid, personaName: username };
+  }
+  const slash = username.lastIndexOf('/');
+  return slash < 0
+    ? { account: username, personaName: '' }
+    : {
+        account: username.slice(0, slash),
+        personaName: username.slice(slash + 1),
+      };
+}
+
+/** Shorter PINs are too easy to guess once the picker address has leaked. */
+const PIN_ONLY_PATTERN = /^\d{6,12}$/;
+
+/** The picker address's credential stands in for the password. */
+async function pinOnlySignIn(
+  mount: { uuid: string; encryptedPassword: string },
+  personaName: string,
+  pin: string
+): Promise<{ userData: UserData; persona: JellyfinPersona } | null> {
+  if (!appConfig.jellyfin.pinSignIn || !personaName) return null;
+  if (!PIN_ONLY_PATTERN.test(pin)) return null;
+  const userData = await resolveConfig(mount.uuid, mount.encryptedPassword);
+  const persona = userData ? personaByName(userData, personaName) : null;
+  if (!userData || !persona || !personaLocked(persona)) return null;
+  if (!(await userUnlocks(mount.uuid, userData, persona, pin))) return null;
+  return { userData, persona };
+}
+
 router.post(
   '/Users/AuthenticateByName',
-  jfOptional(async (req, res, ctx) => {
+  jfOptional(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const username = String(body.Username ?? body.username ?? '').trim();
     const pw = String(
       body.Pw ?? body.pw ?? body.Password ?? body.password ?? ''
     );
+    const mount = req.jfMount;
 
-    let uuid: string | undefined;
-    let encryptedPassword: string | undefined;
-    let personaName: string;
-    if (ctx?.preAuthenticated) {
-      uuid = ctx.uuid;
-      encryptedPassword = ctx.encryptedPassword;
-      personaName = username;
-    } else {
-      // `<uuid or alias>/<persona>`; neither side can contain a slash.
-      const slash = username.lastIndexOf('/');
-      const account = slash >= 0 ? username.slice(0, slash) : username;
-      personaName = slash >= 0 ? username.slice(slash + 1) : '';
-      if (!account) {
-        res.status(401).json({
-          Message: 'Username (configuration UUID or alias) is required',
-        });
+    const named = parseSignIn(username, mount);
+    if (!named) {
+      res.status(401).json({ Message: 'Invalid username or password' });
+      return;
+    }
+    const { account, personaName } = named;
+    if (!account) {
+      res.status(401).json({
+        Message: 'Username (configuration UUID or alias) is required',
+      });
+      return;
+    }
+    // An alias only stands in for the uuid; the password is still asked for.
+    const uuid = isConfigUuid(account)
+      ? account
+      : (await resolveConfigAlias(account))?.uuid;
+    if (!uuid || (mount && uuid.toLowerCase() !== mount.uuid.toLowerCase())) {
+      res.status(401).json({ Message: 'Invalid username or password' });
+      return;
+    }
+    const proven = await checkPassword(uuid, pw);
+    if (!proven) {
+      const byPin = mount ? await pinOnlySignIn(mount, personaName, pw) : null;
+      if (!mount || !byPin) {
+        res.status(401).json({ Message: 'Invalid username or password' });
         return;
       }
-      if (isConfigUuid(account)) {
-        const enc = encryptString(pw);
-        if (!enc.success || !enc.data) {
-          res.status(500).json({ Message: 'Encryption failure' });
-          return;
-        }
-        uuid = account;
-        encryptedPassword = enc.data;
-      } else {
-        // an alias already carries its password, the way alias URLs do
-        const alias = await resolveConfigAlias(account);
-        if (!alias) {
-          res.status(401).json({ Message: 'Invalid username or password' });
-          return;
-        }
-        uuid = alias.uuid;
-        encryptedPassword = alias.encryptedPassword;
-      }
+      const client = clientOf(req);
+      logger.info(
+        {
+          uuid: mount.uuid,
+          persona: byPin.persona.id,
+          client: client.name,
+          device: client.device,
+        },
+        'jellyfin client authenticated with a pin'
+      );
+      res.json(
+        await authenticationResult(
+          req,
+          mount.uuid,
+          mount.encryptedPassword,
+          byPin.userData,
+          byPin.persona
+        )
+      );
+      return;
     }
+    const { encryptedPassword, pin } = proven;
 
     const userData = await resolveConfig(uuid, encryptedPassword);
     if (!userData) {
       res.status(401).json({ Message: 'Invalid username or password' });
       return;
     }
-    const signIn = resolveSignIn(userData, personaName);
+    // On a picker address the account also answers to its alias, after its users.
+    const signIn =
+      resolveSignIn(userData, personaName) ??
+      (mount &&
+      (await resolvePickerAlias(personaName))?.uuid.toLowerCase() ===
+        uuid.toLowerCase()
+        ? { persona: null }
+        : null);
     if (!signIn) {
       res.status(401).json({ Message: 'Invalid username or password' });
+      return;
+    }
+    if (!(await userUnlocks(uuid, userData, signIn.persona, pin))) {
+      res.status(401).json({ Message: PIN_REQUIRED });
       return;
     }
     const client = clientOf(req);
@@ -356,7 +470,8 @@ router.post(
         uuid,
         encryptedPassword,
         userData,
-        signIn.persona
+        signIn.persona,
+        { provedPassword: true }
       )
     );
   })
@@ -414,7 +529,10 @@ router.get(
       res.status(400).json({ Message: 'API keys have no user' });
       return;
     }
-    res.json(userDto(ctx.uuid, ctx.userData, ctx.persona));
+    res.json({
+      ...userDto(ctx.uuid, ctx.userData, ctx.persona),
+      Configuration: await storedUserConfiguration(ctx.watch),
+    });
   })
 );
 router.get(
@@ -434,20 +552,29 @@ router.get(
         : (personasOf(ctx.userData).find(
             (p) => personaUserId(ctx.uuid, p.id) === wanted
           ) ?? ctx.persona);
-    res.json(
-      userDto(ctx.uuid, ctx.userData, persona, { forKey: !!ctx.apiKey })
-    );
+    res.json({
+      ...userDto(ctx.uuid, ctx.userData, persona, { forKey: !!ctx.apiKey }),
+      Configuration: await storedUserConfiguration(
+        watchScopeOf(ctx.uuid, persona)
+      ),
+    });
   })
 );
+/* A user token only ever reads and writes its own preferences. */
 router.get(
   '/Users/:userId/Configuration',
-  jf(async (_req, res) => {
-    res.json(userConfiguration());
+  jf(async (_req, res, ctx) => {
+    res.json(await storedUserConfiguration(ctx.watch));
   })
 );
 router.post(
   ['/Users/Configuration', '/Users/:userId/Configuration'],
-  jf(async (_req, res) => {
+  jf(async (req, res, ctx) => {
+    const stored = await JellyfinRepository.getUserConfiguration(ctx.watch);
+    await JellyfinRepository.setUserConfiguration(ctx.watch, {
+      ...userPreferences(stored),
+      ...userPreferences(req.body),
+    });
     res.status(204).end();
   })
 );
@@ -464,47 +591,9 @@ router.post(
 );
 
 const SESSIONS_LIMIT = 50;
-const NOW_PLAYING_TTL = 600;
-const NOW_PLAYING_MISS_TTL = 30;
-const NOW_PLAYING_OMIT = [
-  'MediaSources',
-  'MediaStreams',
-  'People',
-  'Tags',
-  'RemoteTrailers',
-  'UserData',
-];
-
-const nowPlayingCache = Cache.getInstance<
-  string,
-  JellyfinItem | { missing: true }
->('jellyfin-now-playing', 5_000, 'memory');
-
-async function nowPlayingItem(
-  ctx: JellyfinRequestContext,
-  row: WatchSessionRow
-): Promise<JellyfinItem | null> {
-  const key = `${ctx.userId}|${ctx.scope()}|${row.itemKey}|${row.durationMs}`;
-  const hit = await nowPlayingCache.get(key);
-  if (hit) return 'missing' in hit ? null : hit;
-
-  const built = await itemFromDescriptor(ctx, descriptorForWatchRow(row)).catch(
-    () => null
-  );
-  if (!built) {
-    await nowPlayingCache.set(key, { missing: true }, NOW_PLAYING_MISS_TTL);
-    return null;
-  }
-  const item = stripInternal(built) as JellyfinItem & Record<string, unknown>;
-  for (const field of NOW_PLAYING_OMIT) delete item[field];
-  if (row.durationMs > 0)
-    item.RunTimeTicks = Math.round(row.durationMs) * TICKS_PER_MS;
-  await nowPlayingCache.set(key, item, NOW_PLAYING_TTL);
-  return item;
-}
 
 /** The caller's own session is the one this request is from, so it is active now. */
-async function sessionFromRow(
+export async function sessionFromRow(
   ctx: JellyfinRequestContext,
   row: WatchSessionRow,
   user: JellyfinPersona | null,
@@ -527,7 +616,7 @@ async function sessionFromRow(
   );
   const checkIn = new Date(row.lastCheckinAt).toISOString();
   const playing = row.endedAt == null;
-  const item = playing ? await nowPlayingItem(ctx, row) : null;
+  const item = playing ? await summaryItem(ctx, row) : null;
   return {
     ...session,
     LastActivityDate: own ? session.LastActivityDate : checkIn,
@@ -536,7 +625,7 @@ async function sessionFromRow(
       ? {
           PlayState: {
             ...session.PlayState,
-            PositionTicks: Math.round(row.positionMs) * TICKS_PER_MS,
+            PositionTicks: msToTicks(row.positionMs),
             IsPaused: row.paused,
           },
         }

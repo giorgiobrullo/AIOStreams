@@ -368,6 +368,46 @@ export class UsenetLibraryRepository {
             nzb_url = COALESCE(EXCLUDED.nzb_url, usenet_library_aliases.nzb_url)`;
   }
 
+  static async proxiedSourceUrls(): Promise<
+    { nzbUrl: string; nzbHash: string }[]
+  > {
+    const rows = await getDb().query<{ nzb_url: string; nzb_hash: string }>(
+      sql`SELECT nzb_url, nzb_hash FROM usenet_library_aliases
+           WHERE nzb_url LIKE ${'%/proxy/%'}
+          UNION
+          SELECT nzb_url, nzb_hash FROM usenet_library
+           WHERE nzb_url LIKE ${'%/proxy/%'}`
+    );
+    return rows.map((r) => ({ nzbUrl: r.nzb_url, nzbHash: r.nzb_hash }));
+  }
+
+  static async addMissingAliases(
+    aliases: { aliasHash: string; nzbHash: string; nzbUrl: string }[]
+  ): Promise<number> {
+    const fresh = [
+      ...new Map(
+        aliases
+          .filter((a) => a.aliasHash && a.aliasHash !== a.nzbHash)
+          .map((a) => [a.aliasHash, a])
+      ).values(),
+    ];
+    let added = 0;
+    for (let i = 0; i < fresh.length; i += 200) {
+      const values = join(
+        fresh
+          .slice(i, i + 200)
+          .map((a) => sql`(${a.aliasHash}, ${a.nzbHash}, ${a.nzbUrl})`)
+      );
+      const result = await getDb().exec(
+        sql`INSERT INTO usenet_library_aliases (alias_hash, nzb_hash, nzb_url)
+            VALUES ${values}
+            ON CONFLICT(alias_hash) DO NOTHING`
+      );
+      added += result.rowCount;
+    }
+    return added;
+  }
+
   /**
    * Map a search-time hash onto a canonical content hash. No-ops on a
    * self-alias; no change event (aliases are invisible to the dashboard).
@@ -892,7 +932,7 @@ export class UsenetLibraryRepository {
   }): Promise<UsenetLibraryEntry[]> {
     const statuses = opts.statuses.filter((s) => VALID_STATUSES.has(s));
     if (statuses.length === 0) return [];
-    const limit = Math.min(Math.max(opts.limit ?? 5000, 1), 50_000);
+    const limit = Math.min(Math.max(opts.limit ?? 25_000, 1), 50_000);
     const rows = await getDb().query<UsenetLibraryRow>(
       sql`SELECT ${COLUMNS} FROM usenet_library
           WHERE status IN (${join(statuses.map((s) => sql`${s}`))})

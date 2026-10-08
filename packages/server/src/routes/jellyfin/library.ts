@@ -2,22 +2,34 @@ import { Router, type Request, type Response } from 'express';
 import {
   buildGenre,
   catalogHasCollections,
+  filmographyCredits,
+  findPerson,
+  recommendedPreviews,
+  sortCredits,
+  titlePreviews,
+  type FilmographyKind,
+  Cache,
   collectionMembers,
   config as appConfig,
   contentItemType,
+  defaultUserData,
   encodeItemId,
   findCatalog,
   genreId,
   genreOptions,
   getCatalogPage,
   getWatchStateProvider,
+  isLeafEntry,
   knownCatalogKinds,
   latestSpellings,
   listResult,
   listViews,
+  requiresGenre,
   searchCatalogs,
   seriesIdOf,
   seriesKeyOf,
+  seriesKeyOfMatch,
+  showsAiringBetween,
   supportsExtra,
   type ContentKind,
   stripInternal,
@@ -40,20 +52,27 @@ import {
 import {
   attachUserData,
   boxSetChildren,
+  caughtUpOn,
   decodeForRequest,
+  decodeItemForRequest,
   isBoxsetCatalog,
   isBoxsetEntry,
   episodesForSeries,
   itemForId,
   itemFromDescriptor,
   itemsFromPreviews,
+  nextToAir,
   nextUpForSeries,
+  rememberListMarkers,
   seasonsForSeries,
   viewItems,
 } from './items.js';
-import { getMetaLoose } from './resolve.js';
+import { getMeta } from './resolve.js';
 
 const router: Router = Router({ mergeParams: true });
+
+const withoutRequiredGenre = (views: ViewEntry[]) =>
+  views.filter((v) => !requiresGenre(v.catalog));
 
 function isKodi(ctx: JellyfinRequestContext): boolean {
   return /kodi/i.test(ctx.client.name);
@@ -62,6 +81,10 @@ function isKodi(ctx: JellyfinRequestContext): boolean {
 function typeFilter(req: Request): Set<string> | null {
   const types = qlist(req, 'IncludeItemTypes').map((t) => t.toLowerCase());
   return types.length ? new Set(types) : null;
+}
+
+function isBoxsetOnly(types: Set<string> | null): boolean {
+  return !!types && types.size === 1 && types.has('boxset');
 }
 
 function excludedTypes(req: Request): Set<string> {
@@ -73,6 +96,19 @@ function excludeTypes(req: Request, items: JellyfinItem[]): JellyfinItem[] {
   return excluded.size
     ? items.filter((i) => !excluded.has(String(i.Type).toLowerCase()))
     : items;
+}
+
+/** Undefined without Fields: Jellyfin's single-item route takes none and always sends MediaSources. */
+function wantsVersions(req: Request): boolean | undefined {
+  const fields = qlist(req, 'Fields');
+  if (!fields.length) return undefined;
+  return fields.some((f) => f.toLowerCase() === 'mediasources');
+}
+
+/** Jellyfin's SortOrder, when a request gives one. */
+function sortDescending(req: Request): boolean | undefined {
+  const order = qs(req, 'SortOrder');
+  return order ? order.toLowerCase().startsWith('desc') : undefined;
 }
 
 function filterByType(
@@ -128,7 +164,7 @@ async function viewsForTypes(
   if (!kinds) return views;
   // A collection is a movie-typed meta, so a boxset row would otherwise pull in
   // every movie catalog and filter it away item by item.
-  const boxsetOnly = !!types && types.size === 1 && types.has('boxset');
+  const boxsetOnly = isBoxsetOnly(types);
   const evidence = await Promise.all(
     views.map((v) => knownCatalogKinds(ctx.userData, v.catalog))
   );
@@ -198,10 +234,12 @@ function pageFilter(
   const excluded = excludedTypes(req);
   const userFiltered = hasUserFilters(req);
   return async (previews) => {
+    const evidence = await ctx.leafEvidence();
     const byType = previews.filter((p) => {
       const type = contentItemType(
         p.type,
-        isBoxsetEntry(p, opts.catalog)
+        isBoxsetEntry(p, opts.catalog),
+        isLeafEntry(p, evidence)
       ).toLowerCase();
       return (!types || types.has(type)) && !excluded.has(type);
     });
@@ -219,20 +257,22 @@ function applyUserFilters(req: Request, items: JellyfinItem[]): JellyfinItem[] {
   const isPlayed = qb(req, 'IsPlayed');
   const isFavorite = qb(req, 'IsFavorite');
   const ud = (i: JellyfinItem) =>
-    i.UserData as {
-      Played: boolean;
-      IsFavorite: boolean;
-      PlaybackPositionTicks: number;
-    };
+    i.UserData as
+      | {
+          Played: boolean;
+          IsFavorite: boolean;
+          PlaybackPositionTicks: number;
+        }
+      | undefined;
   let out = items;
   if (filters.includes('isplayed') || isPlayed === true)
-    out = out.filter((i) => ud(i).Played);
+    out = out.filter((i) => ud(i)?.Played);
   if (filters.includes('isunplayed') || isPlayed === false)
-    out = out.filter((i) => !ud(i).Played);
+    out = out.filter((i) => !ud(i)?.Played);
   if (filters.includes('isfavorite') || isFavorite === true)
-    out = out.filter((i) => ud(i).IsFavorite);
+    out = out.filter((i) => ud(i)?.IsFavorite);
   if (filters.includes('isresumable'))
-    out = out.filter((i) => ud(i).PlaybackPositionTicks > 0);
+    out = out.filter((i) => (ud(i)?.PlaybackPositionTicks ?? 0) > 0);
   return out;
 }
 
@@ -272,15 +312,16 @@ function send(
   total?: number,
   startIndex = 0
 ) {
+  if (req.jf) rememberListMarkers(req.jf, items);
   const out = items.map(stripInternal);
   res.json(listResult(out, wantsTotal(req) ? total : out.length, startIndex));
 }
 
 /** Rows in flight while building a shelf; each one costs a meta lookup. */
-const ROW_CONCURRENCY = 6;
+export const ROW_CONCURRENCY = 6;
 
 /** Runs `fn` over `items` with a few in flight, keeping the input order. */
-async function mapLimited<T, R>(
+export async function mapLimited<T, R>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<R>
@@ -294,6 +335,16 @@ async function mapLimited<T, R>(
       }
     })
   );
+  return out;
+}
+
+async function take<T>(source: AsyncIterator<T>, n: number): Promise<T[]> {
+  const out: T[] = [];
+  while (out.length < n) {
+    const next = await source.next();
+    if (next.done) break;
+    out.push(next.value);
+  }
   return out;
 }
 
@@ -397,20 +448,32 @@ async function handleItems(
   const wantsResumable = filters.includes('isresumable');
   const recursive = qb(req, 'Recursive') ?? false;
   const personIds = qlist(req, 'PersonIds');
-  const engine = await ctx.engine();
 
   if (ids.length) {
-    // One id is a detail fetch and must resolve; several are a metadata
-    // lookup filling a row, where resolving would run the stream pipeline
-    // once per id.
-    const resolve = ids.length === 1 ? undefined : false;
+    // Resolving runs the stream pipeline, so a lookup of several ids never does.
+    const resolve = ids.length === 1 && (wantsVersions(req) ?? false);
     const built = await mapLimited(ids.slice(0, 200), ROW_CONCURRENCY, (id) =>
-      itemForId(req, ctx, id, { resolve }).catch(() => null)
+      itemForId(req, ctx, id, { resolve, listed: true }).catch(() => null)
     );
-    const items = built.filter((item): item is JellyfinItem => !!item);
-    send(req, res, filterByType(items, types), items.length, 0);
+    const items = applySort(
+      req,
+      excludeTypes(
+        req,
+        applyUserFilters(
+          req,
+          filterByType(
+            built.filter((item): item is JellyfinItem => !!item),
+            types
+          )
+        )
+      )
+    );
+    const end = qs(req, 'Limit') ? startIndex + limit : items.length;
+    send(req, res, items.slice(startIndex, end), items.length, startIndex);
     return;
   }
+
+  const engine = await ctx.engine();
 
   const parent = parentId ? await decodeForRequest(ctx, parentId) : null;
   const pd = parent?.kind === 'descriptor' ? parent.descriptor : null;
@@ -418,7 +481,7 @@ async function handleItems(
   // A collection meta is a BoxSet whatever type it is served as.
   const collectionParent =
     pd?.k === 'series'
-      ? !!(await getMetaLoose(ctx, pd.t, pd.i).catch(() => null))?.collection
+      ? !!(await getMeta(ctx, pd.t, pd.i).catch(() => null))?.collection
       : false;
   if (pd?.k === 'series' && !collectionParent) {
     if (types?.has('episode') || recursive) {
@@ -465,7 +528,7 @@ async function handleItems(
     (pd?.k === 'movie' && !pd.p) ||
     (pd?.k === 'series' && collectionParent)
   ) {
-    const meta = await getMetaLoose(ctx, pd.t, pd.i).catch(() => null);
+    const meta = await getMeta(ctx, pd.t, pd.i).catch(() => null);
     if (meta?.collection) {
       const page = await collectionMembers(engine, meta, {
         startIndex,
@@ -473,6 +536,8 @@ async function handleItems(
         exactTotal: isKodi(ctx) && wantsTotal(req),
         cursorKey: `${ctx.scope()}|${filterShape(req, types)}|${pd.t}|${pd.i}`,
         select: pageFilter(req, ctx, types, { parentId }),
+        kinds: searchKindsFor(types),
+        collectionsOnly: isBoxsetOnly(types),
       });
       const items = await itemsFromPreviews(ctx, page.items, { parentId });
       send(req, res, applySort(req, items), page.total, startIndex);
@@ -499,6 +564,26 @@ async function handleItems(
       if (p?.kind === 'descriptor' && p.descriptor.k === 'person')
         name = p.descriptor.n;
     }
+    const found = name ? await findPerson(ctx.userData, name) : null;
+    if (found) {
+      const kinds = types
+        ? (['movie', 'series'] as FilmographyKind[]).filter((k) => types.has(k))
+        : undefined;
+      const credits = sortCredits(
+        filmographyCredits(found.person, kinds),
+        qlist(req, 'SortBy'),
+        sortDescending(req)
+      );
+      const previews = await titlePreviews(
+        engine,
+        found.tmdb,
+        credits.slice(startIndex, startIndex + limit)
+      );
+      const items = await itemsFromPreviews(ctx, previews);
+      send(req, res, excludeTypes(req, items), credits.length, startIndex);
+      return;
+    }
+    // Without TMDB, a search for the name finds what it can.
     const previews = name ? await searchCatalogs(engine, name, limit) : [];
     const items = filterByType(await itemsFromPreviews(ctx, previews), types);
     send(req, res, items, items.length, 0);
@@ -508,6 +593,29 @@ async function handleItems(
   // Watch state is keyed by content identity and cannot say which catalog an
   // item came from, so only unscoped lists come from the provider; a scoped
   // request falls through to that catalog's page, where the filter is exact.
+  // A library's episodes by air date, as a calendar asks for them, are the
+  // episodes of the shows followed, with the watchlisted films when it asks
+  // for films too.
+  const minPremiere = Date.parse(qs(req, 'MinPremiereDate') ?? '');
+  const maxPremiere = Date.parse(qs(req, 'MaxPremiereDate') ?? '');
+  if (
+    !parentId &&
+    types?.has('episode') &&
+    (Number.isFinite(minPremiere) || Number.isFinite(maxPremiere))
+  ) {
+    refreshWatchState(ctx);
+    const items = await airingItems(
+      ctx,
+      Number.isFinite(minPremiere) ? minPremiere : 0,
+      Number.isFinite(maxPremiere) ? maxPremiere : Infinity,
+      types.has('movie')
+    );
+    const pageEnd =
+      startIndex + Math.min(Math.max(1, qi(req, 'Limit', 500)), 500);
+    send(req, res, items.slice(startIndex, pageEnd), items.length, startIndex);
+    return;
+  }
+
   if ((wantsFavorites || wantsPlayed || wantsResumable) && !parentId) {
     refreshWatchState(ctx);
     const provider = getWatchStateProvider();
@@ -548,17 +656,26 @@ async function handleItems(
     catalogDesc = pd;
     genreFromId = pd.g;
   }
-  if (!catalogDesc && genreIds.length) {
+  if (genreIds.length && pd?.k !== 'genre') {
     const g = await decodeForRequest(ctx, genreIds[0]);
-    if (g?.kind === 'descriptor' && g.descriptor.k === 'genre') {
-      genreFromId = g.descriptor.g;
-      if (g.descriptor.c) catalogDesc = g.descriptor;
+    const d = g?.kind === 'descriptor' ? g.descriptor : null;
+    // Jellyfin clients filter a library by its genre this way.
+    if (
+      d?.k === 'genre' &&
+      (!catalogDesc || (d.t === catalogDesc.t && d.c === catalogDesc.c))
+    ) {
+      genreFromId = d.g;
+      if (d.c) catalogDesc = d;
     }
   }
 
   if (catalogDesc) {
     const catalog = findCatalog(engine, catalogDesc.t, catalogDesc.c);
-    if (!catalog || !catalogCanList(types)) {
+    if (
+      !catalog ||
+      !catalogCanList(types) ||
+      (requiresGenre(catalog) && !genreFromId && !searchTerm)
+    ) {
       send(req, res, [], 0, startIndex);
       return;
     }
@@ -636,7 +753,9 @@ async function handleItems(
     send(req, res, [], 0, startIndex);
     return;
   }
-  const views = await viewsForTypes(ctx, await ctx.views(), types);
+  const views = withoutRequiredGenre(
+    await viewsForTypes(ctx, await ctx.views(), types)
+  );
   const want = startIndex + limit;
   const items: JellyfinItem[] = [];
   let offset = 0;
@@ -684,7 +803,7 @@ router.get(
       const d = await decodeForRequest(ctx, parentId);
       if (d?.kind === 'descriptor' && d.descriptor.k === 'view') {
         const catalog = findCatalog(engine, d.descriptor.t, d.descriptor.c);
-        if (catalog) {
+        if (catalog && !requiresGenre(catalog)) {
           const page = await getCatalogPage(engine, catalog, {
             startIndex: 0,
             limit,
@@ -696,7 +815,9 @@ router.get(
         }
       }
     } else {
-      const views = await viewsForTypes(ctx, await ctx.views(), types);
+      const views = withoutRequiredGenre(
+        await viewsForTypes(ctx, await ctx.views(), types)
+      );
       const per = Math.max(4, Math.ceil(limit / Math.max(1, views.length)));
       const pageAt = readAhead(views.length, (i) =>
         getCatalogPage(engine, views[i].catalog, {
@@ -721,7 +842,9 @@ router.get(
         if (items.length >= limit) break;
       }
     }
-    res.json(filterByType(items, types).slice(0, limit).map(stripInternal));
+    const latest = filterByType(items, types).slice(0, limit);
+    rememberListMarkers(ctx, latest);
+    res.json(latest.map(stripInternal));
   })
 );
 
@@ -764,6 +887,9 @@ router.get(
   })
 );
 
+/** How many of the most recently watched shows Next Up looks through. */
+const NEXT_UP_SHOWS = 200;
+
 router.get(
   '/Shows/NextUp',
   jf(async (req, res, ctx) => {
@@ -791,35 +917,38 @@ router.get(
             (b.season ?? 0) - (a.season ?? 0) ||
             (b.episode ?? 0) - (a.episode ?? 0)
         );
-        const next = await nextUpForSeries(ctx, d.descriptor, rows[0], {
+        // Anchored on the last episode watched, as the shelf is; a row left by
+        // an unmarked episode or a favourite says nothing about progress.
+        const last = rows.find((r) => r.played || r.positionMs > 0);
+        const next = await nextUpForSeries(ctx, d.descriptor, last, {
           includeResumable,
         });
         if (next) items.push(next);
       }
     } else {
-      const recent = await provider.listRecentSeries(ctx.watch, limit * 2);
+      const recent = provider.recentSeries(ctx.watch, limit * 4);
       /* One show can sit under several series keys; see `itemsFromRows`. */
       const shown = new Set<string>();
       // Reaching the limit mid-batch wastes at most the rest of that batch.
       for (
-        let i = 0;
-        i < recent.length && items.length < limit;
-        i += ROW_CONCURRENCY
+        let checked = 0;
+        items.length < limit && checked < NEXT_UP_SHOWS;
+        checked += ROW_CONCURRENCY
       ) {
-        const batch = await mapLimited(
-          recent.slice(i, i + ROW_CONCURRENCY),
-          ROW_CONCURRENCY,
-          (row) =>
-            nextUpForSeries(
-              ctx,
-              {
-                t: row.mediaType,
-                i: seriesIdOf(row.baseId, row.videoId, row.mediaType),
-              },
-              row,
-              { includeResumable }
-            ).catch(() => null)
-        );
+        const rows = await take(recent, ROW_CONCURRENCY);
+        if (!rows.length) break;
+        const batch = await mapLimited(rows, ROW_CONCURRENCY, async (row) => {
+          const d = {
+            t: row.mediaType,
+            i: seriesIdOf(row.baseId, row.videoId, row.mediaType),
+          };
+          // A part-played anchor can still come back to resume.
+          if (row.played && (await caughtUpOn(ctx, d).catch(() => false)))
+            return null;
+          return nextUpForSeries(ctx, d, row, { includeResumable }).catch(
+            () => null
+          );
+        });
         for (const next of batch) {
           if (items.length >= limit) break;
           if (!next || (next.UserData as { Played: boolean }).Played) continue;
@@ -835,30 +964,192 @@ router.get(
 );
 
 const UPCOMING_SERIES = 60;
+/** How many watchlisted shows, and films, are looked at, newest first. */
+const UPCOMING_WATCHLIST = 100;
 const UPCOMING_CONCURRENCY = 4;
 const DAY_MS = 86_400_000;
+/** How far back a range may reach: the whole grid of the month before the current one. */
+const DATED_PAST_DAYS = 75;
+const DATED_FUTURE_DAYS = 365;
+const DATED_TTL = 6 * 60 * 60;
+
+/* One show's episodes that air near now, so a range reads no meta while it lasts. */
+const datedEpisodes = Cache.getInstance<string, JellyfinItem[]>(
+  'jellyfin-dated-episodes',
+  20_000
+);
 
 function premiereOf(item: JellyfinItem): number {
   const at = Date.parse(String(item.PremiereDate ?? ''));
   return Number.isFinite(at) ? at : Number.MAX_SAFE_INTEGER;
 }
 
-async function upcomingForSeries(
+async function datedForSeries(
   ctx: JellyfinRequestContext,
   row: WatchStateRow,
-  now: number,
-  horizon: number
+  now: number
 ): Promise<JellyfinItem[]> {
-  const res = await episodesForSeries(ctx, {
+  const d = {
     t: row.mediaType,
     i: seriesIdOf(row.baseId, row.videoId, row.mediaType),
-  });
+  };
+  const key = `${ctx.scope()}|${d.t}|${d.i}`;
+  const cached = await datedEpisodes.get(key).catch(() => undefined);
+  if (cached) return cached;
+  const res = await episodesForSeries(ctx, d);
   if (!res) return [];
-  return res.episodes.filter((e) => {
-    if (e.ParentIndexNumber === 0) return false;
+  const from = now - DATED_PAST_DAYS * DAY_MS;
+  const to = now + DATED_FUTURE_DAYS * DAY_MS;
+  const dated = res.episodes.filter((e) => {
     const at = premiereOf(e);
-    return at >= now && at <= horizon;
+    return e.ParentIndexNumber !== 0 && at >= from && at <= to;
   });
+  void datedEpisodes.set(key, dated, DATED_TTL).catch(() => undefined);
+  return dated;
+}
+
+/* A film that premieres near now, so a range reads no meta while it lasts. */
+const datedFilms = Cache.getInstance<string, JellyfinItem[]>(
+  'jellyfin-dated-films',
+  20_000
+);
+
+async function datedFilm(
+  ctx: JellyfinRequestContext,
+  row: WatchStateRow,
+  now: number
+): Promise<JellyfinItem[]> {
+  const d = { k: 'movie' as const, t: row.mediaType, i: row.baseId };
+  const key = `${ctx.scope()}|${d.t}|${d.i}`;
+  const cached = await datedFilms.get(key).catch(() => undefined);
+  if (cached) return cached;
+  const item = await itemFromDescriptor(ctx, d);
+  const at = item ? premiereOf(item) : 0;
+  const dated =
+    item?.Type === 'Movie' &&
+    at >= now - DATED_PAST_DAYS * DAY_MS &&
+    at <= now + DATED_FUTURE_DAYS * DAY_MS
+      ? [item]
+      : [];
+  void datedFilms.set(key, dated, DATED_TTL).catch(() => undefined);
+  return dated;
+}
+
+/** The shows and films Upcoming and the calendar follow. */
+async function followed(
+  ctx: JellyfinRequestContext
+): Promise<{ shows: WatchStateRow[]; films: WatchStateRow[] }> {
+  const provider = getWatchStateProvider();
+  const [recent, listed] = await Promise.all([
+    provider.listRecentSeries(ctx.watch, UPCOMING_SERIES),
+    provider.listFavorites(ctx.watch),
+  ]);
+  const showKey = (row: WatchStateRow) =>
+    `${row.mediaType}|${seriesIdOf(row.baseId, row.videoId, row.mediaType)}`;
+  const watching = new Set(recent.map(showKey));
+  return {
+    shows: [
+      ...recent,
+      ...listed
+        .filter(
+          (row) =>
+            row.kind === 'series' && !row.dropped && !watching.has(showKey(row))
+        )
+        .slice(0, UPCOMING_WATCHLIST),
+    ],
+    films: listed
+      .filter((row) => row.kind === 'movie' && !row.played)
+      .slice(0, UPCOMING_WATCHLIST),
+  };
+}
+
+/**
+ * Episodes of the shows followed that air between two times, aired ones
+ * included, and with `films` the watchlisted films premiering then, soonest
+ * first, with the user's own state.
+ */
+async function airingItems(
+  ctx: JellyfinRequestContext,
+  from: number,
+  to: number,
+  films: boolean
+): Promise<JellyfinItem[]> {
+  const follows = await followed(ctx);
+  const now = Date.now();
+  const [dated, premieres] = await Promise.all([
+    mapLimited(follows.shows, UPCOMING_CONCURRENCY, (row) =>
+      datedForSeries(ctx, row, now).catch(() => [])
+    ),
+    films
+      ? mapLimited(follows.films, UPCOMING_CONCURRENCY, (row) =>
+          datedFilm(ctx, row, now).catch(() => [])
+        )
+      : [],
+  ]);
+  const items: JellyfinItem[] = [];
+  const seen = new Set<string>();
+  for (const item of [...dated.flat(), ...premieres.flat()]) {
+    const at = premiereOf(item);
+    if (seen.has(item.Id) || at < from || at > to) continue;
+    seen.add(item.Id);
+    // Copied and reset: users of one configuration share the cached items.
+    items.push({ ...item, UserData: defaultUserData(item.Id) });
+  }
+  const withState = await attachUserData(ctx, items);
+  return withState.sort((a, b) => premiereOf(a) - premiereOf(b));
+}
+
+/**
+ * The next episode of each show caught up on, watched or watchlisted, where it
+ * airs before `to`, and watchlisted films that premiere by then, soonest first.
+ */
+async function upcomingItems(
+  ctx: JellyfinRequestContext,
+  to: number
+): Promise<JellyfinItem[]> {
+  const now = Date.now();
+  const [{ shows, films }, timed] = await Promise.all([
+    followed(ctx),
+    showsAiringBetween(ctx.watch, now, to),
+  ]);
+  const airsSoon = (e: JellyfinItem) => {
+    const at = premiereOf(e);
+    return at > now && at <= to;
+  };
+  const trackerTimed = (row: WatchStateRow) =>
+    [
+      row.seriesKey,
+      row.matchKey && seriesKeyOfMatch(row.matchKey, row.mediaType),
+    ].some((key) => !!key && timed.has(key));
+  const nexts = await mapLimited(shows, UPCOMING_CONCURRENCY, async (row) => {
+    // The cached dates rule most shows out before their episodes are read,
+    // unless a tracker times one, which an undated new season needs.
+    const dated = await datedForSeries(ctx, row, now).catch(() => []);
+    if (!dated.some(airsSoon) && !trackerTimed(row)) return null;
+    const d = {
+      t: row.mediaType,
+      i: seriesIdOf(row.baseId, row.videoId, row.mediaType),
+    };
+    return nextToAir(ctx, d, row).catch(() => null);
+  });
+  const premieres = await mapLimited(films, UPCOMING_CONCURRENCY, (row) =>
+    datedFilm(ctx, row, now).catch(() => [])
+  );
+  const items: JellyfinItem[] = [];
+  const shown = new Set<string>();
+  for (const next of nexts) {
+    if (!next || !airsSoon(next)) continue;
+    const series = String(next.SeriesId ?? next.Id);
+    if (shown.has(series)) continue;
+    shown.add(series);
+    items.push(next);
+  }
+  const dated = premieres
+    .flat()
+    .filter(airsSoon)
+    .map((film) => ({ ...film, UserData: defaultUserData(film.Id) }));
+  items.push(...(await attachUserData(ctx, dated)));
+  return items.sort((a, b) => premiereOf(a) - premiereOf(b));
 }
 
 router.get(
@@ -872,37 +1163,16 @@ router.get(
       return;
     }
     refreshWatchState(ctx);
-
-    const recent = await getWatchStateProvider().listRecentSeries(
-      ctx.watch,
-      UPCOMING_SERIES
+    const items = await upcomingItems(
+      ctx,
+      Date.now() + appConfig.jellyfin.upcomingDays * DAY_MS
     );
-    const now = Date.now();
-    const horizon = now + appConfig.jellyfin.upcomingDays * DAY_MS;
-
-    const episodes: JellyfinItem[] = [];
-    const seen = new Set<string>();
-    for (let i = 0; i < recent.length; i += UPCOMING_CONCURRENCY) {
-      const batch = await Promise.all(
-        recent
-          .slice(i, i + UPCOMING_CONCURRENCY)
-          .map((row) =>
-            upcomingForSeries(ctx, row, now, horizon).catch(() => [])
-          )
-      );
-      for (const episode of batch.flat()) {
-        if (seen.has(episode.Id)) continue;
-        seen.add(episode.Id);
-        episodes.push(episode);
-      }
-    }
-    episodes.sort((a, b) => premiereOf(a) - premiereOf(b));
 
     send(
       req,
       res,
-      episodes.slice(startIndex, startIndex + limit),
-      episodes.length,
+      items.slice(startIndex, startIndex + limit),
+      items.length,
       startIndex
     );
   })
@@ -927,25 +1197,30 @@ router.get(
 router.get(
   '/Shows/:seriesId/Episodes',
   jf(async (req, res, ctx) => {
-    const d = await decodeForRequest(ctx, param(req, 'seriesId'));
-    if (
-      d?.kind !== 'descriptor' ||
-      (d.descriptor.k !== 'series' && d.descriptor.k !== 'movie')
-    ) {
+    // Given a season, the path id is ignored, as some clients put the season's id there.
+    const seasonId = qs(req, 'SeasonId');
+    const sd = seasonId ? await decodeForRequest(ctx, seasonId) : null;
+    const fromSeason =
+      sd?.kind === 'descriptor' && sd.descriptor.k === 'season'
+        ? sd.descriptor
+        : undefined;
+    const d = fromSeason
+      ? null
+      : await decodeForRequest(ctx, param(req, 'seriesId'));
+    const show =
+      fromSeason ??
+      (d?.kind === 'descriptor' &&
+      (d.descriptor.k === 'series' || d.descriptor.k === 'movie')
+        ? d.descriptor
+        : undefined);
+    if (!show) {
       res.status(404).json({ Message: 'Series not found' });
       return;
     }
-    let season: number | undefined;
-    const seasonId = qs(req, 'SeasonId');
-    if (seasonId) {
-      const sd = await decodeForRequest(ctx, seasonId);
-      if (sd?.kind === 'descriptor' && sd.descriptor.k === 'season')
-        season = sd.descriptor.s;
-    }
+    let season = fromSeason?.s;
     const seasonNum = qs(req, 'Season');
     if (season == null && seasonNum) season = Number(seasonNum);
-    let eps =
-      (await episodesForSeries(ctx, d.descriptor, season))?.episodes ?? [];
+    let eps = (await episodesForSeries(ctx, show, season))?.episodes ?? [];
     const startItemId = qs(req, 'StartItemId');
     if (startItemId) {
       const idx = eps.findIndex(
@@ -979,7 +1254,9 @@ router.get(
   (req, _res, next) =>
     RESERVED_ITEM_IDS.test(param(req, 'itemId')) ? next('route') : next(),
   jf(async (req, res, ctx) => {
-    const item = await itemForId(req, ctx, param(req, 'itemId'));
+    const item = await itemForId(req, ctx, param(req, 'itemId'), {
+      resolve: wantsVersions(req),
+    });
     if (!item) {
       res.status(404).json({ Message: 'Item not found' });
       return;
@@ -991,10 +1268,9 @@ router.get(
 router.get(
   '/Items/:itemId/Ancestors',
   jf(async (req, res, ctx) => {
-    const d = await decodeForRequest(ctx, param(req, 'itemId'));
+    const desc = await decodeItemForRequest(ctx, param(req, 'itemId'));
     const out: JellyfinItem[] = [];
-    if (d?.kind === 'descriptor') {
-      const desc = d.descriptor;
+    if (desc) {
       if (desc.k === 'episode') {
         const season = await itemFromDescriptor(ctx, {
           k: 'season',
@@ -1036,19 +1312,28 @@ router.get(
     '/Shows/:itemId/Similar',
   ],
   jf(async (req, res, ctx) => {
-    const d = await decodeForRequest(ctx, param(req, 'itemId'));
+    const desc = await decodeItemForRequest(ctx, param(req, 'itemId'));
     const limit = Math.min(Math.max(1, qi(req, 'Limit', 12)), 50);
-    if (
-      d?.kind !== 'descriptor' ||
-      (d.descriptor.k !== 'movie' && d.descriptor.k !== 'series')
-    ) {
+    if (desc?.k !== 'movie' && desc?.k !== 'series') {
       send(req, res, [], 0, 0);
       return;
     }
-    const desc = d.descriptor;
-    const meta = await getMetaLoose(ctx, desc.t, desc.i);
-    const genre = (meta?.genres ?? [])[0];
+    const meta = await getMeta(ctx, desc.t, desc.i);
     const engine = await ctx.engine();
+    // TMDB's picks when it knows the title; else the top of its first genre.
+    const recommended = await recommendedPreviews(
+      engine,
+      ctx.userData,
+      meta ?? { id: desc.i, type: desc.t },
+      desc.k === 'movie' ? 'movie' : 'series',
+      limit
+    );
+    if (recommended) {
+      const items = await itemsFromPreviews(ctx, recommended);
+      send(req, res, items, items.length, 0);
+      return;
+    }
+    const genre = (meta?.genres ?? [])[0];
     if (genre) {
       for (const view of await ctx.views()) {
         if (
@@ -1081,7 +1366,7 @@ router.get(
   jf(async (req, res, ctx) => {
     const limit = Math.min(Math.max(1, qi(req, 'ItemLimit', 8)), 20);
     const engine = await ctx.engine();
-    const views = (await ctx.views())
+    const views = withoutRequiredGenre(await ctx.views())
       .filter((v) => v.collectionType === 'movies')
       .slice(0, 3);
     const out = [];
@@ -1090,13 +1375,13 @@ router.get(
         startIndex: 0,
         limit,
       });
+      const items = await itemsFromPreviews(ctx, page.items, {
+        parentId: view.id,
+        catalog: view.catalog,
+      });
+      rememberListMarkers(ctx, items);
       out.push({
-        Items: (
-          await itemsFromPreviews(ctx, page.items, {
-            parentId: view.id,
-            catalog: view.catalog,
-          })
-        ).map(stripInternal),
+        Items: items.map(stripInternal),
         RecommendationType: 'SimilarToRecentlyPlayed',
         BaselineItemName: view.catalog.name,
         CategoryId: view.id,

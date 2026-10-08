@@ -4,14 +4,14 @@ import { FiCopy, FiKey, FiTrash2 } from 'react-icons/fi';
 import type { UserData } from '@aiostreams/core';
 import { useUserData } from '@/context/userData';
 import { APIError, getJellyfinApiKeyToken } from '@/lib/api';
-import { formatDateTime } from '@/lib/format';
-import { copyToClipboard } from '@/utils/clipboard';
-import { Button, IconButton } from '@/components/ui/button';
-import { TextInput } from '@/components/ui/text-input';
+import { formatDateTime } from '@aiostreams/ui/core/format';
+import { copyToClipboard } from '@aiostreams/ui/utils/clipboard';
+import { Button, IconButton } from '@aiostreams/ui/button';
+import { TextInput } from '@aiostreams/ui/text-input';
 import {
   ConfirmationDialog,
   useConfirmationDialog,
-} from '../shared/confirmation-dialog';
+} from '@aiostreams/ui/shared/confirmation-dialog';
 
 type ApiKey = NonNullable<NonNullable<UserData['jellyfin']>['apiKeys']>[number];
 
@@ -23,8 +23,7 @@ function newKeyId(): string {
 }
 
 export function JellyfinApiKeys({ serverUrl }: { serverUrl: string }) {
-  const { userData, setUserData, uuid, password, encryptedPassword } =
-    useUserData();
+  const { userData, setUserData, uuid, password } = useUserData();
   const keys = userData.jellyfin?.apiKeys ?? [];
   const [name, setName] = useState('');
   const [tokens, setTokens] = useState<Record<string, string>>({});
@@ -65,7 +64,7 @@ export function JellyfinApiKeys({ serverUrl }: { serverUrl: string }) {
       setLoading(key.id);
       try {
         ({ token } = await getJellyfinApiKeyToken(
-          { uuid, password: password || encryptedPassword || null },
+          { uuid, password: password || null },
           key.id
         ));
         setTokens((prev) => ({ ...prev, [key.id]: token }));
@@ -108,8 +107,9 @@ export function JellyfinApiKeys({ serverUrl }: { serverUrl: string }) {
         Give a tool a key and the server address{' '}
         <span className="font-mono text-gray-300">{serverUrl}</span> instead of
         your password. A key acts as the administrator, so it sees every
-        user&apos;s activity and history. Changing your password stops every
-        key; copy them again afterwards.
+        user&apos;s activity and history, though it can&apos;t act as a
+        household user with a PIN. Changing your password stops every key; copy
+        them again afterwards.
       </p>
 
       {keys.length > 0 && (

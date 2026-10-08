@@ -110,6 +110,7 @@ Modifiers are chained with `::`:
 **When accurate media info is available**, `languages` contains audio track languages and `subtitles` contains embedded subtitle languages. This is the case for:
 
 - Debrid results from built-in and service-wrapped addons that have `media_info` from StremThru (crowdsourced/probed via FFmpeg)
+- Files this instance has read with ffprobe, and tracks it has stored or looks up on another instance, matched to any addon's results by info hash or NZB (see [Media info](/configuration/environment-variables#media-info))
 - Torznab/Newznab results from indexers that provide separate audio/subtitle metadata
 - nekoBT results (all results have accurate audio/subtitle info)
 - Torrentio anime results (subtitles field may be populated)
@@ -118,26 +119,33 @@ Modifiers are chained with `::`:
 
 </Callout>
 
+#### Media info
+
+| Variable                    | Type   | Description                                                                                                                                                                                                                |
+| --------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{stream.mediaInfoQuality}` | string | Confidence tier for how the stream's media info (languages, subtitles, audio, etc.) was determined: `probe` (ffprobe-derived: StremThru, stored or looked-up tracks, or this instance's own probes), `indexer`, or `addon` |
+
 #### Tracks
 
 `{stream.audioTracks}` and `{stream.subtitleTracks}` list a stream's probed tracks. Only media info fills them in, so they are empty for streams that were never probed. A track list can't be printed directly: narrow it with `::where`, then either take one field from every track with `::pluck`, or render each track with `::each`. See [Object list modifiers](#object-list-modifiers).
 
 Inside `::each`, the track being rendered is available as `{track.*}`:
 
-| Variable                  | Type    | Tracks   | Description                                                                 |
-| ------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
-| `{track.lang}`            | string  | both     | Language (e.g. `English`)                                                   |
-| `{track.title}`           | string  | both     | The track's name (e.g. `SDH`, `Director's Commentary`)                      |
-| `{track.codec}`           | string  | both     | ffprobe's codec name (e.g. `truehd`, `eac3`, `subrip`, `hdmv_pgs_subtitle`) |
-| `{track.tag}`             | string  | audio    | Audio format as in `audioTags` (e.g. `TrueHD`, `DD+`)                       |
-| `{track.channels}`        | string  | audio    | Channels (e.g. `5.1`)                                                       |
-| `{track.default}`         | boolean | both     | Marked as the default track                                                 |
-| `{track.forced}`          | boolean | subtitle | Forced subtitles                                                            |
-| `{track.hearingImpaired}` | boolean | both     | For the hearing impaired (SDH)                                              |
-| `{track.commentary}`      | boolean | audio    | Commentary track                                                            |
-| `{track.dub}`             | boolean | audio    | Dubbed audio                                                                |
-| `{track.original}`        | boolean | audio    | Original-language audio                                                     |
-| `{track.visualImpaired}`  | boolean | audio    | Audio description                                                           |
+| Variable                  | Type     | Tracks   | Description                                                                 |
+| ------------------------- | -------- | -------- | --------------------------------------------------------------------------- |
+| `{track.lang}`            | string   | both     | Language (e.g. `English`)                                                   |
+| `{track.title}`           | string   | both     | The track's name (e.g. `SDH`, `Director's Commentary`)                      |
+| `{track.codec}`           | string   | both     | ffprobe's codec name (e.g. `truehd`, `eac3`, `subrip`, `hdmv_pgs_subtitle`) |
+| `{track.tags}`            | string[] | audio    | Audio format, then Atmos or DTS:X if present (e.g. `DD+`, `Atmos`)          |
+| `{track.tag}`             | string   | audio    | Deprecated: the first of `{track.tags}`                                     |
+| `{track.channels}`        | string   | audio    | Channels (e.g. `5.1`)                                                       |
+| `{track.default}`         | boolean  | both     | Marked as the default track                                                 |
+| `{track.forced}`          | boolean  | subtitle | Forced subtitles                                                            |
+| `{track.hearingImpaired}` | boolean  | both     | For the hearing impaired (SDH)                                              |
+| `{track.commentary}`      | boolean  | audio    | Commentary track                                                            |
+| `{track.dub}`             | boolean  | audio    | Dubbed audio                                                                |
+| `{track.original}`        | boolean  | audio    | Original-language audio                                                     |
+| `{track.visualImpaired}`  | boolean  | audio    | Audio description                                                           |
 
 The flags are whatever the file itself marks. Many releases only say `SDH` or `Commentary` in the track's title, so `title~sdh` catches more than `hearingImpaired` does.
 
@@ -458,6 +466,8 @@ Patterns chain with the other modifiers as usual:
 | `::join('separator')`   | Join elements with separator                           |
 | `::keep('a', 'b', …)`   | Keep only the listed elements                          |
 | `::remove('a', 'b', …)` | Drop the listed elements                               |
+| `::replace('a', 'b')`   | Replace every element equal to `a` with `b`            |
+| `::unique`              | Drop repeated elements, keeping the first              |
 | `::slice(start, end)`   | Return a section (end is optional)                     |
 | `::length`              | Number of elements                                     |
 | `::first`               | First element                                          |
@@ -470,11 +480,12 @@ Patterns chain with the other modifiers as usual:
 | `::languageCode`        | Each language name/code → its ISO 639 code             |
 | `::languageEmoji`       | Each language name/code → its flag emoji               |
 
-`::keep` and `::remove` compare whole elements, ignoring case, and pair with the `{user.*}` lists:
+`::keep`, `::remove`, `::replace` and `::unique` compare whole elements, ignoring case. `::keep` and `::remove` pair with the `{user.*}` lists, and `::unique` drops the repeats `::replace` can leave behind:
 
 ```
-{stream.audioTags::keep({user.audioTags})::join(', ')}     ->  Atmos
-{stream.languages::remove({user.languages})::join(', ')}   ->  German
+{stream.audioTags::keep({user.audioTags})::join(', ')}               ->  Atmos
+{stream.languages::remove({user.languages})::join(', ')}             ->  German
+{stream.visualTags::replace('HDR10+', 'HDR')::unique::join(' | ')}   ->  HDR | DV
 ```
 
 ### Object List Modifiers
@@ -496,19 +507,19 @@ Each `::where` condition is one of:
 | `field~a\|b` | the field contains one of the values                  |
 | `!…`         | the condition after `!` does not hold, e.g. `!forced` |
 
-Comparisons ignore case. Because every condition must hold on the same item, `::where('lang=English', 'forced')` keeps English forced tracks only. A value may also be a `{field}` reference, so `::where('lang={user.languages}')` keeps the tracks in the languages you configured — see [Referencing a field](#referencing-a-field).
+Comparisons ignore case. Because every condition must hold on the same item, `::where('lang=English', 'forced')` keeps English forced tracks only. A value may also be a `{field}` reference, so `::where('lang={user.languages}')` keeps the tracks in the languages you configured — see [Referencing a field](#referencing-a-field). A list field such as `tags` matches when any of its entries does, so `::where('tags=Atmos')` keeps Atmos tracks, and `::pluck('tags')` gives every entry.
 
 ```
 {stream.subtitleTracks::where('hearingImpaired')::exists["CC"||""]}
 {stream.subtitleTracks::where('forced')::pluck('lang')::languageEmoji::join(' ')}
 {stream.audioTracks::where('commentary')::exists["🎙️"||""]}
 {stream.subtitleTracks::where('title~ubtitle')::length}
-{stream.audioTracks::each("{track.lang::languageCode} {track.tag} {track.channels}")::join(' | ')}
+{stream.audioTracks::each("{track.lang::languageCode} {track.tags::join(' ')} {track.channels}")::join(' | ')}
 
   ->  EN TrueHD 7.1 | EN DD 2.0 | FR DD+ 5.1
 ```
 
-`::each` renders its template once per item. For a track list, the track being rendered is available as `{track.*}` (see [Tracks](#tracks)). All other fields stay available too, and conditionals work inside it. An item that renders only whitespace is left out. Inside the template, quotes need escaping only outside `{…}`, as in conditional branches. `::each` cannot be nested inside another `::each`, and one render allows at most 256 items across all its `::each` calls.
+`::each` renders its template once per item. For a track list, the track being rendered is available as `{track.*}` (see [Tracks](#tracks)). All other fields stay available too, and conditionals work inside it. An item that renders only whitespace is left out, but repeats are kept: two English tracks render `EN` twice, so add `::unique` before `::join` to show it once. Inside the template, quotes need escaping only outside `{…}`, as in conditional branches. `::each` cannot be nested inside another `::each`, and one render allows at most 256 items across all its `::each` calls.
 
 ### Referencing a field
 

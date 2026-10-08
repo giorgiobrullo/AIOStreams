@@ -25,6 +25,7 @@ import { createHash } from 'node:crypto';
 import { appConfig } from '../../utils/index.js';
 import { subscribeToConfig } from '../../config/index.js';
 import { openUsenetStream, usenetStreamEtag } from './stream-session.js';
+import { probesOn, queueEngineProbe } from '../../media-info/play.js';
 import { libraryFileToken, libraryFileName, removeForArr } from './library.js';
 import { encodeUsenetStreamToken } from './tokens.js';
 import { stripNzbExt } from './naming.js';
@@ -253,8 +254,10 @@ function fileNode(
     contentType: mimeForFilename(name),
     body: {
       type: 'stream',
-      open: (range, signal) =>
-        openUsenetStream(token, {
+      open: (range, signal) => {
+        // Repeat reads are deduped by the prober before they reach the db.
+        if (probesOn('shares')) void queueEngineProbe(token, 'shares');
+        return openUsenetStream(token, {
           start: range?.start,
           end: range?.endExclusive,
           suffixLength: range?.suffixLength,
@@ -263,7 +266,8 @@ function fileNode(
           share: true,
         }).catch((err) => {
           throw ShareError.from(err);
-        }),
+        });
+      },
     },
   };
 }
@@ -316,12 +320,27 @@ function byIdFile(
   ]);
 }
 
+/**
+ * The projection is capped to the newest rows, so older entries fall back to
+ * the DB: imported links point here and must outlive the cap.
+ */
+async function byIdLookup(
+  hash: string
+): Promise<UsenetLibraryEntry | undefined> {
+  const hit = (await projection()).byHash.get(hash);
+  if (hit) return hit;
+  const entry = await UsenetLibraryRepository.get(hash);
+  return entry?.nzbUrl && TREE_STATUSES.includes(entry.status)
+    ? entry
+    : undefined;
+}
+
 async function resolveById(
   rest: string[],
   ctx: ShareContext
 ): Promise<ShareNode | undefined> {
   if (rest.length === 0) return byIdRoot(ctx);
-  const entry = (await projection()).byHash.get(rest[0]);
+  const entry = await byIdLookup(rest[0]);
   if (!entry) return undefined;
   if (rest.length === 1) return byIdEntry(entry, ctx);
   const file = entry.files.find(

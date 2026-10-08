@@ -24,33 +24,35 @@ import {
   BiCheckShield,
   BiRefresh,
   BiDotsVerticalRounded,
+  BiScan,
 } from 'react-icons/bi';
-import { Card } from '@/components/ui/card';
-import { Button, IconButton } from '@/components/ui/button';
-import { TextInput } from '@/components/ui/text-input';
-import { Select } from '@/components/ui/select';
-import { Tooltip } from '@/components/ui/tooltip';
+import { Link, useNavigate } from '@tanstack/react-router';
+import { Card } from '@aiostreams/ui/card';
+import { Button, IconButton } from '@aiostreams/ui/button';
+import { TextInput } from '@aiostreams/ui/text-input';
+import { Select } from '@aiostreams/ui/select';
+import { Tooltip } from '@aiostreams/ui/tooltip';
 import {
   DropdownMenu,
   DropdownMenuItem,
   DropdownMenuSeparator,
-} from '@/components/ui/dropdown-menu';
-import { SimpleDropzone } from '@/components/ui/simple-dropzone';
+} from '@aiostreams/ui/dropdown-menu';
+import { SimpleDropzone } from '@aiostreams/ui/simple-dropzone';
 import {
   Pagination,
   PaginationEllipsis,
   PaginationItem,
   PaginationTrigger,
   pageWindow,
-} from '@/components/ui/pagination';
-import { cn } from '@/components/ui/core/styling';
-import { useDebounce } from '@/hooks/debounce';
-import { useMediaQuery } from '@/hooks/media-query';
+} from '@aiostreams/ui/pagination';
+import { cn } from '@aiostreams/ui/core/styling';
+import { useDebounce } from '@aiostreams/ui/hooks/debounce';
+import { useMediaQuery } from '@aiostreams/ui/hooks/media-query';
 import { DashboardQueryBoundary } from '@/components/shared/dashboard-query-boundary';
 import {
   ConfirmationDialog,
   useConfirmationDialog,
-} from '@/components/shared/confirmation-dialog';
+} from '@aiostreams/ui/shared/confirmation-dialog';
 import {
   useUsenetLibrary,
   useUsenetLibraryStream,
@@ -73,7 +75,7 @@ import {
 import { NzbBrowser } from './_components/nzb-browser';
 import { EntryInfoModal } from './_components/entry-info-modal';
 import { SettingsPageHeader } from '../settings/_components/settings-card';
-import { formatBytes } from '@/lib/format';
+import { formatBytes } from '@aiostreams/ui/core/format';
 
 const STATUS_STYLE: Record<LibraryStatus, string> = {
   queued: 'bg-[--subtle] text-[--muted]',
@@ -330,6 +332,7 @@ function EntryActions({
   onDelete: (hash: string) => void;
 }) {
   const playUrl = usePlayUrl();
+  const navigate = useNavigate();
   // Degraded entries are playable: known holes are zero-filled at playback.
   const available = e.status === 'available' || e.status === 'degraded';
   const multiFile = e.files.length > 1;
@@ -409,6 +412,18 @@ function EntryActions({
             Details
           </DropdownMenuItem>
           <DropdownMenuItem
+            onSelect={() =>
+              navigate({
+                to: '/dashboard/media-info',
+                search: { nzb: e.nzbHash },
+              })
+            }
+            disabled={!e.probedFiles}
+          >
+            <BiScan />
+            {e.probedFiles ? 'Media info' : 'No media info yet'}
+          </DropdownMenuItem>
+          <DropdownMenuItem
             onSelect={() => onRequeue([e.nzbHash])}
             disabled={!e.nzbUrl}
           >
@@ -459,6 +474,48 @@ function EntryActions({
   );
 }
 
+/** How many files have probed tracks; links to them unless selecting. */
+function ProbedBadge({
+  entry: e,
+  linked,
+}: {
+  entry: LibraryEntry;
+  linked: boolean;
+}) {
+  const probed = e.probedFiles ?? 0;
+  const of = e.probeableFiles ?? 0;
+  const label = of > 1 ? `${Math.min(probed, of)}/${of} probed` : 'probed';
+  const content = (
+    <>
+      <BiScan className="shrink-0" />
+      {label}
+    </>
+  );
+  const className = 'inline-flex items-center gap-1';
+  return (
+    <Tooltip
+      trigger={
+        linked ? (
+          <Link
+            to="/dashboard/media-info"
+            search={{ nzb: e.nzbHash }}
+            className={cn(
+              className,
+              'transition-colors hover:text-[--foreground]'
+            )}
+          >
+            {content}
+          </Link>
+        ) : (
+          <span className={className}>{content}</span>
+        )
+      }
+    >
+      Track details stored for {probed} file{probed === 1 ? '' : 's'}
+    </Tooltip>
+  );
+}
+
 /**
  * One library entry. `view='grid'` renders a slim vertical card; `view='list'`
  * renders a full-width horizontal row. Both share {@link EntryActions} and the
@@ -504,6 +561,7 @@ function EntryCard({
           {e.hiddenAt ? 'sab · imported' : 'sab'}
         </span>
       )}
+      {!!e.probedFiles && <ProbedBadge entry={e} linked={!selectMode} />}
     </>
   );
   const cardClass = cn(

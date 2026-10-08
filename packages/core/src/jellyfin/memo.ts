@@ -5,6 +5,7 @@ import { getSimpleTextHash } from '../utils/crypto.js';
 import { userScopeKey } from '../utils/user-scope.js';
 import type { UserData } from '../db/schemas.js';
 import type { MemoPointer, PlaybackMemo } from './types.js';
+import { firstWriteOf } from './write-once.js';
 
 /*
  * Long because a client holds credential-less stream URLs for the length of
@@ -14,13 +15,18 @@ import type { MemoPointer, PlaybackMemo } from './types.js';
 export const PLAYBACK_MEMO_TTL = 4 * 60 * 60;
 
 /* ~20 KB per memo, so the cap is low; an eviction costs a re-resolve. */
+const MEMO_CAP = 10_000;
+/* The play session, notices and list markers, beside one pointer per version. */
+const POINTER_SPARE = 5;
+
 const memos = Cache.getInstance<string, PlaybackMemo>(
   'jellyfin-playback',
-  10_000
+  MEMO_CAP
 );
+/* A stream URL names only its source, so a pointer must outlive its memo. */
 const pointers = Cache.getInstance<string, MemoPointer>(
   'jellyfin-playback-ptr',
-  50_000
+  () => MEMO_CAP * (appConfig.jellyfin.maxVersions + POINTER_SPARE)
 );
 
 /**
@@ -48,12 +54,14 @@ export function newPlaySessionId(): string {
 
 export async function writePlaybackMemo(
   memo: PlaybackMemo,
-  scope: string
+  scope: string,
+  persona?: string
 ): Promise<void> {
   const pointer: MemoPointer = {
     uuid: memo.uuid,
     encryptedPassword: memo.encryptedPassword,
     itemId: memo.itemId,
+    persona,
   };
   await Promise.all([
     memos.set(
@@ -62,7 +70,12 @@ export async function writePlaybackMemo(
       PLAYBACK_MEMO_TTL,
       true
     ),
-    pointers.set(`psid:${memo.psid}`, pointer, PLAYBACK_MEMO_TTL, true),
+    pointers.set(
+      `psid:${memo.psid}`,
+      { ...pointer, scope },
+      PLAYBACK_MEMO_TTL,
+      true
+    ),
     ...memo.sources.map((s) =>
       pointers.set(`msid:${s.msid}`, pointer, PLAYBACK_MEMO_TTL, true)
     ),
@@ -77,6 +90,8 @@ export async function writeMemoPointer(
   id: string,
   pointer: MemoPointer
 ): Promise<void> {
+  const key = `ptr:${id}:${pointer.encryptedPassword}:${pointer.persona ?? ''}`;
+  if (!firstWriteOf(key)) return;
   await pointers
     .set(`msid:${id}`, pointer, PLAYBACK_MEMO_TTL, true)
     .catch(() => undefined);

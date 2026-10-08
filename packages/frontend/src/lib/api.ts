@@ -243,6 +243,7 @@ interface CatalogInfo {
   type: string;
   name: string;
   hideable: boolean;
+  genreRequired: boolean;
   searchable: boolean;
   addonName: string;
 }
@@ -888,6 +889,8 @@ export interface WatchStateTracker {
   /** Absent when the addon or the instance does not use that direction. */
   push?: TrackerExchange;
   pull?: TrackerExchange;
+  /** Its address is private and the instance does not connect to those. */
+  refused?: boolean;
 }
 
 export interface WatchStateTrackerOption {
@@ -895,6 +898,8 @@ export interface WatchStateTrackerOption {
   user: string;
   presetId: string;
   addon: string;
+  /** Can be picked for several users. */
+  viewers: boolean;
 }
 
 export interface WatchStateOverview {
@@ -914,14 +919,15 @@ export async function getWatchStateTrackers(credentials: Credentials) {
 export async function approveJellyfinQuickConnect(
   credentials: Credentials,
   code: string,
-  persona?: string
+  persona?: string,
+  pin?: string
 ) {
   return api<{
     approved: boolean;
     device: { name: string; app: string; version: string };
   }>('POST /jellyfin/quickconnect/approve', {
     ...authed(credentials),
-    body: { code, ...(persona ? { persona } : {}) },
+    body: { code, ...(persona ? { persona } : {}), ...(pin ? { pin } : {}) },
   });
 }
 

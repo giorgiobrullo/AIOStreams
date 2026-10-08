@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { Button } from '../../../ui/button';
-import { Modal } from '../../../ui/modal';
-import { Popover } from '../../../ui/popover';
-import { Tooltip } from '../../../ui/tooltip';
-import { Alert } from '../../../ui/alert';
+import { Button } from '@aiostreams/ui/button';
+import { Modal } from '@aiostreams/ui/modal';
+import { Popover } from '@aiostreams/ui/popover';
+import { Tooltip } from '@aiostreams/ui/tooltip';
+import { Alert } from '@aiostreams/ui/alert';
 import MarkdownLite from '../../../shared/markdown-lite';
 import { PlusIcon } from 'lucide-react';
 import * as constants from '../../../../../../core/src/utils/constants';
@@ -44,6 +44,7 @@ export function AddonCard({
                   src={preset.LOGO}
                   alt={preset.NAME}
                   className="w-full h-full object-cover"
+                  referrerPolicy="no-referrer"
                 />
               </div>
             ) : (

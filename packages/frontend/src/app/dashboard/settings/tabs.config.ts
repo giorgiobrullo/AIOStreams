@@ -7,6 +7,7 @@ import {
   BiFolderOpen,
   BiData,
   BiDownload,
+  BiFilm,
   BiGroup,
   BiHistory,
   BiInfoCircle,
@@ -16,6 +17,7 @@ import {
   BiPalette,
   BiPlayCircle,
   BiPlug,
+  BiScan,
   BiShareAlt,
   BiSitemap,
   BiTachometer,
@@ -193,6 +195,20 @@ export const TAB_MANIFEST: Record<string, Omit<TabDef, 'section'>> = {
     order: 140,
     // Poster handling is metadata presentation, and is a single setting.
     sections: ['metadata', 'poster'],
+  },
+  mediaInfo: {
+    label: 'Media Info',
+    icon: BiScan,
+    group: 'Core',
+    order: 145,
+    fieldVisibility: {
+      'mediaInfo.probeOn': { key: 'mediaInfo.probe', equals: true },
+      'mediaInfo.ffprobePath': { key: 'mediaInfo.probe', equals: true },
+      'mediaInfo.playWait': { key: 'mediaInfo.probe', equals: true },
+      'mediaInfo.maxConcurrentProbes': { key: 'mediaInfo.probe', equals: true },
+      'mediaInfo.maxQueuedProbes': { key: 'mediaInfo.probe', equals: true },
+      'mediaInfo.probeTimeout': { key: 'mediaInfo.probe', equals: true },
+    },
   },
   releaseBlocklist: {
     label: 'Blocklists',
@@ -397,9 +413,9 @@ export const TAB_MANIFEST: Record<string, Omit<TabDef, 'section'>> = {
     order: 330,
   },
 
-  // --- ways in other than Stremio -------------------------------------------
+  // --- other apps and services ----------------------------------------------
   jellyfin: {
-    label: 'Jellyfin',
+    label: 'Media server',
     icon: BiTv,
     group: 'Integrations',
     order: 410,
@@ -409,6 +425,12 @@ export const TAB_MANIFEST: Record<string, Omit<TabDef, 'section'>> = {
     icon: BiHistory,
     group: 'Integrations',
     order: 420,
+  },
+  remuxdb: {
+    label: 'RemuxDB',
+    icon: BiFilm,
+    group: 'Integrations',
+    order: 430,
   },
 };
 
