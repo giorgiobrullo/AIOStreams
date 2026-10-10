@@ -17,11 +17,61 @@ import {
   logVariantNotes,
   VARIANT_QUERY_PARAM,
   VARIANT_PATH_PARAM,
+  settingsStore,
+  UserData,
 } from '@aiostreams/core';
+import { createHash } from 'node:crypto';
 import { syncUserDataUrls } from '../utils/syncUserData.js';
 import { buildVariantRequestContext } from '../utils/variant-context.js';
 
 const logger = createLogger('server');
+
+/**
+ * Validated configurations, by the configuration they were validated from.
+ *
+ * Validating runs on every request: it compiles the regexes, test-evaluates every stream
+ * expression and initialises a whole AIOStreams instance on top of the one the route then
+ * initialises again, about 20 ms of a catalog or meta request's 30. What it returns depends only
+ * on the configuration handed to it and on the server settings, so the key is a hash of the
+ * former (after variants, synced URLs and the client's IP are applied) and the settings version,
+ * and a changed configuration is simply another key. The entries expire anyway, as validation
+ * also checks API keys with their services. Each request gets its own copy: routes modify it.
+ */
+const VALIDATED_CONFIG_TTL_MS = 5 * 60 * 1000;
+const VALIDATED_CONFIG_MAX = 100;
+const validatedConfigs = new Map<string, { at: number; config: UserData }>();
+
+async function validateConfigCached(
+  userData: UserData,
+  options: Parameters<typeof validateConfig>[1]
+): Promise<UserData> {
+  let key: string | undefined;
+  try {
+    key = `${settingsStore.currentVersion}:${JSON.stringify(options)}:${createHash('sha256')
+      .update(JSON.stringify(userData))
+      .digest('hex')}`;
+    const hit = validatedConfigs.get(key);
+    if (hit && Date.now() - hit.at < VALIDATED_CONFIG_TTL_MS) {
+      return structuredClone(hit.config);
+    }
+  } catch {
+    key = undefined;
+  }
+
+  const validated = await validateConfig(userData, options);
+  if (key) {
+    try {
+      validatedConfigs.delete(key);
+      validatedConfigs.set(key, { at: Date.now(), config: structuredClone(validated) });
+      while (validatedConfigs.size > VALIDATED_CONFIG_MAX) {
+        validatedConfigs.delete(validatedConfigs.keys().next().value!);
+      }
+    } catch {
+      // A configuration that cannot be copied is validated on every request, as before.
+    }
+  }
+  return validated;
+}
 
 // Valid resources that require authentication
 const VALID_RESOURCES = [
@@ -183,7 +233,7 @@ export const userDataMiddleware = async (
       userData = await syncUserDataUrls(userData);
 
       try {
-        userData = await validateConfig(userData, {
+        userData = await validateConfigCached(userData, {
           skipVariantValidation: true,
           skipErrorsFromAddonsOrProxies: true,
           decryptValues: true,
