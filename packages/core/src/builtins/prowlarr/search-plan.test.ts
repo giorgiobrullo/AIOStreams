@@ -151,8 +151,50 @@ describe('planProwlarrSearches', () => {
       [byImdbAndTvdb, animeTracker],
       options
     );
-    assert.deepEqual(names(anime.textIndexers), ['IdTracker', 'AnimeTracker']);
+    assert.deepEqual(names(anime.textIndexers), ['IdTracker']);
+    assert.deepEqual(names(anime.titleOnlyIndexers), ['AnimeTracker']);
     assert.equal(anime.skipped.length, 0);
+  });
+
+  it('searches anime by TVDB id when its episode is mapped to a TVDB season', () => {
+    const plan = planProwlarrSearches(
+      {
+        mediaType: 'series',
+        tvdbId: 7,
+        season: 1,
+        tvdbSeason: 2,
+        isAnime: true,
+      },
+      all
+    );
+    assert.equal(plan.idSearches.length, 1);
+    assert.equal(plan.idSearches[0].query, '{TvdbId:7}{Season:2}');
+    assert.deepEqual(names(plan.idSearches[0].indexers), ['IdTracker']);
+    assert.deepEqual(names(plan.textIndexers), ['TextTracker']);
+  });
+
+  it('searches anime-only indexers by title alone for a series, not for a movie', () => {
+    const animeTracker = indexer(
+      5,
+      'AnimeTracker',
+      ['q'],
+      ['q', 'season', 'ep']
+    );
+    const options = { animeOnlyIndexers: ['AnimeTracker'] };
+    const series = planProwlarrSearches(
+      { mediaType: 'series', tvdbId: 1, season: 1, isAnime: true },
+      [animeTracker],
+      options
+    );
+    assert.deepEqual(names(series.titleOnlyIndexers), ['AnimeTracker']);
+    assert.equal(series.textIndexers.length, 0);
+    const movie = planProwlarrSearches(
+      { mediaType: 'movie', imdbId: 'tt0000001', isAnime: true },
+      [animeTracker],
+      options
+    );
+    assert.deepEqual(names(movie.textIndexers), ['AnimeTracker']);
+    assert.equal(movie.titleOnlyIndexers.length, 0);
   });
 
   it('does nothing when switched off', () => {

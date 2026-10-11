@@ -229,13 +229,28 @@ export class ProwlarrAddon extends BaseDebridAddon<ProwlarrAddonConfig> {
         `Not searching ${plan.skipped.map((i) => i.name).join(', ')}: they cannot hold this ${parsedId.mediaType}`
       );
     }
+    const queryOptions = {
+      titleLanguages: getTitleLanguagesForUrl(this.userData.url, this.id),
+      keepApostrophes: true,
+    };
     const queries = plan.textIndexers.length
-      ? this.buildQueries(parsedId, metadata, {
-          titleLanguages: getTitleLanguagesForUrl(this.userData.url, this.id),
-          keepApostrophes: true,
-        })
+      ? this.buildQueries(parsedId, metadata, queryOptions)
       : [];
-    if (queries.length === 0 && plan.idSearches.length === 0) {
+    const titleQueries = plan.titleOnlyIndexers.length
+      ? [
+          ...new Set(
+            this.buildQueries(parsedId, metadata, {
+              ...queryOptions,
+              addSeasonEpisode: false,
+            })
+          ),
+        ]
+      : [];
+    if (
+      queries.length === 0 &&
+      titleQueries.length === 0 &&
+      plan.idSearches.length === 0
+    ) {
       return { results: [], privateIndexerIds };
     }
 
@@ -273,6 +288,7 @@ export class ProwlarrAddon extends BaseDebridAddon<ProwlarrAddonConfig> {
     const searchPromises = [
       ...plan.idSearches.map((s) => search(s.type, s.query, s.indexers)),
       ...queries.map((q) => search('search', q, plan.textIndexers)),
+      ...titleQueries.map((q) => search('search', q, plan.titleOnlyIndexers)),
     ];
     const allResults = await Promise.all(searchPromises);
     return { results: allResults.flat(), privateIndexerIds };

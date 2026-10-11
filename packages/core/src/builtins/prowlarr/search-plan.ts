@@ -9,6 +9,11 @@ export interface ProwlarrIdSearch {
 export interface ProwlarrSearchPlan {
   idSearches: ProwlarrIdSearch[];
   textIndexers: ProwlarrApiIndexer[];
+  /**
+   * Anime-only indexers searching anime: by the series' titles alone, not the
+   * season and episode variants (see planProwlarrSearches).
+   */
+  titleOnlyIndexers: ProwlarrApiIndexer[];
   /** Indexers left out because they cannot hold this content. */
   skipped: ProwlarrApiIndexer[];
 }
@@ -41,8 +46,16 @@ export interface ProwlarrSearchPlanOptions {
  * five or six title variants past the addon timeout, and the ID search is also
  * the precise one: a title search for "vikings" returns Vikings: Valhalla too.
  *
- * Anime and date-based shows stay on titles: their episode numbering does not
- * reliably match the indexers' seasons.
+ * Date-based shows stay on titles: their episode numbering does not reliably
+ * match the indexers' seasons. So does anime, unless the metadata maps its
+ * episode to a TVDB season (tvdbSeason), the numbering TVDB-keyed trackers use.
+ *
+ * An anime-only indexer searching anime gets the series' titles alone: AnimeBytes
+ * answers a title with every release of the series and ignores an episode number
+ * ("re monster", "re monster 04" and "re monster S01E04" return the same 857
+ * releases) while "re monster S01" returns none, and each extra query waits out
+ * Prowlarr's 4 s rate limit, which took the anime searches to 8-15 s, past the
+ * addon timeout. One query per title also serves every episode from the cache.
  *
  * Indexers that cannot hold the content are left out instead of being sent the
  * title variants: the anime-only ones (configured, since Prowlarr reports their
@@ -61,11 +74,14 @@ export function planProwlarrSearches(
     target.imdbId && /^tt\d+$/.test(target.imdbId) ? target.imdbId : undefined;
   const tvdbId = target.tvdbId && target.tvdbId > 0 ? target.tvdbId : undefined;
   const seriesById =
-    target.mediaType === 'series' && !target.isAnime && !target.isDateBased;
+    target.mediaType === 'series' &&
+    !target.isDateBased &&
+    (!target.isAnime || target.tvdbSeason !== undefined);
   const tvdbSeason = target.tvdbSeason ?? target.season;
 
   const searches = new Map<string, ProwlarrIdSearch>();
   const textIndexers: ProwlarrApiIndexer[] = [];
+  const titleOnlyIndexers: ProwlarrApiIndexer[] = [];
   const skipped: ProwlarrApiIndexer[] = [];
   const add = (
     type: ProwlarrIdSearch['type'],
@@ -96,6 +112,8 @@ export function planProwlarrSearches(
 
     if ((isAnimeOnly && !target.isAnime) || (params && params.length === 0)) {
       skipped.push(indexer);
+    } else if (isAnimeOnly && target.mediaType === 'series') {
+      titleOnlyIndexers.push(indexer);
     } else if (!idSearch) {
       textIndexers.push(indexer);
     } else if (
@@ -125,5 +143,10 @@ export function planProwlarrSearches(
     }
   }
 
-  return { idSearches: [...searches.values()], textIndexers, skipped };
+  return {
+    idSearches: [...searches.values()],
+    textIndexers,
+    titleOnlyIndexers,
+    skipped,
+  };
 }
