@@ -90,6 +90,17 @@ async function pingStream(
   });
 }
 
+/**
+ * A preload ping is made ahead of playback: an owned playback URL is marked as a prefetch, so its
+ * failover chain starts no download (qBittorrent). Preloading a TorBox stream whose link failed
+ * over to the same release on qBittorrent downloaded a 90 GB private-tracker torrent for a title
+ * nobody played.
+ */
+function withPrefetch(url: string): string {
+  if (!url.includes(PLAYBACK_PATH_PREFIX)) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}${constants.PREFETCH_MARKER}=1`;
+}
+
 async function pingStreamUrls(
   streams: ParsedStream[],
   play: { path: 'stremio' | 'jellyfin'; ids: ContributionIds }
@@ -108,7 +119,7 @@ async function pingStreamUrls(
           const response = await pingStream(
             stream,
             PING_TIMEOUT_MS,
-            withPlayPath(stream.url!, play.path)
+            withPrefetch(withPlayPath(stream.url!, play.path))
           );
           response.body?.cancel().catch(() => undefined);
           const location = response.headers.get('location');
