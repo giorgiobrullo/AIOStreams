@@ -369,8 +369,30 @@ class StreamFetcher {
           resolve();
         };
 
+        // No exit before a short minimum: addons answered from the stream cache come back
+        // within milliseconds (plus their processing), and an exit condition met by the first
+        // of them (e.g. "SeaDex has results") left the rest out. With the cache warm, anime
+        // requests returned 1-2 streams instead of 15-26. Live requests take seconds anyway.
+        const minExitWaitMs = Math.max(
+          0,
+          Number(process.env.DYNAMIC_FETCHING_MIN_WAIT_MS ?? 500) || 0
+        );
+        let minWaitCheckScheduled = false;
+
         const checkExit = async (fromAddonCompletion: boolean) => {
           if (resolved) return;
+          const elapsed = Date.now() - start;
+          if (elapsed < minExitWaitMs) {
+            if (!minWaitCheckScheduled) {
+              minWaitCheckScheduled = true;
+              timeouts.push(
+                setTimeout(() => {
+                  if (!resolved) checkExit(false);
+                }, minExitWaitMs - elapsed)
+              );
+            }
+            return;
+          }
           // If already checking, wait for that check to complete instead of skipping
           if (checkingPromise) {
             await checkingPromise;
