@@ -18,6 +18,7 @@ import {
 } from '../utils/debrid.js';
 import { createQueryLimit, getTitleLanguagesForUrl } from '../utils/general.js';
 import { hashNzbUrl } from '../../debrid/utils.js';
+import { planProwlarrSearches } from './search-plan.js';
 
 export const ProwlarrAddonConfigSchema = BaseDebridConfigSchema.extend({
   url: z.string(),
@@ -207,40 +208,64 @@ export class ProwlarrAddon extends BaseDebridAddon<ProwlarrAddonConfig> {
         .map((i) => i.id)
     );
 
-    const queries = this.buildQueries(parsedId, metadata, {
-      titleLanguages: getTitleLanguagesForUrl(this.userData.url, this.id),
-      keepApostrophes: true,
-    });
-    if (queries.length === 0) {
+    const plan = planProwlarrSearches(
+      {
+        mediaType: parsedId.mediaType,
+        season: metadata.season,
+        tvdbSeason: metadata.tvdbSeason,
+        imdbId: metadata.imdbId,
+        tvdbId: metadata.tvdbId,
+        isAnime: metadata.isAnime,
+        isDateBased: metadata.isDateBased,
+      },
+      chosenIndexers,
+      appConfig.builtins.prowlarr.idSearch
+    );
+    const queries = plan.textIndexers.length
+      ? this.buildQueries(parsedId, metadata, {
+          titleLanguages: getTitleLanguagesForUrl(this.userData.url, this.id),
+          keepApostrophes: true,
+        })
+      : [];
+    if (queries.length === 0 && plan.idSearches.length === 0) {
       return { results: [], privateIndexerIds };
     }
 
     // Pass Newznab categories so Prowlarr only queries indexers that support
     // the content type (e.g. PTP won't receive TV queries).
     const categories =
-      parsedId.mediaType === 'movie' ? [2000] : // Movies (all subcategories)
-      parsedId.mediaType === 'series' ? [5000] : // TV (all subcategories)
-      undefined;
+      parsedId.mediaType === 'movie'
+        ? [2000] // Movies (all subcategories)
+        : parsedId.mediaType === 'series'
+          ? [5000] // TV (all subcategories)
+          : undefined;
 
-    const searchPromises = queries.map((q) =>
+    const search = (
+      type: 'search' | 'movie' | 'tvsearch',
+      query: string,
+      indexers: ProwlarrApiIndexer[]
+    ) =>
       queryLimit(async () => {
         const start = Date.now();
         const data = await this.api.search({
-          query: q,
-          indexerIds: chosenIndexers.map((indexer) => indexer.id),
+          query,
+          indexerIds: indexers.map((indexer) => indexer.id),
           categories,
-          type: 'search',
+          type,
           limit: 2000,
         });
         this.logger.info(
-          `Prowlarr ${protocol} search for ${q} took ${getTimeTakenSincePoint(start)}`,
+          `Prowlarr ${protocol} ${type === 'search' ? 'search' : 'ID search'} for ${query} on ${indexers.map((i) => i.name).join(', ')} took ${getTimeTakenSincePoint(start)}`,
           {
             results: data.length,
           }
         );
         return data;
-      })
-    );
+      });
+    const searchPromises = [
+      ...plan.idSearches.map((s) => search(s.type, s.query, s.indexers)),
+      ...queries.map((q) => search('search', q, plan.textIndexers)),
+    ];
     const allResults = await Promise.all(searchPromises);
     return { results: allResults.flat(), privateIndexerIds };
   }

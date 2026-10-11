@@ -937,6 +937,16 @@ export const builtinsSchema = {
       requiresRestart: false,
       secret: false,
     },
+    idSearch: {
+      schema: z.boolean(),
+      default: true,
+      label: 'Prowlarr ID search',
+      env: 'BUILTIN_PROWLARR_ID_SEARCH',
+      description:
+        'Search the indexers that support IMDb/TVDB IDs once by ID (series by season) instead of by every title variant; the other indexers keep the title search.',
+      requiresRestart: false,
+      secret: false,
+    },
   },
   knaben: {
     defaultTimeout: {

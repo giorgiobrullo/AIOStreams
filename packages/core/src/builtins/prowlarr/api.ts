@@ -47,6 +47,13 @@ const ProwlarrApiIndexerSchema = z.object({
   protocol: z.enum(['torrent', 'usenet']),
   privacy: z.enum(['public', 'private', 'semiPrivate']).optional(),
   tags: z.array(z.number()),
+  // Which IDs the indexer can be searched by (e.g. 'imdbId', 'tvdbId').
+  capabilities: z
+    .object({
+      movieSearchParams: z.array(z.string()).optional(),
+      tvSearchParams: z.array(z.string()).optional(),
+    })
+    .optional(),
 });
 
 export type ProwlarrApiIndexer = z.infer<typeof ProwlarrApiIndexerSchema>;
@@ -90,10 +97,12 @@ class ProwlarrApi {
     ProwlarrApiSearchItem[]
   >('prowlarr-api:search:v2');
 
+  // v3: entries carry the indexers' search capabilities (v2 ones were parsed
+  // without them, so they would keep ID search off until they expired).
   private readonly indexersCache = Cache.getInstance<
     string,
     ProwlarrApiIndexer[]
-  >('prowlarr-api:indexers:v2');
+  >('prowlarr-api:indexers:v3');
 
   private readonly tagsCache = Cache.getInstance<string, ProwlarrApiTagItem[]>(
     'prowlarr-api:tags:v2'
@@ -151,7 +160,8 @@ class ProwlarrApi {
     query: string;
     indexerIds: number[];
     categories?: number[];
-    type: 'search';
+    // 'movie' and 'tvsearch' take ID tokens in the query, e.g. {ImdbId:tt…}.
+    type: 'search' | 'movie' | 'tvsearch';
     limit?: number;
     offset?: number;
   }): Promise<ProwlarrApiSearchItem[]> {
