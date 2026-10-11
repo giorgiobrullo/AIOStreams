@@ -7,6 +7,7 @@ import {
   DebridError,
   decodeFallbackKey,
   decodeFileInfo,
+  decodeStoreAuth,
   describeChainItem,
   getPlayChain,
   parsePlaybackUrl,
@@ -86,7 +87,34 @@ router.get(
       const chain = decodedFbk
         ? await getPlayChain(decodedFbk, clickedType)
         : undefined;
-      const fallbacks = chain?.fallbacks ?? [];
+
+      // Ahead of playback (warming the link, probing): nothing that starts a download. A
+      // warmed TorBox stream that failed over to the same release on qBittorrent made it
+      // download a 90 GB private-tracker torrent for a page nobody played.
+      const isPrefetch = req.query[constants.PREFETCH_MARKER] === '1';
+      const downloads = (serviceId: string | undefined) =>
+        !!serviceId && constants.DOWNLOADING_SERVICES.includes(serviceId);
+      if (isPrefetch) {
+        const clickedService =
+          chain?.clicked?.serviceId ??
+          decodeStoreAuth({
+            encryptedStoreAuth,
+            fileInfoRaw,
+            metadataId,
+            filename,
+          })?.id;
+        if (downloads(clickedService)) {
+          logger.info(
+            { service: clickedService },
+            'not resolving a downloading service for a prefetch'
+          );
+          res.status(409).end();
+          return;
+        }
+      }
+      const fallbacks = (chain?.fallbacks ?? []).filter(
+        (f) => !(isPrefetch && downloads(f.serviceId))
+      );
       const hasFailover = fallbacks.length > 0;
 
       if (!hasFailover && !decodedFbk) {

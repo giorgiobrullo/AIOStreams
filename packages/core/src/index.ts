@@ -95,6 +95,7 @@ export {
   resolveExternalTarget,
   parsePlaybackUrl,
   decodeFileInfo,
+  decodeStoreAuth,
 } from './main/failover.js';
 export type {
   PlaybackTarget,

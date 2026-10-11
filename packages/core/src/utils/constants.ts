@@ -256,6 +256,14 @@ export const DEFAULT_FAILOVER_PREFERRED_GRACE_MS = 2000;
 export const INTERNAL_PROXY_MARKER = 'from_proxy';
 /** Query marker naming the client path a play came from (`jellyfin`). */
 export const PLAY_PATH_MARKER = 'via';
+/**
+ * Query marker (`prefetch=1`) for a request made ahead of playback: a client warming a stream's
+ * link or probing it (Gelato). It must not start a download, so it resolves no service that
+ * downloads the whole torrent to serve it (qBittorrent), neither the item nor a failover to one.
+ */
+export const PREFETCH_MARKER = 'prefetch';
+/** Services that serve a stream by downloading it (see {@link PREFETCH_MARKER}). */
+export const DOWNLOADING_SERVICES: readonly string[] = ['qbittorrent'];
 
 /**
  * Path prefix of an AIOStreams builtin-proxy URL.
