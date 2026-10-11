@@ -9,6 +9,8 @@ export interface ProwlarrIdSearch {
 export interface ProwlarrSearchPlan {
   idSearches: ProwlarrIdSearch[];
   textIndexers: ProwlarrApiIndexer[];
+  /** Indexers left out because they cannot hold this content. */
+  skipped: ProwlarrApiIndexer[];
 }
 
 export interface ProwlarrSearchTarget {
@@ -19,6 +21,13 @@ export interface ProwlarrSearchTarget {
   tvdbId?: number | null;
   isAnime?: boolean;
   isDateBased?: boolean;
+}
+
+export interface ProwlarrSearchPlanOptions {
+  /** Search ID-capable indexers by ID (default true). */
+  idSearch?: boolean;
+  /** Names of indexers that only carry anime (e.g. AnimeBytes). */
+  animeOnlyIndexers?: string[];
 }
 
 /**
@@ -34,14 +43,20 @@ export interface ProwlarrSearchTarget {
  *
  * Anime and date-based shows stay on titles: their episode numbering does not
  * reliably match the indexers' seasons.
+ *
+ * Indexers that cannot hold the content are left out instead of being sent the
+ * title variants: the anime-only ones (configured, since Prowlarr reports their
+ * categories under the same TV parent as any tracker) for anything that is not
+ * anime, and those reporting no search parameters at all for the content type
+ * (a movie-only tracker for a series).
  */
 export function planProwlarrSearches(
   target: ProwlarrSearchTarget,
   indexers: ProwlarrApiIndexer[],
-  enabled = true
+  options: ProwlarrSearchPlanOptions = {}
 ): ProwlarrSearchPlan {
-  if (!enabled) return { idSearches: [], textIndexers: indexers };
-
+  const { idSearch = true, animeOnlyIndexers = [] } = options;
+  const animeOnly = new Set(animeOnlyIndexers.map((n) => n.toLowerCase()));
   const imdbId =
     target.imdbId && /^tt\d+$/.test(target.imdbId) ? target.imdbId : undefined;
   const tvdbId = target.tvdbId && target.tvdbId > 0 ? target.tvdbId : undefined;
@@ -51,6 +66,7 @@ export function planProwlarrSearches(
 
   const searches = new Map<string, ProwlarrIdSearch>();
   const textIndexers: ProwlarrApiIndexer[] = [];
+  const skipped: ProwlarrApiIndexer[] = [];
   const add = (
     type: ProwlarrIdSearch['type'],
     query: string,
@@ -63,10 +79,26 @@ export function planProwlarrSearches(
   };
 
   for (const indexer of indexers) {
-    const movieParams = indexer.capabilities?.movieSearchParams ?? [];
-    const tvParams = indexer.capabilities?.tvSearchParams ?? [];
+    const caps = indexer.capabilities;
+    const movieParams = caps?.movieSearchParams ?? [];
+    const tvParams = caps?.tvSearchParams ?? [];
+    const params =
+      target.mediaType === 'movie'
+        ? caps?.movieSearchParams
+        : target.mediaType === 'series'
+          ? caps?.tvSearchParams
+          : undefined;
+    const isAnimeOnly = [
+      indexer.name,
+      indexer.definitionName,
+      indexer.sortName,
+    ].some((n) => animeOnly.has(n.toLowerCase()));
 
-    if (
+    if ((isAnimeOnly && !target.isAnime) || (params && params.length === 0)) {
+      skipped.push(indexer);
+    } else if (!idSearch) {
+      textIndexers.push(indexer);
+    } else if (
       target.mediaType === 'movie' &&
       imdbId &&
       movieParams.includes('imdbId')
@@ -93,5 +125,5 @@ export function planProwlarrSearches(
     }
   }
 
-  return { idSearches: [...searches.values()], textIndexers };
+  return { idSearches: [...searches.values()], textIndexers, skipped };
 }

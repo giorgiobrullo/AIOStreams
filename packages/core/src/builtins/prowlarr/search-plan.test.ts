@@ -66,8 +66,9 @@ describe('planProwlarrSearches', () => {
       plan.idSearches.map((s) => [s.type, s.query, names(s.indexers)]),
       [['tvsearch', '{TvdbId:12345}{Season:3}', ['IdTracker']]]
     );
-    // a movie-only indexer has no TV parameters, so it stays on titles
-    assert.deepEqual(names(plan.textIndexers), ['MovieTracker', 'TextTracker']);
+    assert.deepEqual(names(plan.textIndexers), ['TextTracker']);
+    // a movie-only indexer reports no TV parameters: it cannot hold a series
+    assert.deepEqual(names(plan.skipped), ['MovieTracker']);
   });
 
   it('uses the TVDB season numbering with the TVDB id', () => {
@@ -99,7 +100,7 @@ describe('planProwlarrSearches', () => {
     ]) {
       const plan = planProwlarrSearches(target, all);
       assert.equal(plan.idSearches.length, 0, JSON.stringify(target));
-      assert.deepEqual(names(plan.textIndexers), names(all));
+      assert.deepEqual(names(plan.textIndexers), ['IdTracker', 'TextTracker']);
     }
   });
 
@@ -121,11 +122,44 @@ describe('planProwlarrSearches', () => {
     assert.deepEqual(names(plan.textIndexers), ['IdTracker']);
   });
 
+  it('leaves anime-only indexers out of everything that is not anime', () => {
+    const animeTracker = indexer(
+      5,
+      'AnimeTracker',
+      ['q'],
+      ['q', 'season', 'ep']
+    );
+    const options = { animeOnlyIndexers: ['animetracker'] };
+    for (const target of [
+      { mediaType: 'movie', imdbId: 'tt0000001' },
+      { mediaType: 'series', tvdbId: 1, season: 1 },
+    ]) {
+      const plan = planProwlarrSearches(
+        target,
+        [byImdbAndTvdb, animeTracker],
+        options
+      );
+      assert.deepEqual(
+        names(plan.skipped),
+        ['AnimeTracker'],
+        JSON.stringify(target)
+      );
+      assert.equal(plan.textIndexers.length, 0);
+    }
+    const anime = planProwlarrSearches(
+      { mediaType: 'series', tvdbId: 1, season: 1, isAnime: true },
+      [byImdbAndTvdb, animeTracker],
+      options
+    );
+    assert.deepEqual(names(anime.textIndexers), ['IdTracker', 'AnimeTracker']);
+    assert.equal(anime.skipped.length, 0);
+  });
+
   it('does nothing when switched off', () => {
     const plan = planProwlarrSearches(
       { mediaType: 'movie', imdbId: 'tt0000001' },
       all,
-      false
+      { idSearch: false }
     );
     assert.equal(plan.idSearches.length, 0);
     assert.deepEqual(names(plan.textIndexers), names(all));

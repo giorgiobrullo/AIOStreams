@@ -947,6 +947,16 @@ export const builtinsSchema = {
       requiresRestart: false,
       secret: false,
     },
+    animeIndexers: {
+      schema: commaSeparatedList,
+      default: [] as string[],
+      label: 'Prowlarr anime-only indexers',
+      env: 'BUILTIN_PROWLARR_ANIME_INDEXERS',
+      description:
+        'Comma-separated Prowlarr indexers that only carry anime (e.g. AnimeBytes): searched for anime only, not for other movies and series.',
+      requiresRestart: false,
+      secret: false,
+    },
   },
   knaben: {
     defaultTimeout: {

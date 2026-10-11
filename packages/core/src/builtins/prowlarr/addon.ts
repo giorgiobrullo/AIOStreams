@@ -219,8 +219,16 @@ export class ProwlarrAddon extends BaseDebridAddon<ProwlarrAddonConfig> {
         isDateBased: metadata.isDateBased,
       },
       chosenIndexers,
-      appConfig.builtins.prowlarr.idSearch
+      {
+        idSearch: appConfig.builtins.prowlarr.idSearch,
+        animeOnlyIndexers: appConfig.builtins.prowlarr.animeIndexers,
+      }
     );
+    if (plan.skipped.length) {
+      this.logger.debug(
+        `Not searching ${plan.skipped.map((i) => i.name).join(', ')}: they cannot hold this ${parsedId.mediaType}`
+      );
+    }
     const queries = plan.textIndexers.length
       ? this.buildQueries(parsedId, metadata, {
           titleLanguages: getTitleLanguagesForUrl(this.userData.url, this.id),
