@@ -258,6 +258,12 @@ export interface FailoverAttempt {
   resolve: (signal?: AbortSignal) => Promise<string | undefined>;
   label?: string;
   /**
+   * The attempt goes through a service that serves a stream by downloading it (qBittorrent):
+   * resolving it starts a download that losing the race does not undo. It is never launched
+   * alongside another attempt, only once every attempt before it has settled.
+   */
+  downloads?: boolean;
+  /**
    * Failover rank. Distinct releases get increasing ranks; same-release
    * variants share their parent's rank. The grace window only holds a result while
    * a STRICTLY-lower-rank attempt is still in flight, meaning a same-rank variant is
@@ -486,6 +492,10 @@ function runParallel(
     function launchNext() {
       if (settled || best !== null) return; // a candidate exists → don't start new attempts
       if (launched >= attempts.length || active >= cfg.parallel) return;
+      // A downloading attempt waits for the others: raced against a debrid link it answered
+      // first (it streams while downloading), won, and downloaded a whole torrent that a
+      // cached debrid link would have served.
+      if (attempts[launched]?.downloads && active > 0) return;
       const i = launched++;
       const controller = new AbortController();
       controllers[i] = controller;

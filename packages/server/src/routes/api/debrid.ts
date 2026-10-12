@@ -196,6 +196,13 @@ router.get(
             : Promise.reject(new Error('unparseable fallback url'));
         };
 
+      // Fallbacks through a downloading service (qBittorrent) last: tried only once the
+      // others have failed, never raced against them (see FailoverAttempt.downloads).
+      const orderedFallbacks = [
+        ...fallbacks.filter((f) => !downloads(f.serviceId)),
+        ...fallbacks.filter((f) => downloads(f.serviceId)),
+      ];
+
       const attempts: FailoverAttempt[] = [
         {
           label: chain?.clicked
@@ -209,11 +216,12 @@ router.get(
               signal
             ),
         },
-        ...fallbacks.map(
+        ...orderedFallbacks.map(
           (f): FailoverAttempt => ({
             label: describeChainItem(f),
             rank: f.rank,
             resolve: resolveTarget(f),
+            downloads: downloads(f.serviceId),
           })
         ),
       ];
@@ -236,7 +244,7 @@ router.get(
               const label = a.label ?? 'unknown';
               // Index 0 is the clicked item, the fallbacks follow in order.
               // Variants are indented under the release they belong to.
-              return i > 0 && fallbacks[i - 1]?.isVariant
+              return i > 0 && orderedFallbacks[i - 1]?.isVariant
                 ? `  ↳ ${label}`
                 : label;
             }),
