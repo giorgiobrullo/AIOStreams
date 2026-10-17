@@ -1,6 +1,7 @@
 ﻿import { DistributedLock } from '../utils/distributed-lock.js';
 import {
   deduplicateTitles,
+  earliestDate,
   Metadata,
   MetadataTitle,
   TitleConflict,
@@ -571,6 +572,7 @@ export class MetadataService {
             // that agree on which episode the request points at.
             let episodeTitles: MetadataTitle[] | undefined;
             let episodeReleased: string | undefined;
+            let episodeEarliestAired: string | undefined;
             let tvdbSeason: number | undefined;
             let tvdbEpisode: number | undefined;
             let episodeYear: number | undefined;
@@ -708,6 +710,17 @@ export class MetadataService {
               ) {
                 episodeReleased = referenceAirDate;
               }
+
+              // one provider running a week late (a double premiere shifts
+              // every later episode on TMDB and Cinemeta) must not hold back
+              // an episode that has aired, so keep the earliest date any of
+              // them gives
+              episodeEarliestAired = earliestDate(
+                cinemetaReleased,
+                tvdbEp?.airDate,
+                skyhookEp?.airDate,
+                tmdbEp?.airDate
+              );
 
               // the mapping's season is wrong often enough that it is only
               // usable when both the episode's air date and the cour's start
@@ -870,6 +883,7 @@ export class MetadataService {
               episodeAirDates: episodeFacts?.episodeAirDates,
               episodeAirDate: episodeFacts?.episodeAirDates?.[0],
               episodeReleased,
+              episodeEarliestAired,
               tvdbSeason,
               tvdbEpisode,
               resolvedSeasonNumber: episodeFacts?.resolvedSeasonNumber,

@@ -1,6 +1,6 @@
 import { ParsedStream, UserData } from '../db/schemas.js';
 import { MetadataService } from '../metadata/service.js';
-import { Metadata } from '../metadata/utils.js';
+import { earliestDate, Metadata } from '../metadata/utils.js';
 import { ReleaseDate, TMDBMetadata } from '../metadata/tmdb.js';
 import {
   AnimeDatabase,
@@ -616,7 +616,10 @@ export class StreamContext {
   private computeAgeInDays(): number | undefined {
     const episodeDate =
       this.type === 'series'
-        ? this._episodeDetails?.airDate || this._metadata?.episodeReleased
+        ? earliestDate(
+            this._episodeDetails?.airDate || this._metadata?.episodeReleased,
+            this._metadata?.episodeEarliestAired
+          )
         : undefined;
     if (episodeDate) {
       return this.getDaysSince(episodeDate);

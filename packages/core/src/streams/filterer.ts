@@ -29,6 +29,7 @@ import { partial_ratio } from 'fuzzball';
 import { formatBitrate, formatBytes } from '../formatters/utils.js';
 import { iso6391ToLanguage, languageToCode } from '../utils/languages.js';
 import { ReleaseDate } from '../metadata/tmdb.js';
+import { earliestDate } from '../metadata/utils.js';
 import { StreamContext, ExtendedMetadata } from './context.js';
 
 const logger = createLogger('filterer');
@@ -644,9 +645,10 @@ class StreamFilterer {
 
       // Episode air date (series/anime only)
       const epDateStr = isSeries
-        ? episodeAirDate ||
-          requestedMetadata?.episodeReleased ||
-          requestedMetadata?.releaseDate
+        ? earliestDate(
+            episodeAirDate || requestedMetadata?.episodeReleased,
+            requestedMetadata?.episodeEarliestAired
+          ) || requestedMetadata?.releaseDate
         : null;
       const epDate =
         epDateStr && !isNaN(new Date(epDateStr).getTime())

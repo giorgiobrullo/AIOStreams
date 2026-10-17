@@ -5,6 +5,20 @@ export interface MetadataTitle {
 }
 
 /**
+ * Returns the earliest of the given dates, skipping missing and unparseable ones.
+ */
+export function earliestDate(
+  ...dates: (string | null | undefined)[]
+): string | undefined {
+  let earliest: string | undefined;
+  for (const date of dates) {
+    if (!date || Number.isNaN(new Date(date).getTime())) continue;
+    if (!earliest || new Date(date) < new Date(earliest)) earliest = date;
+  }
+  return earliest;
+}
+
+/**
  * Deduplicates a list of MetadataTitle entries by title string (case-insensitive).
  * Insertion order of first occurrence is preserved.
  */
@@ -108,6 +122,8 @@ export interface Metadata {
   episodeAirDate?: string;
   /** When the requested episode aired, as the request numbers it. */
   episodeReleased?: string;
+  /** The earliest air date any provider gives the requested episode. */
+  episodeEarliestAired?: string;
   /** The requested episode on TVDB, when TVDB numbers it differently. */
   tvdbSeason?: number;
   tvdbEpisode?: number;
