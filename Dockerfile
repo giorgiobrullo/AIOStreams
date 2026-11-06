@@ -26,8 +26,7 @@ COPY packages/server/package*.json ./packages/server/
 COPY packages/core/package*.json ./packages/core/
 COPY packages/frontend/package*.json ./packages/frontend/
 COPY packages/ui/package*.json ./packages/ui/
-COPY packages/jellyfin-web/package*.json ./packages/jellyfin-web/
-COPY packages/seanime-extensions/package*.json ./packages/seanime-extensions/
+COPY packages/web/package*.json ./packages/web/
 COPY packages/crypto/package*.json ./packages/crypto/
 COPY pnpm-workspace.yaml ./pnpm-workspace.yaml
 COPY pnpm-lock.yaml ./pnpm-lock.yaml
@@ -43,8 +42,7 @@ COPY packages/server ./packages/server
 COPY packages/core ./packages/core
 COPY packages/frontend ./packages/frontend
 COPY packages/ui ./packages/ui
-COPY packages/jellyfin-web ./packages/jellyfin-web
-COPY packages/seanime-extensions ./packages/seanime-extensions
+COPY packages/web ./packages/web
 COPY packages/crypto ./packages/crypto
 COPY scripts ./scripts
 COPY resources ./resources
@@ -59,8 +57,7 @@ RUN rm -rf packages/core/node_modules
 RUN rm -rf packages/server/node_modules
 RUN rm -rf packages/frontend/node_modules
 RUN rm -rf packages/ui/node_modules
-RUN rm -rf packages/jellyfin-web/node_modules
-RUN rm -rf packages/seanime-extensions/node_modules
+RUN rm -rf packages/web/node_modules
 
 RUN pnpm install --prod --frozen-lockfile
 
@@ -83,10 +80,9 @@ COPY --from=builder /build/packages/crypto ./packages/crypto
 
 COPY --from=builder /build/packages/core/dist ./packages/core/dist
 COPY --from=builder /build/packages/frontend/dist ./packages/frontend/dist
-COPY --from=builder /build/packages/jellyfin-web/dist ./packages/jellyfin-web/dist
+COPY --from=builder /build/packages/web/dist ./packages/web/dist
 COPY --from=builder /build/packages/server/dist ./packages/server/dist
 COPY --from=builder /build/packages/server/src/static ./packages/server/dist/static
-COPY --from=builder /build/packages/seanime-extensions/dist ./packages/seanime-extensions/dist
 
 COPY --from=builder /build/resources ./resources
 COPY --from=builder /build/scripts ./scripts
@@ -126,7 +122,7 @@ RUN curl -fsSL -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VER
   && make -j"$(nproc)" ffprobe \
   && strip ffprobe
 
-FROM gcr.io/distroless/nodejs24-debian12 AS production
+FROM gcr.io/distroless/nodejs24-debian13 AS production
 
 LABEL org.opencontainers.image.title="AIOStreams"
 LABEL org.opencontainers.image.source="https://github.com/Viren070/AIOStreams"

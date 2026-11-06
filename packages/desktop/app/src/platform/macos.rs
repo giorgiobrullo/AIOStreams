@@ -8,30 +8,42 @@ use std::ptr::{self, NonNull};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aiostreams_desktop_core::bridge::{Outbound, VideoFrame};
 use aiostreams_desktop_core::mpv::Mpv;
+use aiostreams_desktop_core::playback::Fit;
 use aiostreams_desktop_core::render::RenderContext;
 use dispatch2::DispatchQueue;
 use muda::accelerator::Accelerator;
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use objc2::rc::Retained;
+use objc2::runtime::AnyClass;
 use objc2::{
-    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
 };
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSModalResponseOK, NSOpenPanel, NSView, NSWindow, NSWindowButton,
-    NSWindowOrderingMode,
+    NSAutoresizingMaskOptions, NSEvent, NSModalResponseOK, NSOpenPanel, NSResponder, NSView,
+    NSWindow, NSWindowButton, NSWindowOrderingMode,
 };
-use objc2_core_foundation::{CFString, CFTimeInterval};
+use objc2_core_foundation::{CFString, CFTimeInterval, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::CGColor;
 use objc2_core_video::CVTimeStamp;
-use objc2_foundation::{NSObject, NSString};
+use objc2_foundation::{NSObject, NSPoint, NSRect, NSString};
 use objc2_open_gl::{
     CGLChoosePixelFormat, CGLContextObj, CGLContextParameter, CGLCreateContext, CGLError,
     CGLLockContext, CGLOpenGLProfile, CGLPixelFormatAttribute, CGLPixelFormatObj, CGLRetainContext,
     CGLRetainPixelFormat, CGLSetCurrentContext, CGLSetParameter, CGLUnlockContext,
 };
-use objc2_quartz_core::{CAAutoresizingMask, CALayer, CAOpenGLLayer, CATransaction};
+use objc2_quartz_core::{
+    CAAutoresizingMask, CACornerMask, CALayer, CAMetalLayer, CAOpenGLLayer, CATransaction,
+    kCAContentsFormatRGBA16Float,
+};
 use tao::platform::macos::WindowExtMacOS;
 use tao::window::{Icon, Window};
+
+mod video;
+
+use super::small::{Small, event};
+use video::Output;
 
 /// Custom protocols are served from `<scheme>://localhost` on macOS.
 pub const APP_URL: &str = "aiostreams://localhost/";
@@ -77,45 +89,58 @@ fn frame_target() -> (c_int, c_int, c_int) {
     }
 }
 
-/// A 3.2 core profile, on the discrete GPU only when the system switches to it.
-fn pixel_format() -> Option<CGLPixelFormatObj> {
+/// A 3.2 core profile, 16 float bits a channel where it can, on the discrete
+/// GPU only when the system switches to it. HDR needs the float format: an
+/// 8-bit drawable clips the extended range.
+fn pixel_format() -> Option<(CGLPixelFormatObj, c_int)> {
     let a = |v: CGLPixelFormatAttribute| v;
     let core = CGLPixelFormatAttribute(CGLOpenGLProfile::CGLOGLPVersion_3_2_Core.0);
-    let attempts: [&[CGLPixelFormatAttribute]; 2] = [
-        &[
-            a(CGLPixelFormatAttribute::CGLPFAOpenGLProfile),
-            core,
-            a(CGLPixelFormatAttribute::CGLPFAAccelerated),
-            a(CGLPixelFormatAttribute::CGLPFADoubleBuffer),
-            a(CGLPixelFormatAttribute::CGLPFAAllowOfflineRenderers),
-            a(CGLPixelFormatAttribute::CGLPFASupportsAutomaticGraphicsSwitching),
-            CGLPixelFormatAttribute(0),
-        ],
-        &[
-            a(CGLPixelFormatAttribute::CGLPFAOpenGLProfile),
-            core,
-            a(CGLPixelFormatAttribute::CGLPFADoubleBuffer),
-            CGLPixelFormatAttribute(0),
-        ],
+    let base = [
+        a(CGLPixelFormatAttribute::CGLPFAOpenGLProfile),
+        core,
+        a(CGLPixelFormatAttribute::CGLPFAAccelerated),
+        a(CGLPixelFormatAttribute::CGLPFADoubleBuffer),
+        a(CGLPixelFormatAttribute::CGLPFAAllowOfflineRenderers),
+        a(CGLPixelFormatAttribute::CGLPFASupportsAutomaticGraphicsSwitching),
     ];
-    attempts.iter().find_map(|attribs| {
+    let float = [
+        a(CGLPixelFormatAttribute::CGLPFAColorSize),
+        CGLPixelFormatAttribute(64),
+        a(CGLPixelFormatAttribute::CGLPFAColorFloat),
+    ];
+    let attempts: [(Vec<CGLPixelFormatAttribute>, c_int); 3] = [
+        ([&base[..], &float[..]].concat(), 16),
+        (base.to_vec(), 8),
+        (
+            vec![
+                a(CGLPixelFormatAttribute::CGLPFAOpenGLProfile),
+                core,
+                a(CGLPixelFormatAttribute::CGLPFADoubleBuffer),
+            ],
+            8,
+        ),
+    ];
+    attempts.into_iter().find_map(|(mut attribs, depth)| {
+        attribs.push(CGLPixelFormatAttribute(0));
         let mut format: CGLPixelFormatObj = ptr::null_mut();
         let mut count = 0;
         // SAFETY: a zero-terminated list, and out-pointers to locals.
         let error = unsafe {
             CGLChoosePixelFormat(
-                NonNull::new_unchecked(attribs.as_ptr().cast_mut()),
+                NonNull::new_unchecked(attribs.as_mut_ptr()),
                 NonNull::from(&mut format),
                 NonNull::from(&mut count),
             )
         };
-        (error == CGLError::NoError && !format.is_null()).then_some(format)
+        (error == CGLError::NoError && !format.is_null()).then_some((format, depth))
     })
 }
 
 pub struct LayerIvars {
     format: CGLPixelFormatObj,
     context: CGLContextObj,
+    /// The framebuffer's bits a channel: 16 float where the pixel format allows, else 8.
+    depth: c_int,
     render: RefCell<Option<RenderContext>>,
     mpv: RefCell<Option<Arc<Mpv>>>,
     started: Cell<bool>,
@@ -224,13 +249,229 @@ define_class!(
     }
 );
 
+define_class!(
+    /// mpv's swapchain over MoltenVK presents into this.
+    #[unsafe(super(CAMetalLayer, CALayer, NSObject))]
+    #[name = "AIOStreamsMetalLayer"]
+    pub struct MetalLayer;
+
+    impl MetalLayer {
+        /// MoltenVK shrinks the drawable to 1x1 to finish a presentation, which mpv would size to.
+        #[unsafe(method(setDrawableSize:))]
+        fn set_drawable_size(&self, size: CGSize) {
+            if size.width > 1.0 && size.height > 1.0 {
+                // SAFETY: the superclass's setter, with the same argument.
+                let _: () = unsafe { msg_send![super(self), setDrawableSize: size] };
+            }
+        }
+
+        /// MoltenVK sets this from mpv's thread, and EDR only turns on when set from the main one.
+        #[unsafe(method(setWantsExtendedDynamicRangeContent:))]
+        fn set_wants_edr(&self, on: bool) {
+            if MainThreadMarker::new().is_some() {
+                // SAFETY: the superclass's setter, with the same argument.
+                let _: () =
+                    unsafe { msg_send![super(self), setWantsExtendedDynamicRangeContent: on] };
+                return;
+            }
+            let layer = SendLayer(self.retain());
+            DispatchQueue::main().exec_async(move || {
+                let layer = layer;
+                layer.0.setWantsExtendedDynamicRangeContent(on);
+            });
+        }
+    }
+);
+
+struct SendLayer(Retained<MetalLayer>);
+
+// SAFETY: Core Animation layers may be used from any thread.
+unsafe impl Send for SendLayer {}
+
+impl MetalLayer {
+    fn create() -> Retained<Self> {
+        let this = Self::alloc().set_ivars(());
+        // SAFETY: NSObject's init, on a freshly allocated instance.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// vo_avfoundation's display layer, from AVFoundation, which only this path loads.
+fn sample_buffer_layer() -> Result<Retained<CALayer>, String> {
+    // SAFETY: a system framework, opened by its path.
+    unsafe {
+        libc::dlopen(
+            c"/System/Library/Frameworks/AVFoundation.framework/AVFoundation".as_ptr(),
+            libc::RTLD_LAZY,
+        )
+    };
+    let class = AnyClass::get(c"AVSampleBufferDisplayLayer").ok_or("no AVFoundation")?;
+    // SAFETY: a CALayer subclass, with its plain initializer.
+    Ok(unsafe { msg_send![class, new] })
+}
+
+type OnInput = Box<dyn Fn(Outbound)>;
+
 thread_local! {
     static LAYER: RefCell<Option<Retained<VideoLayer>>> = const { RefCell::new(None) };
+    static VIEW: RefCell<Option<Retained<VideoView>>> = const { RefCell::new(None) };
+    static SMALL: RefCell<Option<Small>> = const { RefCell::new(None) };
+    static GLIDING: Cell<bool> = const { Cell::new(false) };
+    static ON_INPUT: RefCell<Option<OnInput>> = const { RefCell::new(None) };
+}
+
+fn emit(message: Outbound) {
+    ON_INPUT.with_borrow(|on_input| {
+        if let Some(on_input) = on_input {
+            on_input(message);
+        }
+    });
+}
+
+/// In the page's pixels, which run down: the window's points run up.
+fn cursor(e: &NSEvent) -> (f64, f64) {
+    let at = e.locationInWindow();
+    (at.x, -at.y)
+}
+
+fn glide() {
+    let going = SMALL.with_borrow_mut(|small| small.as_mut().is_some_and(Small::step));
+    VIEW.with_borrow(|view| {
+        if let Some(view) = view {
+            view.place();
+        }
+    });
+    if going {
+        video::after(Duration::from_millis(8), glide);
+    } else {
+        GLIDING.set(false);
+    }
+}
+
+pub struct ViewIvars {
+    video: Retained<CALayer>,
+}
+
+define_class!(
+    /// Holds the video's layer, small where the page's mini player leaves room for it, and
+    /// takes clicks and drags on it while it sits over the page.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AIOStreamsVideoView"]
+    #[ivars = ViewIvars]
+    pub struct VideoView;
+
+    impl VideoView {
+        /// Only the small video takes clicks; the page beneath gets the rest.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            // SAFETY: the window's content view, which holds this one.
+            let content = unsafe { self.superview() };
+            let inside = content.is_some_and(|content| {
+                let y = if content.isFlipped() {
+                    point.y
+                } else {
+                    content.bounds().size.height - point.y
+                };
+                SMALL.with_borrow(|small| {
+                    small.as_ref().is_some_and(|s| {
+                        !s.hidden
+                            && (s.at.0..s.at.0 + s.size.0).contains(&point.x)
+                            && (s.at.1..s.at.1 + s.size.1).contains(&y)
+                    })
+                })
+            });
+            inside.then(|| Retained::into_super(self.retain()))
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, e: &NSEvent) {
+            SMALL.with_borrow_mut(|small| {
+                if let Some(small) = small.as_mut() {
+                    small.press(cursor(e));
+                }
+            });
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, e: &NSEvent) {
+            let room = self.bounds().size;
+            let moved = SMALL.with_borrow_mut(|small| {
+                let small = small.as_mut()?;
+                let grabbed = small.drag(cursor(e), (room.width, room.height))?;
+                Some((grabbed, small.at))
+            });
+            let Some((grabbed, at)) = moved else {
+                return;
+            };
+            self.place();
+            if grabbed {
+                emit(event("grabbed", None));
+            }
+            emit(event("moving", Some(at)));
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _e: &NSEvent) {
+            let heard = SMALL.with_borrow_mut(|small| small.as_mut()?.release(true));
+            if let Some(heard) = heard {
+                emit(heard);
+            }
+        }
+    }
+);
+
+impl VideoView {
+    fn create(mtm: MainThreadMarker, frame: NSRect, video: Retained<CALayer>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ViewIvars { video });
+        // SAFETY: NSView's designated initializer, on a freshly allocated instance.
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// The video's layer where the page last placed it, or over the whole view.
+    fn place(&self) {
+        let (Some(holder), video) = (self.layer(), &self.ivars().video) else {
+            return;
+        };
+        let bounds = holder.bounds();
+        let (frame, radii) = SMALL.with_borrow(|small| match small {
+            Some(s) => {
+                // Whichever way the layers above run.
+                let y = if holder.contentsAreFlipped() {
+                    s.at.1
+                } else {
+                    bounds.size.height - s.at.1 - s.size.1
+                };
+                let at = CGRect::new(CGPoint::new(s.at.0, y), CGSize::new(s.size.0, s.size.1));
+                (at, s.radii)
+            }
+            None => (bounds, (0.0, 0.0)),
+        });
+        let top = CACornerMask::LayerMinXMaxYCorner | CACornerMask::LayerMaxXMaxYCorner;
+        let bottom = CACornerMask::LayerMinXMinYCorner | CACornerMask::LayerMaxXMinYCorner;
+        let (top, bottom) = if video.contentsAreFlipped() {
+            (bottom, top)
+        } else {
+            (top, bottom)
+        };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        video.setFrame(frame);
+        video.setCornerRadius(radii.0);
+        video.setMaskedCorners(if radii.1 > 0.0 { top | bottom } else { top });
+        video.setMasksToBounds(radii.0 > 0.0);
+        CATransaction::commit();
+    }
 }
 
 impl VideoLayer {
     fn create() -> Result<Retained<Self>, String> {
-        let format = pixel_format().ok_or("no OpenGL pixel format")?;
+        let (format, depth) = pixel_format().ok_or("no OpenGL pixel format")?;
         let mut context: CGLContextObj = ptr::null_mut();
         // SAFETY: a format CGL just chose, and an out-pointer to a local.
         let error =
@@ -250,6 +491,7 @@ impl VideoLayer {
         let this = Self::alloc().set_ivars(LayerIvars {
             format,
             context,
+            depth,
             render: RefCell::default(),
             mpv: RefCell::default(),
             started: Cell::new(false),
@@ -258,7 +500,12 @@ impl VideoLayer {
             held: Cell::new(Held::new()),
         });
         // SAFETY: NSObject's init, on a freshly allocated instance.
-        Ok(unsafe { msg_send![super(this), init] })
+        let layer: Retained<Self> = unsafe { msg_send![super(this), init] };
+        if depth == 16 {
+            // SAFETY: the static is a valid, constant string.
+            layer.setContentsFormat(unsafe { kCAContentsFormatRGBA16Float });
+        }
+        Ok(layer)
     }
 
     fn start(&self) {
@@ -271,7 +518,14 @@ impl VideoLayer {
         }
         let _lock = ContextLock::new(ivars.context);
         // Advanced control: mpv waits on the main thread, where nothing may block on mpv.
-        match RenderContext::new(mpv, get_proc_address, ptr::null_mut(), None, true) {
+        match RenderContext::new(
+            mpv,
+            get_proc_address,
+            ptr::null_mut(),
+            None,
+            true,
+            ivars.depth,
+        ) {
             Ok(mut render) => {
                 render.on_update(|| {
                     DispatchQueue::main().exec_async(|| {
@@ -346,10 +600,21 @@ impl Drop for ContextLock {
     }
 }
 
-/// A view under the web view whose layer mpv's render API draws into.
+enum Drawn {
+    /// Through the render API.
+    OpenGl(Retained<VideoLayer>),
+    Metal(Retained<MetalLayer>),
+    /// mpv adds its subtitle layer beside this one.
+    SampleBuffer(Retained<CALayer>),
+}
+
+/// A view under the web view, holding the video's layer, or over it where the page's
+/// mini player leaves room.
 pub struct VideoSurface {
-    view: Retained<NSView>,
-    layer: Retained<VideoLayer>,
+    view: Retained<VideoView>,
+    root: Retained<CALayer>,
+    drawn: Drawn,
+    lifted: Cell<bool>,
 }
 
 impl VideoSurface {
@@ -358,46 +623,166 @@ impl VideoSurface {
         // SAFETY: tao's content view, alive as long as the window.
         let content: &NSView = unsafe { &*window.ns_view().cast::<NSView>() };
         let bounds = content.bounds();
-        let view = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+        let sizable =
+            CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable;
+        let (root, drawn) = match video::running() {
+            Output::Compatibility => {
+                let layer = VideoLayer::create()?;
+                layer.setAsynchronous(false);
+                layer.setNeedsDisplayOnBoundsChange(true);
+                LAYER.with(|l| *l.borrow_mut() = Some(layer.clone()));
+                let root = Retained::into_super(Retained::into_super(layer.clone()));
+                (root, Drawn::OpenGl(layer))
+            }
+            Output::Mpv => {
+                let layer = MetalLayer::create();
+                let root = Retained::into_super(Retained::into_super(layer.clone()));
+                (root, Drawn::Metal(layer))
+            }
+            Output::System => {
+                let display = sample_buffer_layer()?;
+                display.setAutoresizingMask(sizable);
+                let root = CALayer::layer();
+                root.setBackgroundColor(Some(&CGColor::new_srgb(0.0, 0.0, 0.0, 1.0)));
+                root.addSublayer(&display);
+                (root, Drawn::SampleBuffer(display))
+            }
+        };
+        root.setContentsScale(window.scale_factor());
+        // The view stays the window's size, so the layer it hosts does too; the video's moves inside it.
+        let holder = CALayer::layer();
+        holder.addSublayer(&root);
+        let view = VideoView::create(mtm, bounds, root.clone());
         view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
-        let layer = VideoLayer::create()?;
-        layer.setAsynchronous(false);
-        layer.setNeedsDisplayOnBoundsChange(true);
-        layer.setAutoresizingMask(
-            CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
-        );
-        layer.setContentsScale(window.scale_factor());
         // A layer-hosting view: the layer is set before the view asks for one.
-        view.setLayer(Some(&layer));
+        view.setLayer(Some(&holder));
         view.setWantsLayer(true);
         content.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, None);
-        LAYER.with(|l| *l.borrow_mut() = Some(layer.clone()));
-        Ok(Self { view, layer })
+        view.place();
+        VIEW.with(|v| *v.borrow_mut() = Some(view.clone()));
+        Ok(Self {
+            view,
+            root,
+            drawn,
+            lifted: Cell::new(false),
+        })
     }
 
     pub fn attach(&self, mpv: Arc<Mpv>) {
-        *self.layer.ivars().mpv.borrow_mut() = Some(mpv);
-        self.layer.start();
+        let edr = match &self.drawn {
+            Drawn::OpenGl(_) | Drawn::Metal(_) => self.root.clone(),
+            Drawn::SampleBuffer(display) => display.clone(),
+        };
+        // Before rendering starts, as it reads mpv's options on this thread.
+        video::attach(edr, Retained::into_super(self.view.clone()), mpv.clone());
+        if let Drawn::OpenGl(layer) = &self.drawn {
+            *layer.ivars().mpv.borrow_mut() = Some(mpv);
+            layer.start();
+        }
     }
 
     /// The render context goes before mpv, with its OpenGL context current.
     pub fn shutdown(&self) {
-        self.layer.stop();
+        if let Drawn::OpenGl(layer) = &self.drawn {
+            layer.stop();
+        }
         LAYER.with(|l| l.borrow_mut().take());
+    }
+
+    /// Hears clicks and drags on the small video, for the page.
+    pub fn on_input(&self, on_input: impl Fn(Outbound) + 'static) {
+        ON_INPUT.set(Some(Box::new(on_input)));
+    }
+
+    /// Over the page in `frame`, in the page's pixels; none puts it back beneath, filling the window.
+    pub fn frame(&self, frame: Option<VideoFrame>, _scale: f64) {
+        let next = frame.map(|frame| SMALL.with_borrow(|last| Small::new(&frame, last.as_ref())));
+        let lifted = next.as_ref().is_some_and(|s| !s.hidden);
+        let gliding = next.as_ref().is_some_and(Small::gliding);
+        SMALL.set(next);
+        // SAFETY: the window's content view, which holds the video's.
+        if lifted != self.lifted.replace(lifted)
+            && let Some(content) = unsafe { self.view.superview() }
+        {
+            let order = if lifted {
+                NSWindowOrderingMode::Above
+            } else {
+                NSWindowOrderingMode::Below
+            };
+            content.addSubview_positioned_relativeTo(&self.view, order, None);
+        }
+        self.fit();
+        if gliding && !GLIDING.replace(true) {
+            glide();
+        }
     }
 
     pub fn resize(&self, width: u32, _height: u32) {
         let bounds = self.view.bounds();
-        self.layer.setFrame(bounds);
+        if let Some(holder) = self.view.layer() {
+            holder.setFrame(bounds);
+        }
         if bounds.size.width > 0.0 {
-            self.layer
+            self.root
                 .setContentsScale(f64::from(width) / bounds.size.width);
         }
-        self.layer.setNeedsDisplay();
+        self.fit();
     }
+
+    /// The video's layer placed, and what draws into it sized to match.
+    fn fit(&self) {
+        self.view.place();
+        let bounds = self.root.bounds();
+        match &self.drawn {
+            Drawn::OpenGl(layer) => layer.setNeedsDisplay(),
+            Drawn::Metal(layer) => {
+                let scale = self.root.contentsScale();
+                layer.setDrawableSize(CGSize::new(
+                    bounds.size.width * scale,
+                    bounds.size.height * scale,
+                ));
+            }
+            Drawn::SampleBuffer(display) => {
+                CATransaction::begin();
+                CATransaction::setDisableActions(true);
+                display.setFrame(bounds);
+                CATransaction::commit();
+            }
+        }
+    }
+
+    pub fn refresh_hdr(&self) {
+        video::refresh();
+    }
+}
+
+/// From any thread.
+pub fn update_hdr(gamma: Option<String>, primaries: Option<String>) {
+    video::update(gamma, primaries);
+}
+
+pub fn load_video_output(data_dir: &Path) {
+    video::load(data_dir);
+}
+
+pub fn video_outputs() -> (Vec<&'static str>, &'static str, &'static str) {
+    video::state()
+}
+
+pub fn choose_video_output(output: &str) {
+    video::choose(output);
+}
+
+pub fn fit_video(fit: Fit) -> Fit {
+    video::fit(fit)
+}
+
+pub fn relaunch() -> bool {
+    video::relaunch();
+    true
 }
 
 /// The bundle's own icon shows in the Dock.
@@ -486,15 +871,42 @@ pub fn install_menu(on_quit: impl Fn() + Send + Sync + 'static) -> Option<Menu> 
 
 const QUIT: &str = "quit";
 
-pub fn mpv_options(_video: &VideoSurface) -> Vec<(&'static str, String)> {
-    vec![
-        ("vo", "libmpv".into()),
-        ("hwdec", "auto-safe".into()),
-        // Frames arrive when due, so drawing one barely waits on the main thread.
-        ("video-timing-offset", "0".into()),
-        // Needs OpenGL 4.4, which macOS lacks, and each try waits on the main thread.
-        ("vd-lavc-dr", "no".into()),
-    ]
+pub fn mpv_options(video: &VideoSurface) -> Vec<(&'static str, String)> {
+    match &video.drawn {
+        Drawn::OpenGl(_) => vec![
+            ("vo", "libmpv".into()),
+            ("hwdec", "auto-safe".into()),
+            // Frames arrive when due, so drawing one barely waits on the main thread.
+            ("video-timing-offset", "0".into()),
+            // Needs OpenGL 4.4, which macOS lacks, and each try waits on the main thread.
+            ("vd-lavc-dr", "no".into()),
+        ],
+        Drawn::Metal(layer) => vec![
+            ("vo", "gpu-next".into()),
+            ("gpu-api", "vulkan".into()),
+            ("gpu-context", "moltenvk".into()),
+            ("wid", wid(layer)),
+            ("hwdec", "auto-safe".into()),
+            // Only read when mpv starts.
+            ("target-colorspace-hint", "yes".into()),
+            ("sub-hdr-peak", video::REFERENCE_WHITE.to_string()),
+            ("image-subs-hdr-peak", video::REFERENCE_WHITE.to_string()),
+        ],
+        Drawn::SampleBuffer(display) => vec![
+            ("vo", "avfoundation".into()),
+            ("wid", wid(display)),
+            // Composited subtitles would take the video through SDR.
+            ("avfoundation-composite-osd", "no".into()),
+            ("hwdec", "videotoolbox".into()),
+            ("hwdec-codecs", "all".into()),
+            ("hwdec-software-fallback", "yes".into()),
+        ],
+    }
+}
+
+/// The layer's address, which mpv draws to; the surface keeps the layer alive.
+fn wid(layer: &CALayer) -> String {
+    (std::ptr::from_ref(layer) as usize).to_string()
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -556,6 +968,19 @@ pub fn choose_program(_window: &Window, title: &str) -> Option<PathBuf> {
         return Some(path.join("Contents/MacOS").join(name));
     }
     Some(path)
+}
+
+pub fn choose_folder(_window: &Window, title: &str) -> Option<PathBuf> {
+    let panel = NSOpenPanel::openPanel(MainThreadMarker::new()?);
+    panel.setCanChooseFiles(false);
+    panel.setCanChooseDirectories(true);
+    panel.setCanCreateDirectories(true);
+    panel.setAllowsMultipleSelection(false);
+    panel.setMessage(Some(&NSString::from_str(title)));
+    if panel.runModal() != NSModalResponseOK {
+        return None;
+    }
+    Some(PathBuf::from(panel.URL()?.path()?.to_string()))
 }
 
 pub fn fatal(message: &str) -> ! {

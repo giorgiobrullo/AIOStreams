@@ -1,5 +1,4 @@
-import { FULL_LANGUAGE_MAPPING } from './language-list.js';
-import { LANGUAGES } from './constants.js';
+import { FULL_LANGUAGE_MAPPING, LANGUAGES } from './language-list.js';
 
 /**
  * Returns the canonical display name for a language entry.
@@ -39,10 +38,13 @@ const LANGUAGE_ALIAS_MAP: Record<string, string> = {
   wel: 'cym',
 };
 
+/** Codes the mapping holds under another language's entry. */
+const SAME_LANGUAGE: Record<string, string> = { fil: 'tgl' };
+
 /** Resolve a deprecated ISO 639-2 alias to its preferred form (lowercased). */
 export function normaliseLangCode(code: string): string {
   const lower = code.toLowerCase().trim();
-  return LANGUAGE_ALIAS_MAP[lower] ?? lower;
+  return LANGUAGE_ALIAS_MAP[lower] ?? SAME_LANGUAGE[lower] ?? lower;
 }
 
 const LANGUAGE_BY_NAME = new Map<string, string>(
@@ -66,6 +68,28 @@ for (const entry of FULL_LANGUAGE_MAPPING) {
     if (!existing || (!existing.flag_priority && entry.flag_priority)) {
       ENTRY_BY_NAME.set(key, entry);
     }
+  }
+}
+
+function indexFirst(
+  index: Map<string, (typeof FULL_LANGUAGE_MAPPING)[number]>,
+  key: string,
+  entry: (typeof FULL_LANGUAGE_MAPPING)[number]
+): void {
+  const existing = index.get(key);
+  if (!existing || (!existing.flag_priority && entry.flag_priority)) {
+    index.set(key, entry);
+  }
+}
+
+/** iso_639_1 code, optionally with a region suffix ("pt-br"), to entry. */
+const CODE_ENTRY_MAP = new Map<string, (typeof FULL_LANGUAGE_MAPPING)[number]>();
+for (const entry of FULL_LANGUAGE_MAPPING) {
+  if (!entry.iso_639_1) continue;
+  const lang = entry.iso_639_1.toLowerCase();
+  indexFirst(CODE_ENTRY_MAP, lang, entry);
+  if (entry.iso_3166_1) {
+    indexFirst(CODE_ENTRY_MAP, `${lang}-${entry.iso_3166_1.toLowerCase()}`, entry);
   }
 }
 
@@ -137,17 +161,12 @@ export function mapLanguageCode(code: string): string {
 /** Convert a BCP 47 code (e.g. "pt-BR") to a LANGUAGES display name. */
 export function convertLangCodeToName(code: string): string | undefined {
   const parts = code.split('-');
-  const possibleLangs = FULL_LANGUAGE_MAPPING.filter((language) => {
-    if (parts.length === 2) {
-      return (
-        language.iso_639_1?.toLowerCase() === parts[0].toLowerCase() &&
-        language.iso_3166_1?.toLowerCase() === parts[1].toLowerCase()
-      );
-    }
-    return language.iso_639_1?.toLowerCase() === parts[0].toLowerCase();
-  });
-  const chosenLang =
-    possibleLangs.find((lang) => lang.flag_priority) || possibleLangs[0];
+  // Only a two-part code matches on region; any other shape matches on its first part.
+  const key =
+    parts.length === 2
+      ? `${parts[0].toLowerCase()}-${parts[1].toLowerCase()}`
+      : parts[0].toLowerCase();
+  const chosenLang = CODE_ENTRY_MAP.get(key);
   if (!chosenLang) return undefined;
   const candidateLang = getLanguageDisplayName(chosenLang);
   return LANGUAGES.includes(candidateLang as any) ? candidateLang : undefined;
@@ -270,6 +289,26 @@ function computeLanguageCode(language: string): string | undefined {
   return selectedLang.iso_639_1?.toUpperCase();
 }
 
+/** Every spelling languageToIso6392 accepts (names, ISO codes), to entry. */
+const ANY_NAME_ENTRY_MAP = new Map<
+  string,
+  (typeof FULL_LANGUAGE_MAPPING)[number]
+>();
+for (const entry of FULL_LANGUAGE_MAPPING) {
+  const keys = new Set(
+    entry.english_name
+      .split(';')
+      .map((name) => name.split('(')[0].trim().toLowerCase())
+  );
+  if (entry.internal_english_name) {
+    keys.add(entry.internal_english_name.toLowerCase());
+  }
+  keys.add(entry.name.toLowerCase());
+  if (entry.iso_639_1) keys.add(entry.iso_639_1.toLowerCase());
+  keys.add(entry.iso_639_2.toLowerCase());
+  for (const key of keys) indexFirst(ANY_NAME_ENTRY_MAP, key, entry);
+}
+
 /**
  * Convert a language display name to a lower-case ISO 639-2 code ("por"),
  * the form Jellyfin clients expect on media streams.
@@ -277,19 +316,7 @@ function computeLanguageCode(language: string): string | undefined {
 export function languageToIso6392(language: string): string | undefined {
   const needle = language.trim().toLowerCase();
   if (!needle) return undefined;
-  const possible = FULL_LANGUAGE_MAPPING.filter(
-    (lang) =>
-      lang.english_name
-        .split(';')
-        .some((name) => name.split('(')[0].trim().toLowerCase() === needle) ||
-      lang.internal_english_name?.toLowerCase() === needle ||
-      lang.name.toLowerCase() === needle ||
-      lang.iso_639_1?.toLowerCase() === needle ||
-      lang.iso_639_2.toLowerCase() === needle
-  );
-  if (!possible.length) return undefined;
-  const selected = possible.find((lang) => lang.flag_priority) ?? possible[0];
-  return selected.iso_639_2.toLowerCase();
+  return ANY_NAME_ENTRY_MAP.get(needle)?.iso_639_2.toLowerCase();
 }
 
 /** Convert an ISO 639-1 code (e.g. "pt") to a display name. */
@@ -322,6 +349,35 @@ export function iso6392ToIso6391(code: string): string | undefined {
     (lang) => (lang as any).iso_639_2?.toLowerCase() === code.toLowerCase()
   );
   return entry?.iso_639_1 || undefined;
+}
+
+const TAG_LANGUAGE_CACHE = new Map<string, string | undefined>();
+
+/**
+ * The language a BCP 47 or ISO 639 tag names ("es-419" is "Latino"), also
+ * outside LANGUAGES; a region the mapping lacks falls back to the language.
+ */
+export function tagLanguage(tag: string): string | undefined {
+  const key = tag.trim().toLowerCase();
+  if (!key || key.length > MAX_INPUT_LENGTH) return undefined;
+  if (TAG_LANGUAGE_CACHE.has(key)) return TAG_LANGUAGE_CACHE.get(key);
+  const entry = findEntryByCode(key) ?? findEntryByCode(key.split(/[-_]/)[0]);
+  const name = entry && getLanguageDisplayName(entry);
+  if (TAG_LANGUAGE_CACHE.size >= NORMALISED_LANGUAGE_CACHE_MAX) {
+    TAG_LANGUAGE_CACHE.clear();
+  }
+  TAG_LANGUAGE_CACHE.set(key, name);
+  return name;
+}
+
+const BIBLIOGRAPHIC = Object.fromEntries(
+  Object.entries(LANGUAGE_ALIAS_MAP).map(([b, t]) => [t, b])
+);
+
+/** A language's ISO 639-2/B code, the form Jellyfin stores ("ger", not "deu"). */
+export function languageToIso6392B(language: string): string | undefined {
+  const code = languageToIso6392(language);
+  return code && (BIBLIOGRAPHIC[code] ?? code);
 }
 
 const languageEmojiMap: Record<string, string> = {

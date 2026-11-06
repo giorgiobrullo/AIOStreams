@@ -145,8 +145,13 @@ const JellyfinPersonaSchema = z.object({
   history: z.enum(['own', 'shared']).default('own'),
   /** Preset ids of the trackers it syncs with; absent is automatic. */
   trackers: z.array(z.string().min(1)).max(50).optional(),
-  /** Kept out of the picker; still usable by name. */
+  /** Kept out of the picker and apart from the other users; still usable by name. */
   hidden: z.boolean().optional(),
+  /** The code of a hidden user's own sign-in address, `/jellyfin/p/<address>`. */
+  address: z
+    .string()
+    .regex(/^[a-z0-9]{10,32}$/)
+    .optional(),
   lock: UserLockSchema,
 });
 
@@ -167,7 +172,7 @@ const JellyfinSettingsFields = z.object({
   /** Resolve streams when an item is opened so clients can offer a version picker. Default on. */
   resolveOnOpen: z.boolean().optional(),
   /** Versions offered per item; the instance setting caps it. */
-  maxVersions: z.number().int().min(1).max(50).optional(),
+  maxVersions: z.number().int().min(1).max(500).optional(),
   /** Offer skip markers, when the instance has them enabled at all. Default on. */
   segments: z.boolean().optional(),
   /** Which markers to offer. Absent means all of them. */
@@ -187,6 +192,8 @@ const JellyfinSettingsFields = z.object({
         .optional(),
       /** Preset ids of the trackers it syncs with; absent means all. */
       trackers: z.array(z.string().min(1)).max(50).optional(),
+      /** Kept out of the picker; still signs in by name. */
+      hidden: z.boolean().optional(),
       lock: UserLockSchema,
     })
     .optional(),
@@ -205,7 +212,17 @@ const JellyfinSettingsFields = z.object({
       }
       const ids = new Set<string>();
       const names = new Set<string>();
+      const addresses = new Set<string>();
       for (const persona of personas) {
+        if (persona.address) {
+          if (addresses.has(persona.address)) {
+            ctx.addIssue({
+              code: 'custom',
+              message: 'Two users have the same sign-in address.',
+            });
+          }
+          addresses.add(persona.address);
+        }
         if (ids.has(persona.id)) {
           ctx.addIssue({
             code: 'custom',
@@ -1219,6 +1236,7 @@ const ManifestCatalogSchema = z.object({
   extra: z.array(ManifestExtraSchema).optional(),
   poster: z.string().nullish(),
   background: z.string().nullish(),
+  idPrefixes: z.array(z.string()).nullish(),
 });
 
 const AddonCatalogDefinitionSchema = z.object({
@@ -1310,10 +1328,8 @@ export const SubtitleResponseSchema = z.object({
 export type SubtitleResponse = z.infer<typeof SubtitleResponseSchema>;
 export type Subtitle = z.infer<typeof SubtitleSchema>;
 
-export const SourceSchema = z.object({
-  url: z.string(),
-  bytes: z.number().nullable().optional(),
-});
+/** An archive part as `[url, bytes]`: Stremio drops a stream whose parts are objects. */
+export const SourceSchema = z.tuple([z.string(), z.number().nullish()]);
 
 const NNTPServerSchema = z.object({
   username: z.string(),
@@ -1337,6 +1353,7 @@ export const ReleaseKeySchema = z
 export const StreamSchema = z.looseObject({
   url: z.string().or(z.null()).optional(),
   nzbUrl: z.string().or(z.null()).optional(),
+  infoUrl: z.string().or(z.null()).optional(),
   releaseKey: ReleaseKeySchema,
   idMatched: z.boolean().optional(),
   servers: z.array(z.string().min(1)).nullable().optional(),
@@ -1521,6 +1538,7 @@ export const ParsedStreamSchema = z.object({
   passthrough: PassthroughSchema.optional(),
   url: z.string().optional(),
   nzbUrl: z.string().optional(),
+  infoUrl: z.string().optional(),
   releaseKey: ReleaseKeySchema,
   // Same-release failover targets harvested from discarded duplicates by the
   // deduplicator merge step. Each is another playback URL for the *same*
@@ -1571,6 +1589,7 @@ const TrailerSchema = z
   .object({
     source: z.string().optional(),
     type: z.string().optional(),
+    name: z.string().nullish(),
   })
   .passthrough();
 
@@ -1601,12 +1620,21 @@ const MetaPersonSchema = z.object({
   role: z.string(),
   character: z.string().nullish(),
   photo: z.string().nullish(),
+  id: z.string().nullish(),
 });
 
 export type MetaPerson = z.infer<typeof MetaPersonSchema>;
 
+const ScoreSchema = z.object({
+  source: z.string(),
+  value: z.number(),
+  scale: z.number().nullish(),
+});
+
+const EntrySchema = z.looseObject({ id: z.string(), type: z.string() });
+
 const CollectionSchema = z.object({
-  items: z.array(z.looseObject({ id: z.string(), type: z.string() })).nullish(),
+  items: z.array(EntrySchema).nullish(),
   sources: z
     .array(
       z.object({
@@ -1626,10 +1654,13 @@ const metaExtensionFields = {
   originalTitle: z.string().nullish(),
   tagline: z.string().nullish(),
   landscapePoster: z.string().nullish(),
+  animatedPoster: z.string().nullish(),
   people: z.array(MetaPersonSchema).nullish(),
   certification: z.string().nullish(),
   certificationLocal: z.string().nullish(),
   criticRating: z.number().or(z.string()).nullish(),
+  // Some addons send certifications here instead.
+  ratings: z.array(ScoreSchema).nullish().catch(undefined),
   studios: z.array(z.string()).nullish(),
   networks: z.array(z.string()).nullish(),
   countries: z.array(z.string()).nullish(),
@@ -1649,6 +1680,10 @@ const metaExtensionFields = {
     )
     .nullish(),
   collection: CollectionSchema.nullish(),
+  birthday: z.string().nullish(),
+  deathday: z.string().nullish(),
+  birthPlace: z.string().nullish(),
+  credits: z.array(EntrySchema).nullish(),
 };
 
 const MetaVideoSchema = z

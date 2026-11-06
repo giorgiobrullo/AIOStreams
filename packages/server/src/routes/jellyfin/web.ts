@@ -2,6 +2,8 @@ import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import {
   accountScope,
+  appReportBodySchema,
+  AppReportsDisabledError,
   config as appConfig,
   createLogger,
   getWatchStateProvider,
@@ -9,6 +11,7 @@ import {
   PlaybackHandoffRepository,
   personaUserId,
   readToken,
+  submitAppReport,
   UserRepository,
   WatchSessionRepository,
   WatchStateRepository,
@@ -31,8 +34,18 @@ import {
 } from './context.js';
 import { summaryItem } from './items.js';
 import { mapLimited, ROW_CONCURRENCY } from './library.js';
-import { authenticationResult, sessionFromRow, userDto } from './users.js';
-import { jellyfinLoginRateLimiter } from '../../middlewares/ratelimit.js';
+import {
+  authenticationResult,
+  listedFor,
+  sessionFromRow,
+  userDto,
+  withControls,
+} from './users.js';
+import { controllableDevices } from './remote.js';
+import {
+  appReportsRateLimiter,
+  jellyfinLoginRateLimiter,
+} from '../../middlewares/ratelimit.js';
 
 /* The server's own web app; an API key is another tool's credential and may not use it. */
 
@@ -108,16 +121,16 @@ type Secret = 'pin' | 'password' | 'password-pin';
 
 /** What switching to `user` asks of the caller. */
 function secretFor(ctx: JellyfinRequestContext, user: WebUser): Secret | null {
-  if (isCaller(ctx, user)) return null;
   const locked = user.persona
     ? personaLocked(user.persona)
     : accountLocked(ctx.userData);
+  // A PIN is asked on every switch, to the signed-in user too, or handing over
+  // a signed-in device would hand over the account.
+  if (isCaller(ctx, user)) return locked ? 'pin' : null;
   // A persona session may have begun with its PIN alone.
   if (!provedPassword(ctx) && (!user.persona || !locked)) {
     return locked ? 'password-pin' : 'password';
   }
-  // A PIN is asked on every switch, or handing over a signed-in device would
-  // hand over the account.
   return locked ? 'pin' : null;
 }
 
@@ -198,6 +211,10 @@ router.get(
           return key && !user ? null : sessionFromRow(ctx, row, user, null);
         })
     );
+    const playing = sessions.filter((s) => s !== null);
+    const live = playing.length
+      ? withControls(playing, await controllableDevices(ctx))
+      : playing;
     const byScope = new Map(counts.map((c) => [c.persona, c]));
     const none = {
       played: 0,
@@ -218,27 +235,28 @@ router.get(
         historyOf: personaUserId(ctx.uuid, u.scope.persona),
         counts: ownsScope(u) ? (byScope.get(u.scope.persona) ?? none) : null,
       })),
-      sessions: sessions.filter(Boolean),
+      sessions: live,
     });
   })
 );
 
-/*
- * Who the user picker offers. Hidden users show only to the account, which
- * keeps them, and to themselves.
- */
+/** Who the caller may switch to; a separate user is reached only by its own sign-in. */
+function switchable(ctx: JellyfinRequestContext): WebUser[] {
+  return usersOf(ctx).filter((u) =>
+    listedFor(ctx.userData, ctx.persona, u.persona)
+  );
+}
+
 router.get(
   '/AIOStreams/Users',
   web(async (_req, res, ctx) => {
     res.json(
-      usersOf(ctx)
-        .filter((u) => !u.persona?.hidden || !ctx.persona || isCaller(ctx, u))
-        .map((u) => ({
-          user: userDto(ctx.uuid, ctx.userData, u.persona),
-          avatar: avatarOf(ctx, u),
-          hidden: !!u.persona?.hidden,
-          needs: secretFor(ctx, u),
-        }))
+      switchable(ctx).map((u) => ({
+        user: userDto(ctx.uuid, ctx.userData, u.persona),
+        avatar: avatarOf(ctx, u),
+        hidden: !!u.persona?.hidden,
+        needs: secretFor(ctx, u),
+      }))
     );
   })
 );
@@ -436,13 +454,44 @@ router.get(
   })
 );
 
+/** A report from the apps, kept for this server's admins and passed on to the developer when asked. */
+router.post(
+  '/AIOStreams/Reports',
+  web(async (req, res, ctx) => {
+    const body = bodyOf(req);
+    const parsed = appReportBodySchema.safeParse(body);
+    if (!parsed.success) {
+      res
+        .status(400)
+        .json({ Message: 'A report needs a platform and a summary' });
+      return;
+    }
+    if (!(await appReportsRateLimiter.tryConsume(req))) {
+      res.status(429).json({ Message: 'Too many reports' });
+      return;
+    }
+    try {
+      res.json(
+        await submitAppReport(
+          parsed.data,
+          { uuid: ctx.uuid, persona: ctx.persona?.id ?? null },
+          body.forward === true
+        )
+      );
+    } catch (error) {
+      if (!(error instanceof AppReportsDisabledError)) throw error;
+      res.status(404).json({ Message: 'This server keeps no reports' });
+    }
+  })
+);
+
 router.post(
   '/AIOStreams/Token',
   web(async (req, res, ctx) => {
     const body = bodyOf(req);
     const wanted = String(body.UserId ?? '').toLowerCase();
     const secret = String(body.Pw ?? '');
-    const user = usersOf(ctx).find((u) => u.id === wanted);
+    const user = switchable(ctx).find((u) => u.id === wanted);
     if (!user) {
       res.status(404).json({ Message: 'User not found' });
       return;

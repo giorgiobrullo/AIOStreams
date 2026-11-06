@@ -19,19 +19,11 @@ export function layerMediaInfo(
   return {
     ...parsedFile,
     ...merged,
-    languages: merged.languages?.length
-      ? merged.languages
-      : (parsedFile?.languages ?? []),
-    subtitles: merged.subtitles?.length
-      ? merged.subtitles
-      : (parsedFile?.subtitles ?? []),
-    audioChannels: merged.audioChannels?.length
-      ? merged.audioChannels
-      : (parsedFile?.audioChannels ?? []),
+    languages: merged.languages ?? parsedFile?.languages ?? [],
+    subtitles: merged.subtitles ?? parsedFile?.subtitles ?? [],
+    audioChannels: merged.audioChannels ?? parsedFile?.audioChannels ?? [],
     visualTags: mergeVisualTags(parsedFile?.visualTags, info?.visualTags),
-    audioTags: merged.audioTags?.length
-      ? merged.audioTags
-      : (parsedFile?.audioTags ?? []),
+    audioTags: merged.audioTags ?? parsedFile?.audioTags ?? [],
     hasChapters: merged.hasChapters ?? parsedFile?.hasChapters,
     videoIndex: merged.videoIndex,
   };
@@ -46,7 +38,7 @@ export function applyMediaInfo(
     parseMediaInfo(toWireMediaInfo(record))
   );
   if (record.duration && !stream.duration) {
-    stream.duration = record.duration * 1000;
+    stream.duration = Math.round(record.duration * 1000);
   }
   if (record.bitrate && !stream.bitrate) {
     stream.bitrate = record.bitrate;

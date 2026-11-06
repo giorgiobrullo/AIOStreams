@@ -13,11 +13,14 @@ import {
   type ContentDescriptor,
   type ContentRef,
   type JellyfinItem,
+  type PlayingTracks,
   type SessionContext,
   type WatchEvent,
+  type WatchProgressEvent,
   type WatchSnapshot,
 } from '@aiostreams/core';
 import {
+  bodyField,
   bodyOf,
   jf,
   param,
@@ -162,6 +165,22 @@ function mediaSourceIdOf(req: Request): string | undefined {
     : undefined;
 }
 
+function streamIndexOf(req: Request, name: string): number | undefined {
+  const v = bodyField(req, name) ?? qs(req, name);
+  const n = typeof v === 'string' && v ? Number(v) : v;
+  return Number.isInteger(n) ? (n as number) : undefined;
+}
+
+function tracksOf(req: Request): PlayingTracks {
+  return {
+    mediaSourceId: mediaSourceIdOf(req),
+    audioStreamIndex: streamIndexOf(req, 'AudioStreamIndex'),
+    subtitleStreamIndex: streamIndexOf(req, 'SubtitleStreamIndex'),
+  };
+}
+
+const LATE_TICK_MS = 30_000;
+
 async function record(
   ctx: JellyfinRequestContext,
   rawId: string,
@@ -171,23 +190,45 @@ async function record(
     paused?: boolean;
     playSessionId?: string;
     mediaSourceId?: string;
+    tracks?: PlayingTracks;
   } = {}
 ): Promise<void> {
+  // Before any await, so a tick still in flight when a stop is written is older.
+  const at = Date.now();
   const d = await descriptorFor(ctx, rawId);
   if (!d || (d.k !== 'movie' && d.k !== 'episode')) return;
+  const { tracks } = opts;
   if (await playingLive(ctx, rawId, opts.mediaSourceId)) {
     // The session still tracks what is on; only the history is skipped.
     const session = sessionOf(ctx, opts.playSessionId);
     if (type === 'start')
-      await openWatchSession(session, contentRefOf(d), { positionMs });
+      await openWatchSession(session, contentRefOf(d), {
+        positionMs,
+        ...tracks,
+      });
     else if (type === 'stop') await closeWatchSession(session);
     else
-      await checkInWatchSession(session, { positionMs, paused: opts.paused });
+      await checkInWatchSession(session, {
+        positionMs,
+        paused: opts.paused,
+        ...tracks,
+      });
     return;
   }
   const ref = contentRefOf(d);
   const identity = await watchIdentityFor(ref);
   const session = sessionOf(ctx, opts.playSessionId);
+  if (type === 'progress') {
+    await progressed(
+      ctx,
+      session,
+      ref,
+      { type, identity, positionMs, at },
+      opts.paused,
+      tracks
+    );
+    return;
+  }
   const provider = getWatchStateProvider();
   if (type === 'stop' && positionMs == null)
     positionMs =
@@ -196,14 +237,8 @@ async function record(
       )?.positionMs ?? 0;
 
   // one meta call on start and stop, none on the 5-10 s progress ticks
-  const item =
-    type === 'progress'
-      ? null
-      : await itemFromDescriptor(ctx, d).catch(() => null);
-  const durationMs =
-    type === 'progress'
-      ? undefined
-      : await durationFor(ctx, d, rawId, item, opts.mediaSourceId);
+  const item = await itemFromDescriptor(ctx, d).catch(() => null);
+  const durationMs = await durationFor(ctx, d, rawId, item, opts.mediaSourceId);
   const event: WatchEvent = {
     type,
     identity,
@@ -223,6 +258,7 @@ async function record(
       positionMs,
       durationMs,
       paused: false,
+      ...tracks,
     });
     await reportPlayback(ctx, 'start', ref, {
       row,
@@ -240,21 +276,16 @@ async function record(
     return;
   }
 
-  if (type === 'stop') {
-    const closed = await closeWatchSession(session);
-    await reportPlayback(ctx, 'stop', ref, {
-      row,
-      item,
-      positionMs,
-      durationMs,
-      played: playedThrough(positionMs ?? 0, durationMs || row?.durationMs),
-      sessionStartedAt:
-        closed?.itemKey === identity.itemKey ? closed.startedAt : undefined,
-    });
-    return;
-  }
-
-  await progressed(ctx, session, ref, positionMs, opts.paused, row);
+  const closed = await closeWatchSession(session);
+  await reportPlayback(ctx, 'stop', ref, {
+    row,
+    item,
+    positionMs,
+    durationMs,
+    played: playedThrough(positionMs ?? 0, durationMs || row?.durationMs),
+    sessionStartedAt:
+      closed?.itemKey === identity.itemKey ? closed.startedAt : undefined,
+  });
 }
 
 /** A tick keeps the session alive; only the pause edge is worth reporting. */
@@ -262,26 +293,35 @@ async function progressed(
   ctx: JellyfinRequestContext,
   session: SessionContext,
   ref: ContentRef,
-  positionMs: number | undefined,
+  event: WatchProgressEvent,
   paused: boolean | undefined,
-  row: Awaited<ReturnType<ReturnType<typeof getWatchStateProvider>['record']>>
+  tracks: PlayingTracks | undefined
 ): Promise<void> {
+  const { positionMs } = event;
   const { transition, row: existing } = await checkInWatchSession(session, {
     positionMs,
     paused,
+    ...tracks,
   });
+  // Sent before the stop that closed this playback, and handled after it.
+  if (
+    existing?.endedAt != null &&
+    existing.itemKey === event.identity.itemKey &&
+    Date.now() - existing.endedAt < LATE_TICK_MS
+  )
+    return;
+  await getWatchStateProvider().record(ctx.watch, event);
 
   // No row means no sweep could ever close it.
   if (!existing) {
-    await openWatchSession(session, ref, { positionMs, paused });
+    await openWatchSession(session, ref, { positionMs, paused, ...tracks });
     return;
   }
 
-  // The runtime comes off the session: a tick is buffered, so `row` is null and
-  // an event without a duration has the receiver store the position as zero.
+  // The runtime comes off the session: a tick carries none, and an event
+  // without a duration has the receiver store the position as zero.
   if (transition)
     await reportPlayback(ctx, transition, ref, {
-      row,
       positionMs,
       durationMs: existing.durationMs || undefined,
       sessionStartedAt: existing.startedAt,
@@ -305,6 +345,7 @@ router.post(
         {
           playSessionId: playSessionIdOf(req),
           mediaSourceId: mediaSourceIdOf(req),
+          tracks: tracksOf(req),
         }
       );
     res.status(204).end();
@@ -328,6 +369,7 @@ router.post(
         {
           paused: body.IsPaused === true || qs(req, 'IsPaused') === 'true',
           playSessionId: playSessionIdOf(req),
+          tracks: tracksOf(req),
         }
       );
     }
@@ -743,9 +785,15 @@ router.post(
       (d.k === 'movie' || d.k === 'episode')
     ) {
       const item = await itemFromDescriptor(ctx, d).catch(() => null);
+      const at =
+        typeof body.LastPlayedDate === 'string'
+          ? Date.parse(body.LastPlayedDate)
+          : NaN;
       await getWatchStateProvider().record(ctx.watch, {
         type: 'stop',
         identity: await watchIdentityFor(contentRefOf(d)),
+        // A time ahead of now would outrank every later play.
+        at: at > 0 && at <= Date.now() ? at : undefined,
         positionMs: ticksToMs(body.PlaybackPositionTicks),
         durationMs:
           typeof item?.RunTimeTicks === 'number'

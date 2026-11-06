@@ -12,12 +12,33 @@ import {
   normaliseLangCode,
   normaliseLanguage,
 } from '../utils/languages.js';
+import { countryName } from '../utils/countries.js';
 
 export interface EnrichedPerson {
   name: string;
   type: (typeof PERSON_TYPES)[keyof typeof PERSON_TYPES];
   role?: string;
   photo?: string;
+  id?: string;
+}
+
+/** Each source's own scale, which a score without `scale` is on. */
+const SCORE_SCALES = {
+  imdb: 10,
+  tomatoes: 100,
+  tomatoesAudience: 100,
+  metacritic: 100,
+  letterboxd: 5,
+  rogerebert: 4,
+  trakt: 100,
+  tmdb: 10,
+  mal: 10,
+};
+
+export interface Score {
+  source: keyof typeof SCORE_SCALES;
+  value: number;
+  scale: number;
 }
 
 export interface SeasonDetails {
@@ -39,6 +60,7 @@ export interface Enrichment {
   certification?: string;
   customRating?: string;
   criticRating?: number;
+  ratings: Score[];
   studios: string[];
   countries: string[];
   tags: string[];
@@ -166,7 +188,7 @@ const ID_FALLBACKS: [string, string][] = [
   ['anidb_id', 'anidb'],
 ];
 
-function providerIdsFrom(source: AnyObject): Record<string, string> {
+export function providerIdsFrom(source: AnyObject): Record<string, string> {
   const out: Record<string, string> = {};
   const declared = isObject(source.ids) ? Object.entries(source.ids) : [];
   const fallbacks = ID_FALLBACKS.map(([field, key]) => [key, source[field]]);
@@ -174,7 +196,7 @@ function providerIdsFrom(source: AnyObject): Record<string, string> {
     const jf = PROVIDER_KEYS[key as string];
     const v = str(raw);
     if (!jf || !v || out[jf]) continue;
-    out[jf] = key === 'imdb' && !v.startsWith('tt') ? `tt${v}` : v;
+    out[jf] = key === 'imdb' && /^\d+$/.test(v) ? `tt${v}` : v;
   }
   return out;
 }
@@ -210,12 +232,17 @@ function detailed(
     const type = name ? typeOf(entry) : undefined;
     if (!name || !type) return [];
     const role = str(entry.character);
+    const tmdb = str(entry.tmdbId);
+    const tvdb = str(entry.tvdbId);
     return [
       {
         name,
         type,
         role: role && role !== name ? role : undefined,
         photo: str(entry.photo),
+        id:
+          str(entry.id) ??
+          (tmdb ? `tmdb:${tmdb}` : tvdb ? `tvdb:${tvdb}` : undefined),
       },
     ];
   });
@@ -271,7 +298,7 @@ function peopleFrom(meta: AnyMeta): EnrichedPerson[] {
   ]);
 }
 
-function statusFrom(meta: AnyMeta): 'Continuing' | 'Ended' | undefined {
+export function statusFrom(meta: AnyMeta): 'Continuing' | 'Ended' | undefined {
   const explicit = str(meta.status)?.toLowerCase();
   if (
     explicit === 'continuing' ||
@@ -292,17 +319,33 @@ function statusFrom(meta: AnyMeta): 'Continuing' | 'Ended' | undefined {
   return undefined;
 }
 
-/** In `app_extras.ratings`, `tomatoes` is the critic score. */
-function criticRatingFrom(
-  meta: AnyMeta,
-  extras: AnyObject
+/** Known sources only, each once, as the apps have nothing to name another by. */
+function scoresFrom(list: unknown): Score[] {
+  const out: Score[] = [];
+  for (const entry of Array.isArray(list) ? list : []) {
+    const source = isObject(entry) ? str(entry.source) : undefined;
+    if (
+      !source ||
+      !Object.hasOwn(SCORE_SCALES, source) ||
+      out.some((s) => s.source === source)
+    )
+      continue;
+    const known = source as Score['source'];
+    const scale = num(entry.scale) ?? SCORE_SCALES[known];
+    const value =
+      scale > 0 ? upTo(scale, entry.value ?? entry.score) : undefined;
+    if (value !== undefined) out.push({ source: known, value, scale });
+  }
+  return out;
+}
+
+export function scoreOutOf(
+  ratings: Score[],
+  source: Score['source'],
+  max: number
 ): number | undefined {
-  const declared = upTo(100, meta.criticRating);
-  if (declared !== undefined || !Array.isArray(extras.ratings)) return declared;
-  const tomatoes = extras.ratings.find(
-    (r): r is AnyObject => isObject(r) && r.source === 'tomatoes'
-  );
-  return upTo(100, tomatoes?.value ?? tomatoes?.score);
+  const score = ratings.find((s) => s.source === source);
+  return score && Math.round((score.value / score.scale) * max * 10) / 10;
 }
 
 function genreTargetsFrom(
@@ -372,30 +415,43 @@ function seasonsFrom(
   return out;
 }
 
+const YOUTUBE =
+  /^https?:\/\/(www\.|m\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)\//i;
+const youtubeUrl = (id: string | undefined) =>
+  id && `https://www.youtube.com/watch?v=${id}`;
+
+/** A meta's `trailers`, with `trailerStreams` merged in for the names and links they add. */
 function trailersFrom(meta: AnyMeta): { Name: string; Url: string }[] {
-  const trailers: { Name: string; Url: string }[] = [];
-  const add = (name: string, url: string) => {
-    if (!trailers.some((t) => t.Url === url))
-      trailers.push({ Name: name, Url: url });
+  const found: { name?: string; url: string }[] = [];
+  const add = (name: string | undefined, url: string | undefined) => {
+    if (!url) return;
+    const seen = found.find((t) => t.url === url);
+    if (!seen) found.push({ name, url });
+    else seen.name ??= name;
   };
-  for (const t of Array.isArray(meta.trailerStreams)
-    ? meta.trailerStreams
-    : []) {
-    const yt = isObject(t) ? str(t.ytId) : undefined;
-    if (yt)
-      add(str(t.title) ?? 'Trailer', `https://www.youtube.com/watch?v=${yt}`);
-  }
   for (const t of meta.trailers ?? []) {
     const source = str(t.source) ?? str((t as AnyObject).ytId);
-    if (!source) continue;
     add(
-      str((t as AnyObject).name) ?? str(t.type) ?? 'Trailer',
-      source.startsWith('http')
-        ? source
-        : `https://www.youtube.com/watch?v=${source}`
+      str(t.name),
+      source && /^https?:\/\//i.test(source) ? source : youtubeUrl(source)
     );
   }
-  return trailers;
+  for (const t of (Array.isArray(meta.trailerStreams)
+    ? meta.trailerStreams
+    : []
+  ).filter(isObject)) {
+    const url = str(t.url);
+    add(
+      str(t.title) ?? str(t.name),
+      url && /^https?:\/\//i.test(url) ? url : youtubeUrl(str(t.ytId))
+    );
+  }
+  // Direct links play without resolving, so they go first.
+  const direct = found.filter((t) => !YOUTUBE.test(t.url));
+  return [...direct, ...found.filter((t) => YOUTUBE.test(t.url))].map((t) => ({
+    Name: t.name ?? 'Trailer',
+    Url: t.url,
+  }));
 }
 
 const AIR_DAYS = [
@@ -413,6 +469,16 @@ export function readEnrichment(input: MetaPreview | Meta): Enrichment {
   const extras = isObject(meta.app_extras) ? meta.app_extras : {};
   const stability = isObject(meta._stability) ? meta._stability : {};
   const country = str(meta.country);
+  const declaredRatings = scoresFrom(meta.ratings);
+  const ratings = declaredRatings.length
+    ? declaredRatings
+    : scoresFrom(extras.ratings);
+  // Whole first, as ISO names hold commas ("Korea, Republic of").
+  const countries = meta.countries?.length
+    ? meta.countries
+    : country && countryName(country)
+      ? [country]
+      : country?.split(',');
 
   return {
     providerIds: providerIdsFrom(meta),
@@ -428,11 +494,11 @@ export function readEnrichment(input: MetaPreview | Meta): Enrichment {
       str(extras.certification),
     customRating:
       str(meta.certificationLocal) ?? str(extras.certificationLocal),
-    criticRating: criticRatingFrom(meta, extras),
+    criticRating:
+      upTo(100, meta.criticRating) ?? scoreOutOf(ratings, 'tomatoes', 100),
+    ratings,
     studios: strings([...(meta.studios ?? []), ...(meta.networks ?? [])]),
-    countries: meta.countries?.length
-      ? strings(meta.countries)
-      : strings(country?.split(',')),
+    countries: strings(strings(countries).map((c) => countryName(c) ?? c)),
     tags: strings(meta.tags),
     trailers: trailersFrom(meta),
     status: statusFrom(meta),
@@ -469,6 +535,8 @@ export function readVideoEnrichment(
 const SUBTITLE_LANG_ALIASES: Record<string, string> = {
   pob: 'pt-br',
   zht: 'zh-tw',
+  zhe: 'zh',
+  ze: 'zh',
   spn: 'es-419',
 };
 

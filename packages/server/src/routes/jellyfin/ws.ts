@@ -1,20 +1,28 @@
 import type { Server as HttpServer, IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
-import { randomUUID } from 'crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  accountScope,
   config as appConfig,
   createLogger,
+  extractAuth,
   getWatchStateProvider,
   itemIdForWatchRow,
-  personaUserId,
-  readToken,
+  sharedBackend,
+  SharedTx,
   userDataFromRow,
-  type UserData,
   type WatchScope,
 } from '@aiostreams/core';
-import { lockTag, personaById, resolveConfigFor } from './context.js';
+import {
+  resolveAddressCode,
+  resolvePickerAlias,
+  userForToken,
+} from './context.js';
+import {
+  addClientSocket,
+  clientKey,
+  frame,
+  removeClientSocket,
+} from './session-sockets.js';
 
 const logger = createLogger('jellyfin');
 
@@ -23,13 +31,14 @@ const MAX_SOCKETS_TOTAL = 50_000;
 const KEEPALIVE_SECONDS = 60;
 
 const SOCKET_PATH =
-  /^\/jellyfin(?:\/([^/?]+)\/[^/?]+)?(?:\/(?:emby|mediabrowser))?\/(?:socket|websocket)(?:\?|$)/i;
+  /^\/jellyfin(?:\/([^/?]+)\/([^/?]+))?(?:\/(?:emby|mediabrowser))?\/(?:socket|websocket)(?:\?|$)/i;
 
 interface SocketUser {
   /** The rows this socket follows. */
   scope: WatchScope;
   /** The id the client signed in as, stamped on every push so it keeps it. */
   userId: string;
+  deviceId: string;
 }
 
 function reject(socket: Duplex, status: number, text: string) {
@@ -37,53 +46,45 @@ function reject(socket: Duplex, status: number, text: string) {
   socket.destroy();
 }
 
-async function authenticateUpgrade(url: string): Promise<SocketUser | null> {
+/** The configuration a mount names, as the HTTP routes find it. */
+async function mountUuid(
+  first: string,
+  second: string
+): Promise<string | null> {
+  const kind = first.toLowerCase();
+  const value = decodeURIComponent(second);
+  if (kind === 'u') return (await resolvePickerAlias(value))?.uuid ?? null;
+  if (kind === 'p') return (await resolveAddressCode(value))?.uuid ?? null;
+  return decodeURIComponent(first);
+}
+
+async function authenticateUpgrade(
+  req: IncomingMessage
+): Promise<SocketUser | null> {
+  const url = req.url ?? '';
   const m = SOCKET_PATH.exec(url);
   if (!m) return null;
   const query = new URLSearchParams(url.split('?')[1] ?? '');
-  const apiKey =
-    query.get('api_key') ??
-    query.get('ApiKey') ??
-    query.get('apikey') ??
-    query.get('token') ??
-    '';
-  const payload = apiKey ? readToken(apiKey) : null;
+  const { token } = extractAuth({
+    header: (name) => {
+      const value = req.headers[name];
+      return Array.isArray(value) ? value[0] : value;
+    },
+    query: Object.fromEntries(query),
+  });
+  const apiKey = token ?? query.get('token') ?? '';
   // Nothing here pushes sessions; a tool polls /Sessions once its socket fails.
-  if (!payload || payload.a) return null;
-  if (
-    m[1] &&
-    decodeURIComponent(m[1]).toLowerCase() !== payload.u.toLowerCase()
-  )
-    return null;
-  // Resolved rather than verified: see `resolveConfigFor`. The config this
-  // proves the credentials with is the same one the persona is read from, so
-  // the persona branch costs nothing extra.
-  const resolved: { uuid: string; userData: UserData } | null =
-    await resolveConfigFor(payload.u, payload.p);
-  const personaKey = payload.k ?? '';
-  if (!resolved) return null;
-  const { uuid, userData } = resolved;
-  const persona = personaKey ? personaById(userData, personaKey) : null;
-  if (personaKey && !persona) return null;
-  if ((payload.l ?? '') !== lockTag(userData, persona)) return null;
-  if (!persona) {
-    return { scope: accountScope(uuid), userId: personaUserId(uuid, '') };
+  const user = apiKey ? await userForToken(apiKey) : null;
+  if (!user) return null;
+  if (m[1] && m[2]) {
+    const mount = await mountUuid(m[1], m[2]);
+    if (mount?.toLowerCase() !== user.payload.u.toLowerCase()) return null;
   }
   return {
-    scope:
-      persona.history === 'shared'
-        ? accountScope(uuid)
-        : { uuid, persona: persona.id },
-    userId: personaUserId(uuid, persona.id),
+    scope: user.watch,
+    userId: user.userId,
+    deviceId: query.get('deviceId') ?? user.payload.d ?? '',
   };
-}
-
-function frame(MessageType: string, Data: unknown = null): string {
-  return JSON.stringify({
-    MessageType,
-    MessageId: randomUUID().replace(/-/g, ''),
-    Data,
-  });
 }
 
 function scopeKey(scope: WatchScope): string {
@@ -91,8 +92,8 @@ function scopeKey(scope: WatchScope): string {
 }
 
 /**
- * Keepalive plus `UserDataChanged` pushes for the connected history. Clients
- * treat the socket as optional, so nothing here is load-bearing.
+ * Keepalive, `UserDataChanged` pushes for the connected history, and SyncPlay's
+ * pushes to each client (see session-sockets).
  */
 export function attachJellyfinWebSocket(server: HttpServer): void {
   const wss = new WebSocketServer({ noServer: true });
@@ -111,16 +112,41 @@ export function attachJellyfinWebSocket(server: HttpServer): void {
     return count;
   };
 
+  // Each replica hears every write and tells the sockets it holds.
+  const changes = sharedBackend().records<never>({
+    name: 'user-data',
+    save: () => null,
+    load: () => {
+      throw new Error('user data changes keep no records');
+    },
+    due: () => null,
+    tags: () => [],
+    receive: (_id, messages) => {
+      for (const { to, data } of messages) {
+        for (const key of to) {
+          const sockets = byScope.get(key);
+          if (!sockets?.size) continue;
+          const UserDataList = JSON.parse(data.toString()) as unknown[];
+          for (const [ws, userId] of sockets) {
+            send(ws, 'UserDataChanged', { UserId: userId, UserDataList });
+          }
+        }
+      }
+    },
+    lapse: () => undefined,
+  });
+  const replicated = !!appConfig.bootstrap.redisUri;
+
   getWatchStateProvider().onChange((scope, rows) => {
-    const sockets = byScope.get(scopeKey(scope));
-    if (!sockets?.size) return;
+    const key = scopeKey(scope);
+    if (!replicated && !byScope.get(key)?.size) return;
     const UserDataList = rows.map((row) => {
       const id = itemIdForWatchRow(row);
       return userDataFromRow(id, row, row.snapshot?.runtimeMs);
     });
-    for (const [ws, userId] of sockets) {
-      send(ws, 'UserDataChanged', { UserId: userId, UserDataList });
-    }
+    const tx = new SharedTx();
+    tx.send([key], Buffer.from(JSON.stringify(UserDataList)));
+    changes.broadcast(tx);
   });
 
   wss.on(
@@ -133,6 +159,8 @@ export function attachJellyfinWebSocket(server: HttpServer): void {
         byScope.set(key, sockets);
       }
       sockets.set(ws, user.userId);
+      const client = clientKey(user.userId, user.deviceId);
+      addClientSocket(client, ws);
       send(ws, 'ForceKeepAlive', KEEPALIVE_SECONDS);
       const timer = setInterval(
         () => send(ws, 'ForceKeepAlive', KEEPALIVE_SECONDS),
@@ -140,6 +168,7 @@ export function attachJellyfinWebSocket(server: HttpServer): void {
       );
       const release = () => {
         clearInterval(timer);
+        removeClientSocket(client, ws);
         const s = byScope.get(key);
         if (s) {
           s.delete(ws);
@@ -164,7 +193,7 @@ export function attachJellyfinWebSocket(server: HttpServer): void {
       reject(socket, 404, 'Not Found');
       return;
     }
-    void authenticateUpgrade(url)
+    void authenticateUpgrade(req)
       .then((user) => {
         if (socket.destroyed) return;
         if (!user) {

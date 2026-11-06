@@ -1,5 +1,4 @@
-import { createHash } from 'crypto';
-import { Router, type Request } from 'express';
+import { Router, type Request, type Response } from 'express';
 import {
   config as appConfig,
   createLogger,
@@ -14,9 +13,16 @@ import {
   serverId as instanceServerId,
   sessionKeyFor,
   msToTicks,
+  AUDIO_TYPES,
   SUBTITLE_MODES,
+  SUBTITLE_TYPES,
   WatchSessionRepository,
+  buildMediaStreams,
+  resolveByItem,
+  resolveByPlaySession,
+  subtitleFormatFor,
   type ClientInfo,
+  type JellyfinMediaStream,
   type JellyfinPersona,
   type UserData,
   type WatchScope,
@@ -40,8 +46,11 @@ import {
   resolvePickerAlias,
   type JellyfinRequestContext,
 } from './context.js';
-import { summaryItem } from './items.js';
+import { subtitleUrlFor, summaryItem } from './items.js';
+import { pickSource } from './playback.js';
 import { serverName } from './system.js';
+import { sessionIdOf } from './session-sockets.js';
+import { controllableDevices, type RemoteDevice } from './remote.js';
 
 const logger = createLogger('jellyfin');
 const router: Router = Router({ mergeParams: true });
@@ -49,8 +58,13 @@ const router: Router = Router({ mergeParams: true });
 export function userConfiguration() {
   return {
     AudioLanguagePreference: '',
+    AudioLanguages: [] as string[],
     PlayDefaultAudioTrack: true,
+    AudioTypes: [...AUDIO_TYPES] as string[],
     SubtitleLanguagePreference: '',
+    SubtitleLanguages: [] as string[],
+    SubtitleTypes: [...SUBTITLE_TYPES] as string[],
+    ListPreferredSubtitlesOnly: true,
     DisplayMissingEpisodes: true,
     GroupedFolders: [],
     SubtitleMode: 'Default',
@@ -67,11 +81,25 @@ export function userConfiguration() {
   };
 }
 
+const isLanguage = (v: unknown) => typeof v === 'string' && v.length <= 16;
+const isRanking = (all: readonly string[]) => (v: unknown) =>
+  Array.isArray(v) &&
+  v.length <= all.length &&
+  new Set(v).size === v.length &&
+  v.every((t) => all.includes(t));
+const isLanguageList = (v: unknown) =>
+  Array.isArray(v) && v.length <= 10 && v.every((l) => isLanguage(l) && l);
+
 /** The playback preferences a user can set and this server keeps. */
 const USER_PREFERENCES: Record<string, (value: unknown) => boolean> = {
-  AudioLanguagePreference: (v) => typeof v === 'string' && v.length <= 16,
-  SubtitleLanguagePreference: (v) => typeof v === 'string' && v.length <= 16,
+  AudioLanguagePreference: isLanguage,
+  AudioLanguages: isLanguageList,
+  SubtitleLanguagePreference: isLanguage,
+  SubtitleLanguages: isLanguageList,
   SubtitleMode: (v) => SUBTITLE_MODES.some((mode) => mode === v),
+  SubtitleTypes: isRanking(SUBTITLE_TYPES),
+  AudioTypes: isRanking(AUDIO_TYPES),
+  ListPreferredSubtitlesOnly: (v) => typeof v === 'boolean',
   PlayDefaultAudioTrack: (v) => typeof v === 'boolean',
   RememberAudioSelections: (v) => typeof v === 'boolean',
   RememberSubtitleSelections: (v) => typeof v === 'boolean',
@@ -87,12 +115,39 @@ function userPreferences(body: unknown): Record<string, unknown> {
   );
 }
 
+const LANGUAGE_LISTS = [
+  ['AudioLanguagePreference', 'AudioLanguages'],
+  ['SubtitleLanguagePreference', 'SubtitleLanguages'],
+] as const;
+
+/**
+ * Keeps each single language the first of its list. A client that only knows
+ * the single one may send back the list it read, so a single language that
+ * isn't that list's first is its choice, and goes to the front.
+ */
+function withLanguageLists(
+  config: Record<string, unknown>,
+  sent: Record<string, unknown>
+): Record<string, unknown> {
+  for (const [single, list] of LANGUAGE_LISTS) {
+    if (!(single in sent) && !(list in sent)) continue;
+    const languages = (config[list] as string[] | undefined) ?? [];
+    const one = config[single] as string;
+    if (single in sent && one !== (languages[0] ?? ''))
+      config[list] = one ? [one, ...languages.filter((l) => l !== one)] : [];
+    config[single] = (config[list] as string[] | undefined)?.[0] ?? '';
+  }
+  return config;
+}
+
 export async function storedUserConfiguration(scope: WatchScope) {
   const stored = await JellyfinRepository.getUserConfiguration(scope);
   return { ...userConfiguration(), ...userPreferences(stored) };
 }
 
-export function userPolicy(opts: { admin?: boolean; hidden?: boolean } = {}) {
+export function userPolicy(
+  opts: { admin?: boolean; hidden?: boolean; forKey?: boolean } = {}
+) {
   return {
     IsAdministrator: opts.admin ?? false,
     IsHidden: opts.hidden ?? false,
@@ -137,7 +192,8 @@ export function userPolicy(opts: { admin?: boolean; hidden?: boolean } = {}) {
       'Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider',
     PasswordResetProviderId:
       'Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider',
-    SyncPlayAccess: 'None',
+    // A key has no session to join a group with.
+    SyncPlayAccess: opts.forKey ? 'None' : 'CreateAndJoinGroups',
   };
 }
 
@@ -179,15 +235,9 @@ export function userDto(
     LastActivityDate: now,
     Configuration: userConfiguration(),
     Policy: opts.forKey
-      ? userPolicy({ admin: !persona, hidden: persona?.hidden })
+      ? userPolicy({ admin: !persona, hidden: persona?.hidden, forKey: true })
       : userPolicy(),
   };
-}
-
-function sessionId(client: ClientInfo, userId: string): string {
-  return createHash('md5')
-    .update(`${client.name}${client.deviceId}${userId}`)
-    .digest('hex');
 }
 
 export function sessionInfo(
@@ -210,13 +260,13 @@ export function sessionInfo(
     AdditionalUsers: [],
     Capabilities: {
       PlayableMediaTypes: ['Video'],
-      SupportedCommands: [],
+      SupportedCommands: [] as string[],
       SupportsMediaControl: false,
       SupportsPersistentIdentifier: false,
     },
     RemoteEndPoint: remoteIp ?? '',
     PlayableMediaTypes: ['Video'],
-    Id: sessionId(client, userId),
+    Id: sessionIdOf(client, userId),
     UserId: userId,
     UserName: persona?.name ?? accountName(userData),
     Client: client.name,
@@ -231,7 +281,7 @@ export function sessionInfo(
     NowPlayingQueue: [],
     HasCustomDeviceName: false,
     ServerId: instanceServerId(),
-    SupportedCommands: [],
+    SupportedCommands: [] as string[],
   };
 }
 
@@ -273,18 +323,43 @@ export async function authenticationResult(
   };
 }
 
-/** Every user of one configuration, the account first. */
-export function allUsers(
+/** Off the sign-in picker and out of other users' lists. */
+function isHidden(userData: Faced, user: JellyfinPersona | null): boolean {
+  return !!(user ? user.hidden : userData.jellyfin?.primary?.hidden);
+}
+
+/** A list shows its caller and the users not hidden; a hidden persona sees only itself. */
+export function listedFor(
+  userData: Faced,
+  caller: JellyfinPersona | null,
+  user: JellyfinPersona | null
+): boolean {
+  if ((caller?.id ?? '') === (user?.id ?? '')) return true;
+  return !caller?.hidden && !isHidden(userData, user);
+}
+
+/** The account first; an API key lists every user it can act as. */
+function allUsers(
   uuid: string,
   userData: UserData,
+  caller: JellyfinPersona | null,
   opts: { forKey?: boolean } = {}
 ) {
-  return [
-    userDto(uuid, userData, null, opts),
-    ...personasOf(userData)
-      .filter((p) => (opts.forKey ? !personaLocked(p) : !p.hidden))
-      .map((p) => userDto(uuid, userData, p, opts)),
-  ];
+  return [null, ...personasOf(userData)]
+    .filter((p) =>
+      opts.forKey ? !p || !personaLocked(p) : listedFor(userData, caller, p)
+    )
+    .map((p) => userDto(uuid, userData, p, opts));
+}
+
+/** A personal address lists its own user, any other picker everyone not hidden. */
+export function pickerListed(
+  mount: PickerMount,
+  userData: UserData
+): (JellyfinPersona | null)[] {
+  return mount.persona
+    ? personasOf(userData).filter((p) => p.id === mount.persona && p.hidden)
+    : [null, ...personasOf(userData)].filter((p) => !isHidden(userData, p));
 }
 
 /**
@@ -314,7 +389,13 @@ router.get(
       : null;
     // Without a configuration to list for, an empty list is what makes a
     // client show the manual form that takes a uuid or alias.
-    res.json(mount && userData ? allUsers(mount.uuid, userData) : []);
+    res.json(
+      mount && userData
+        ? pickerListed(mount, userData).map((p) =>
+            userDto(mount.uuid, userData, p)
+          )
+        : []
+    );
   })
 );
 
@@ -355,22 +436,50 @@ function parseSignIn(
       };
 }
 
+type PickerMount = NonNullable<Request['jfMount']>;
+
+interface PickerTarget {
+  userData: UserData;
+  persona: JellyfinPersona;
+}
+
+/** The persona a picker sign-in names. A personal address takes only its own user's name, or none. */
+async function pickerTarget(
+  mount: PickerMount,
+  name: string
+): Promise<PickerTarget | null> {
+  const userData = await resolveConfig(mount.uuid, mount.encryptedPassword);
+  if (!userData) return null;
+  if (!mount.persona) {
+    const persona = personaByName(userData, name);
+    return persona ? { userData, persona } : null;
+  }
+  const persona = personaById(userData, mount.persona);
+  if (!persona?.hidden) return null;
+  const wanted = name.trim().toLowerCase();
+  return !wanted ||
+    wanted === persona.id ||
+    wanted === persona.name.trim().toLowerCase()
+    ? { userData, persona }
+    : null;
+}
+
 /** Shorter PINs are too easy to guess once the picker address has leaked. */
 const PIN_ONLY_PATTERN = /^\d{6,12}$/;
 
 /** The picker address's credential stands in for the password. */
 async function pinOnlySignIn(
-  mount: { uuid: string; encryptedPassword: string },
-  personaName: string,
+  mount: PickerMount,
+  target: PickerTarget,
   pin: string
-): Promise<{ userData: UserData; persona: JellyfinPersona } | null> {
-  if (!appConfig.jellyfin.pinSignIn || !personaName) return null;
-  if (!PIN_ONLY_PATTERN.test(pin)) return null;
-  const userData = await resolveConfig(mount.uuid, mount.encryptedPassword);
-  const persona = userData ? personaByName(userData, personaName) : null;
-  if (!userData || !persona || !personaLocked(persona)) return null;
-  if (!(await userUnlocks(mount.uuid, userData, persona, pin))) return null;
-  return { userData, persona };
+): Promise<boolean> {
+  if (!appConfig.jellyfin.pinSignIn || !PIN_ONLY_PATTERN.test(pin)) {
+    return false;
+  }
+  return (
+    personaLocked(target.persona) &&
+    userUnlocks(mount.uuid, target.userData, target.persona, pin)
+  );
 }
 
 router.post(
@@ -403,10 +512,17 @@ router.post(
       res.status(401).json({ Message: 'Invalid username or password' });
       return;
     }
+    const own = mount?.persona ? await pickerTarget(mount, personaName) : null;
+    if (mount?.persona && !own) {
+      res.status(401).json({ Message: 'Invalid username or password' });
+      return;
+    }
     const proven = await checkPassword(uuid, pw);
     if (!proven) {
-      const byPin = mount ? await pinOnlySignIn(mount, personaName, pw) : null;
-      if (!mount || !byPin) {
+      const byPin =
+        own ??
+        (mount && personaName ? await pickerTarget(mount, personaName) : null);
+      if (!mount || !byPin || !(await pinOnlySignIn(mount, byPin, pw))) {
         res.status(401).json({ Message: 'Invalid username or password' });
         return;
       }
@@ -439,13 +555,14 @@ router.post(
       return;
     }
     // On a picker address the account also answers to its alias, after its users.
-    const signIn =
-      resolveSignIn(userData, personaName) ??
-      (mount &&
-      (await resolvePickerAlias(personaName))?.uuid.toLowerCase() ===
-        uuid.toLowerCase()
-        ? { persona: null }
-        : null);
+    const signIn = own
+      ? { persona: own.persona }
+      : (resolveSignIn(userData, personaName) ??
+        (mount &&
+        (await resolvePickerAlias(personaName))?.uuid.toLowerCase() ===
+          uuid.toLowerCase()
+          ? { persona: null }
+          : null));
     if (!signIn) {
       res.status(401).json({ Message: 'Invalid username or password' });
       return;
@@ -538,7 +655,9 @@ router.get(
 router.get(
   '/Users',
   jf(async (_req, res, ctx) => {
-    res.json(allUsers(ctx.uuid, ctx.userData, { forKey: !!ctx.apiKey }));
+    res.json(
+      allUsers(ctx.uuid, ctx.userData, ctx.persona, { forKey: !!ctx.apiKey })
+    );
   })
 );
 /* Read only: a user token's persona is its own, never the id in the URL. */
@@ -546,12 +665,12 @@ router.get(
   '/Users/:userId',
   jf(async (req, res, ctx) => {
     const wanted = param(req, 'userId').toLowerCase();
-    const persona =
-      wanted === personaUserId(ctx.uuid, '')
-        ? null
-        : (personasOf(ctx.userData).find(
-            (p) => personaUserId(ctx.uuid, p.id) === wanted
-          ) ?? ctx.persona);
+    const found = [null, ...personasOf(ctx.userData)].find(
+      (p) =>
+        personaUserId(ctx.uuid, p?.id ?? '') === wanted &&
+        (!ctx.persona || listedFor(ctx.userData, ctx.persona, p))
+    );
+    const persona = found === undefined ? ctx.persona : found;
     res.json({
       ...userDto(ctx.uuid, ctx.userData, persona, { forKey: !!ctx.apiKey }),
       Configuration: await storedUserConfiguration(
@@ -571,10 +690,11 @@ router.post(
   ['/Users/Configuration', '/Users/:userId/Configuration'],
   jf(async (req, res, ctx) => {
     const stored = await JellyfinRepository.getUserConfiguration(ctx.watch);
-    await JellyfinRepository.setUserConfiguration(ctx.watch, {
-      ...userPreferences(stored),
-      ...userPreferences(req.body),
-    });
+    const sent = userPreferences(req.body);
+    await JellyfinRepository.setUserConfiguration(
+      ctx.watch,
+      withLanguageLists({ ...userPreferences(stored), ...sent }, sent)
+    );
     res.status(204).end();
   })
 );
@@ -592,12 +712,38 @@ router.post(
 
 const SESSIONS_LIMIT = 50;
 
+/** The tracks of the version a session plays, while its memo lasts. */
+async function playingStreams(
+  ctx: JellyfinRequestContext,
+  row: WatchSessionRow
+): Promise<JellyfinMediaStream[] | undefined> {
+  if (!row.playSessionId || !row.mediaSourceId) return undefined;
+  const pointer = await resolveByPlaySession(row.playSessionId);
+  if (!pointer?.scope || pointer.uuid !== ctx.uuid) return undefined;
+  const memo = await resolveByItem(pointer.uuid, pointer.scope, pointer.itemId);
+  if (!memo) return undefined;
+  // The first version offered carries the item's id.
+  const record = pickSource(
+    memo,
+    row.mediaSourceId === memo.itemId ? undefined : row.mediaSourceId
+  );
+  return record
+    ? buildMediaStreams(record, {
+        subtitleFormat: (ext) =>
+          subtitleFormatFor(undefined, ctx.client.name, ext),
+        subtitleUrl: subtitleUrlFor(memo.itemId, record.msid),
+        playSessionId: memo.psid,
+      })
+    : undefined;
+}
+
 /** The caller's own session is the one this request is from, so it is active now. */
 export async function sessionFromRow(
   ctx: JellyfinRequestContext,
   row: WatchSessionRow,
   user: JellyfinPersona | null,
-  own: { remoteIp: string | undefined } | null
+  own: { remoteIp: string | undefined } | null,
+  opts: { streams?: boolean } = {}
 ) {
   const client: ClientInfo = own
     ? ctx.client
@@ -616,7 +762,12 @@ export async function sessionFromRow(
   );
   const checkIn = new Date(row.lastCheckinAt).toISOString();
   const playing = row.endedAt == null;
-  const item = playing ? await summaryItem(ctx, row) : null;
+  const [item, streams] = playing
+    ? await Promise.all([
+        summaryItem(ctx, row),
+        opts.streams ? playingStreams(ctx, row) : undefined,
+      ])
+    : [null, undefined];
   return {
     ...session,
     LastActivityDate: own ? session.LastActivityDate : checkIn,
@@ -627,12 +778,114 @@ export async function sessionFromRow(
             ...session.PlayState,
             PositionTicks: msToTicks(row.positionMs),
             IsPaused: row.paused,
+            ...(row.mediaSourceId ? { MediaSourceId: row.mediaSourceId } : {}),
+            ...(row.audioStreamIndex != null
+              ? { AudioStreamIndex: row.audioStreamIndex }
+              : {}),
+            ...(row.subtitleStreamIndex != null
+              ? { SubtitleStreamIndex: row.subtitleStreamIndex }
+              : {}),
           },
         }
       : {}),
-    ...(item ? { NowPlayingItem: item } : {}),
+    ...(item
+      ? { NowPlayingItem: streams ? { ...item, MediaStreams: streams } : item }
+      : {}),
   };
 }
+
+function withRemote<S extends ReturnType<typeof sessionInfo>>(
+  session: S,
+  device: RemoteDevice
+): S {
+  return {
+    ...session,
+    Id: sessionIdOf(device.client, device.userId),
+    Capabilities: {
+      ...session.Capabilities,
+      PlayableMediaTypes: device.media,
+      SupportedCommands: device.commands,
+      SupportsMediaControl: device.mediaControl,
+    },
+    PlayableMediaTypes: device.media,
+    SupportedCommands: device.commands,
+    SupportsMediaControl: device.mediaControl,
+    SupportsRemoteControl: true,
+  };
+}
+
+/** One read of each history for what the devices play. */
+async function deviceSessions(
+  ctx: JellyfinRequestContext,
+  devices: RemoteDevice[]
+) {
+  const found = devices.flatMap((device) => {
+    const user = device.persona
+      ? personaById(ctx.userData, device.persona)
+      : null;
+    if (device.persona && !user) return [];
+    const scope = watchScopeOf(ctx.uuid, user);
+    const key = sessionKeyFor(device.client);
+    return [{ device, user, scope, key, at: `${scope.persona}|${key}` }];
+  });
+  const scopes = new Map(found.map((f) => [f.scope.persona, f.scope]));
+  const rows = new Map<string, WatchSessionRow>();
+  await Promise.all(
+    [...scopes.values()].map(async (scope) => {
+      const keys = found
+        .filter((f) => f.scope.persona === scope.persona)
+        .map((f) => f.key);
+      for (const row of await WatchSessionRepository.getMany(scope, keys))
+        rows.set(`${scope.persona}|${row.sessionKey}`, row);
+    })
+  );
+  return Promise.all(
+    found.map(async ({ device, user, at }) => {
+      const row = rows.get(at);
+      return withRemote(
+        row && row.endedAt == null
+          ? await sessionFromRow(ctx, row, user, null, { streams: true })
+          : sessionInfo(ctx.uuid, ctx.userData, user, device.client, undefined),
+        device
+      );
+    })
+  );
+}
+
+const sameDevice = (
+  session: ReturnType<typeof sessionInfo>,
+  device: RemoteDevice
+) =>
+  session.Client === device.client.name &&
+  session.DeviceId.toLowerCase() === device.client.deviceId.toLowerCase();
+
+/** The sessions on devices that take remote control, with what they take. */
+export function withControls<S extends ReturnType<typeof sessionInfo>>(
+  sessions: S[],
+  devices: RemoteDevice[]
+): S[] {
+  return sessions.map((s) => {
+    const device = devices.find((d) => sameDevice(s, d));
+    return device ? withRemote(s, device) : s;
+  });
+}
+
+async function withDevices<S extends ReturnType<typeof sessionInfo>>(
+  ctx: JellyfinRequestContext,
+  sessions: S[],
+  devices: RemoteDevice[]
+) {
+  const listed = withControls(sessions, devices);
+  const idle = await deviceSessions(
+    ctx,
+    devices.filter((d) => !sessions.some((s) => sameDevice(s, d)))
+  );
+  return [...listed, ...idle];
+}
+
+/** Not res.json: this route is never revalidated, so its ETag hash is wasted. */
+const send = (res: Response, body: unknown) =>
+  res.type('json').end(JSON.stringify(body));
 
 /*
  * A non-administrator sees only their own sessions, so a user token gets the
@@ -641,16 +894,19 @@ export async function sessionFromRow(
 router.get(
   '/Sessions',
   jf(async (req, res, ctx) => {
-    // lists only sessions that take remote control, and none here do.
-    if (qs(req, 'ControllableByUserId')) {
-      res.json([]);
-      return;
-    }
     const within = Number(qs(req, 'ActiveWithinSeconds'));
     const since = within > 0 ? Date.now() - within * 1000 : 0;
     const deviceId = qs(req, 'DeviceId')?.toLowerCase();
     const onDevice = (id: string | null) =>
       !deviceId || id?.toLowerCase() === deviceId;
+    const devices = (await controllableDevices(ctx)).filter((d) =>
+      onDevice(d.client.deviceId)
+    );
+
+    if (qs(req, 'ControllableByUserId')) {
+      send(res, await deviceSessions(ctx, devices));
+      return;
+    }
 
     if (ctx.apiKey) {
       const rows = await WatchSessionRepository.listForUuid(
@@ -665,7 +921,7 @@ router.get(
         if (userKey && !user) continue;
         sessions.push(sessionFromRow(ctx, row, user, null));
       }
-      res.json(await Promise.all(sessions));
+      send(res, await withDevices(ctx, await Promise.all(sessions), devices));
       return;
     }
 
@@ -701,16 +957,11 @@ router.get(
       ...(own ? [own] : []),
       ...others.map((r) => sessionFromRow(ctx, r, ctx.persona, null)),
     ]);
-    res.json(sessions);
+    send(res, await withDevices(ctx, sessions, devices));
   })
 );
 router.post(
-  [
-    '/Sessions/Capabilities',
-    '/Sessions/Capabilities/Full',
-    '/Sessions/Viewing',
-    '/Sessions/Logout',
-  ],
+  ['/Sessions/Viewing', '/Sessions/Logout'],
   jfOptional(async (_req, res) => {
     res.status(204).end();
   })

@@ -1,7 +1,13 @@
 pub mod bridge;
 pub mod discord;
+pub mod downloads;
 pub mod external;
+pub mod licenses;
 pub mod mpv;
 pub mod now_playing;
+pub mod playback;
 pub mod player;
 pub mod render;
+pub mod sound;
+pub mod thumbnails;
+pub mod youtube;

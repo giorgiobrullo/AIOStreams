@@ -13,6 +13,7 @@ import {
   getSimpleTextHash,
   isConfigUuid,
   isEncrypted,
+  JellyfinAddressRepository,
   PERSONA_PIN_PATTERN,
   verifyHash,
   mintToken,
@@ -36,6 +37,7 @@ import {
   type LeafEvidence,
   listViews,
   type ParsedMeta,
+  type TokenPayload,
   type ViewEntry,
   type UserData,
   type WatchScope,
@@ -169,6 +171,17 @@ export async function resolvePickerAlias(
   );
 }
 
+const ADDRESS_CODE = /^[a-z0-9]{10,32}$/;
+
+/** The configuration a `/p/<code>` sign-in address names. */
+export async function resolveAddressCode(
+  code: string
+): Promise<{ uuid: string; encryptedPassword: string } | null> {
+  return ADDRESS_CODE.test(code)
+    ? JellyfinAddressRepository.resolve(code)
+    : null;
+}
+
 export async function resolveUuid(uuidOrAlias: string): Promise<string | null> {
   if (isConfigUuid(uuidOrAlias)) return uuidOrAlias;
   const alias = await resolveConfigAlias(uuidOrAlias);
@@ -237,6 +250,39 @@ export async function resolveConfigFor(
   if (!uuid) return null;
   const entry = await resolveConfigEntry(uuid, encryptedPassword);
   return entry ? { uuid, userData: entry.userData } : null;
+}
+
+export interface TokenUser {
+  uuid: string;
+  userData: UserData;
+  persona: JellyfinPersona | null;
+  userId: string;
+  watch: WatchScope;
+  payload: TokenPayload;
+}
+
+/**
+ * The user a session token signs in, or null once it no longer does. API keys
+ * act for no one in particular, so they are none.
+ */
+export async function userForToken(token: string): Promise<TokenUser | null> {
+  const payload = readToken(token);
+  if (!payload || payload.a) return null;
+  // Resolved rather than verified: see `resolveConfigFor`.
+  const resolved = await resolveConfigFor(payload.u, payload.p);
+  if (!resolved) return null;
+  const { uuid, userData } = resolved;
+  const persona = payload.k ? personaById(userData, payload.k) : null;
+  if (payload.k && !persona) return null;
+  if ((payload.l ?? '') !== lockTag(userData, persona)) return null;
+  return {
+    uuid,
+    userData,
+    persona,
+    userId: personaUserId(uuid, persona?.id ?? ''),
+    watch: watchScopeOf(uuid, persona),
+    payload,
+  };
 }
 
 /** A persona with a history of its own keeps its watch state and preferences apart. */
@@ -409,6 +455,7 @@ const ANONYMOUS_OK = [
   /^\/system\/info\/public$/i,
   /^\/system\/ping$/i,
   /^\/system\/endpoint$/i,
+  /^\/getutctime$/i,
   /^\/users\/authenticatebyname$/i,
   /^\/users\/authenticatewithquickconnect$/i,
   /^\/users\/public$/i,
@@ -597,7 +644,7 @@ async function buildContext(
       userId,
       uuid,
       listVersions: wantsListVersions(req, client),
-      markUnaired: finalUserData.jellyfin?.markUnaired ?? true,
+      markUnaired: finalUserData.jellyfin?.markUnaired ?? false,
     },
     engine: getEngine,
     primaryEngine: getPrimaryEngine,
@@ -638,6 +685,13 @@ export const jellyfinContext: RequestHandler = async (req, res, next) => {
       const target = await resolvePickerAlias(params.alias);
       if (!target) {
         res.status(401).json({ Message: 'Unknown configuration' });
+        return;
+      }
+      req.jfMount = target;
+    } else if (params.code) {
+      const target = await resolveAddressCode(params.code);
+      if (!target) {
+        res.status(401).json({ Message: 'Unknown address' });
         return;
       }
       req.jfMount = target;

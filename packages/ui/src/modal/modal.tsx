@@ -5,6 +5,7 @@ import * as React from 'react';
 import { CloseButton } from '../button';
 import { cn, ComponentAnatomy, defineStyleAnatomy } from '../core/styling';
 import { keepsModalOpen } from '../core/utils';
+import { uiText } from '../core/text';
 
 /* -------------------------------------------------------------------------------------------------
  * Anatomy
@@ -14,6 +15,8 @@ export const ModalAnatomy = defineStyleAnatomy({
   overlay: cva([
     'UI-Modal__overlay',
     'fixed inset-0 w-screen z-50 bg-black/80',
+    // A layer that outlives the fade, which an Android web view draws empty for a frame as it ends.
+    'will-change-[opacity]',
     'data-[state=open]:animate-in data-[state=closed]:animate-out',
     'data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
     // "overflow-y-auto p-0 md:p-4 grid place-items-center",
@@ -21,19 +24,18 @@ export const ModalAnatomy = defineStyleAnatomy({
   content: cva([
     'UI-Modal__content',
     'z-50 grid relative w-full w-full shadow-xl border border-[rgb(255_255_255_/_5%)] max-w-lg gap-4 bg-[--paper] p-6 duration-200',
+    // A column no wider than the box, which unwrapped text would widen past it.
+    'grid-cols-[minmax(0,1fr)]',
+    'will-change-[opacity,transform]',
     'data-[state=open]:animate-in data-[state=closed]:animate-out',
     'data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
-    // "data-[state=open]:slide-in-from-top-[40%] data-[state=closed]:slide-out-to-bottom-[40%]",
-    // "data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%]",
     'data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
-    // process.env.NEXT_PUBLIC_PLATFORM === "desktop" && "mt-10",
-    // process.env.NEXT_PUBLIC_PLATFORM === "desktop" && "select-none",
     'sm:rounded-2xl',
   ]),
-  close: cva(['UI-Modal__close', 'absolute right-4 top-4 !mt-0']),
+  close: cva(['UI-Modal__close', 'absolute end-4 top-4 !mt-0']),
   header: cva([
     'UI-Modal__header',
-    'flex flex-col space-y-1.5 min-w-0 text-center sm:text-left',
+    'flex flex-col space-y-1.5 min-w-0 text-center sm:text-start',
   ]),
   footer: cva([
     'UI-Modal__footer',
@@ -168,7 +170,7 @@ export function Modal(props: ModalProps) {
             >
               {!title && !description ? (
                 <VisuallyHidden>
-                  <DialogPrimitive.Title>Dialog</DialogPrimitive.Title>
+                  <DialogPrimitive.Title>{uiText.dialog}</DialogPrimitive.Title>
                 </VisuallyHidden>
               ) : (
                 <div className={cn(ModalAnatomy.header(), headerClass)}>

@@ -30,7 +30,7 @@ import {
 } from '../parser/utils.js';
 import { normaliseCountryCode } from '../utils/countries.js';
 import { partial_ratio } from 'fuzzball';
-import { ParsedResult } from '@viren070/parse-torrent-title';
+import { ParsedResult } from '@aiostreams/release-parser';
 import { parseTorrentTitleCached } from '../parser/title.js';
 import { unwrapProxyUrl } from '../proxy/token.js';
 
@@ -241,6 +241,7 @@ export interface NZB extends BaseFile {
   zyclopsHealth?: string;
   serviceItemId?: string;
   releaseKey?: string;
+  infoUrl?: string;
 }
 
 export interface TorrentWithSelectedFile extends Torrent {

@@ -6,6 +6,7 @@ import { WheelGesturesPlugin } from 'embla-carousel-wheel-gestures';
 import * as React from 'react';
 import { IconButton } from '../button';
 import { cn, defineStyleAnatomy } from '../core/styling';
+import { uiText } from '../core/text';
 
 /* -------------------------------------------------------------------------------------------------
  * Anatomy
@@ -16,15 +17,15 @@ export const CarouselAnatomy = defineStyleAnatomy({
   content: cva(['UI-Carousel__content', 'overflow-hidden']),
   innerContent: cva(['UI-Carousel__innerContent', 'flex'], {
     variants: {
-      gap: { none: 'ml-0', sm: '-ml-2', md: '-ml-4', lg: '-ml-6' },
+      gap: { none: 'ms-0', sm: '-ms-2', md: '-ms-4', lg: '-ms-6' },
     },
   }),
   item: cva(['UI-Carousel__item', 'min-w-0 shrink-0 grow-0 basis-full'], {
     variants: {
-      gap: { none: 'pl-0', sm: 'pl-2', md: 'pl-4', lg: 'pl-6' },
+      gap: { none: 'ps-0', sm: 'ps-2', md: 'ps-4', lg: 'ps-6' },
     },
   }),
-  chevronIcon: cva(['UI-Carousel__chevronIcon', 'size-6']),
+  chevronIcon: cva(['UI-Carousel__chevronIcon', 'size-6 rtl:-scale-x-100']),
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -58,6 +59,8 @@ export function useCarousel() {
   return context;
 }
 
+const rtl = () => document.documentElement.dir === 'rtl';
+
 /** `scrollTo` only lands on snaps. */
 function jumpTo(emblaApi: EmblaApi, location: number) {
   const engine = emblaApi.internalEngine();
@@ -71,6 +74,7 @@ function jumpTo(emblaApi: EmblaApi, location: number) {
     vector.set(at);
   }
   engine.translate.to(at);
+  engine.index.set(engine.scrollTarget.byDistance(0, false).index);
 }
 
 /**
@@ -98,39 +102,100 @@ function useKeepPositionOnReInit(api: CarouselApi) {
   }, [api]);
 }
 
+/** How long a row glides to a focused slide. */
+const GLIDE_MS = 300;
+
 /**
  * Scrolls a focused slide just into view. Focus would otherwise scroll the
- * clipped viewport itself, which Embla can't see.
+ * clipped viewport itself, which Embla can't see. The row jumps and a CSS
+ * transition eases it on the compositor, where Embla's own easing would run
+ * script on every frame for over a second.
  */
-function useFollowFocus(api: CarouselApi) {
+function useFollowFocus(api: CarouselApi, anchor?: () => boolean) {
+  const anchors = React.useRef(anchor);
+  anchors.current = anchor;
   React.useEffect(() => {
     if (!api) return;
     const viewport = api.rootNode();
+    const container = api.containerNode();
+    let settle = 0;
+    const still = () => {
+      window.clearTimeout(settle);
+      container.style.transition = '';
+    };
     const follow = () => {
       viewport.scrollLeft = 0;
       const focused = document.activeElement;
       const slide = api.slideNodes().find((s) => s.contains(focused));
       if (!slide) return;
       const engine = api.internalEngine();
-      // Where the slide lands once any scroll under way finishes.
-      const ahead = engine.target.get() - engine.location.get();
       const view = viewport.getBoundingClientRect();
+      const box = container.getBoundingClientRect();
       const rect = slide.getBoundingClientRect();
-      const left = rect.left + ahead - view.left;
-      const right = rect.right + ahead - view.right;
-      const shift = left < 0 ? left : right > 0 ? Math.min(right, left) : 0;
+      // Where the row shows now, short of Embla's target while it glides.
+      const { transform } = getComputedStyle(container);
+      const shown =
+        transform === 'none' ? 0 : new DOMMatrixReadOnly(transform).m41;
+      // Embla draws a right-to-left row mirrored: its target, negated.
+      const sign = rtl() ? -1 : 1;
+      const left = rect.left - view.left + sign * engine.target.get() - shown;
+      const right = left + rect.width - view.width;
+      const first = api.slideNodes()[0];
+      const shift = anchors.current?.()
+        ? Math.abs(slide.offsetLeft - first.offsetLeft) +
+          sign * engine.target.get()
+        : left < 0
+          ? left
+          : right > 0
+            ? Math.min(right, left)
+            : 0;
       if (!shift) return;
-      engine.scrollBody.useBaseDuration().useBaseFriction();
-      engine.scrollTo.distance(-shift, false);
+      window.clearTimeout(settle);
+      container.style.transition = `transform ${GLIDE_MS}ms ease-out`;
+      settle = window.setTimeout(still, GLIDE_MS + 50);
+      jumpTo(api, engine.target.get() - sign * shift);
+      api.emit('scroll');
     };
     const onScroll = () => {
       if (viewport.scrollLeft) follow();
     };
     viewport.addEventListener('focusin', follow);
     viewport.addEventListener('scroll', onScroll);
+    api.on('pointerDown', still);
     return () => {
+      still();
       viewport.removeEventListener('focusin', follow);
       viewport.removeEventListener('scroll', onScroll);
+      api.off('pointerDown', still);
+    };
+  }, [api]);
+}
+
+/**
+ * Marks slides scrolled out of sight `data-nav-out`, from Embla's own
+ * tracking, so arrow navigation needn't measure them. Unmarked until Embla
+ * reports, so a new slide is never wrongly out.
+ */
+function useMarkOutOfView(api: CarouselApi) {
+  React.useEffect(() => {
+    if (!api) return;
+    const clear = (emblaApi: EmblaApi) => {
+      for (const node of emblaApi.slideNodes())
+        node.removeAttribute('data-nav-out');
+    };
+    const mark = (emblaApi: EmblaApi) => {
+      const seen = new Set(emblaApi.slidesInView());
+      emblaApi
+        .slideNodes()
+        .forEach((node, i) =>
+          node.toggleAttribute('data-nav-out', !seen.has(i))
+        );
+    };
+    api.on('reInit', clear);
+    api.on('slidesInView', mark);
+    return () => {
+      api.off('reInit', clear);
+      api.off('slidesInView', mark);
     };
   }, [api]);
 }
@@ -162,6 +227,8 @@ export type CarouselProps = React.HTMLAttributes<HTMLDivElement> & {
   plugins?: CarouselPlugins;
   gap?: CarouselGap;
   restoreKey?: string;
+  /** Whether a slide focused now goes where the first one starts, rather than just into view. */
+  anchor?: () => boolean;
 };
 
 export const Carousel = React.forwardRef<HTMLDivElement, CarouselProps>(
@@ -171,24 +238,34 @@ export const Carousel = React.forwardRef<HTMLDivElement, CarouselProps>(
       plugins,
       gap = 'md',
       restoreKey,
+      anchor,
       className,
       children,
       ...rest
     } = props;
 
     const [carouselRef, api] = useEmblaCarousel(
-      { ...opts, axis: 'x', watchFocus: false },
+      {
+        ...opts,
+        axis: 'x',
+        direction: rtl() ? 'rtl' : 'ltr',
+        watchFocus: false,
+      },
       [WheelGesturesPlugin(), ...(plugins ?? [])]
     );
     const [canScrollPrev, setCanScrollPrev] = React.useState(false);
     const [canScrollNext, setCanScrollNext] = React.useState(false);
     useKeepPositionOnReInit(api);
     useRestorePosition(api, restoreKey);
-    useFollowFocus(api);
+    useFollowFocus(api, anchor);
+    useMarkOutOfView(api);
 
+    // Embla's own answer is about the selected snap, which a free drag can
+    // leave short of the edge.
     const onSelect = React.useCallback((emblaApi: EmblaApi) => {
-      setCanScrollPrev(emblaApi.canScrollPrev());
-      setCanScrollNext(emblaApi.canScrollNext());
+      const { limit, target } = emblaApi.internalEngine();
+      setCanScrollPrev(target.get() < limit.max - 0.5);
+      setCanScrollNext(target.get() > limit.min + 0.5);
     }, []);
 
     const scrollPrev = React.useCallback(() => api?.scrollPrev(), [api]);
@@ -335,7 +412,7 @@ export const CarouselPrevious = React.forwardRef<
       disabled={!canScrollPrev}
       onClick={scrollPrev}
       tabIndex={-1}
-      aria-label="Previous"
+      aria-label={uiText.previous}
       icon={<Chevron path="m15 18-6-6 6-6" className={chevronIconClass} />}
       {...rest}
     />
@@ -364,7 +441,7 @@ export const CarouselNext = React.forwardRef<
       disabled={!canScrollNext}
       onClick={scrollNext}
       tabIndex={-1}
-      aria-label="Next"
+      aria-label={uiText.next}
       icon={<Chevron path="m9 18 6-6-6-6" className={chevronIconClass} />}
       {...rest}
     />

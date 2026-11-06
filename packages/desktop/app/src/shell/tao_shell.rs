@@ -24,8 +24,12 @@ use crate::placement::{self, MIN_SIZE, Placement, SETTLE};
 use crate::updates::Updater;
 use crate::{
     App, Edge, UserEvent, allowed_navigation, handle, platform, receive_script, serve,
-    start_external, start_player,
+    start_downloads, start_external, start_player,
 };
+use aiostreams_desktop_core::downloads::Command as DownloadCommand;
+
+#[cfg(target_os = "macos")]
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub fn webview_version() -> String {
     wry::webview_version().unwrap_or_else(|_| "missing".into())
@@ -132,6 +136,8 @@ pub fn run(app: App) {
         }
     });
     #[cfg(target_os = "macos")]
+    platform::load_video_output(&data_dir);
+    #[cfg(target_os = "macos")]
     let _menu = platform::install_menu({
         let proxy = proxy.clone();
         move || {
@@ -176,6 +182,12 @@ pub fn run(app: App) {
         }
     });
     video.attach(started.mpv());
+    video.on_input({
+        let proxy = proxy.clone();
+        move |message: Outbound| {
+            let _ = proxy.send_event(UserEvent::Emit(receive_script(&message)));
+        }
+    });
     let player = Rc::new(RefCell::new(Some(started)));
     let external = Rc::new(start_external(&paths, {
         let proxy = proxy.clone();
@@ -184,6 +196,12 @@ pub fn run(app: App) {
         }
     }));
     let updater = Rc::new(Updater::start({
+        let proxy = proxy.clone();
+        move |message: Outbound| {
+            let _ = proxy.send_event(UserEvent::Emit(receive_script(&message)));
+        }
+    }));
+    let downloads = Rc::new(start_downloads(&paths, {
         let proxy = proxy.clone();
         move |message: Outbound| {
             let _ = proxy.send_event(UserEvent::Emit(receive_script(&message)));
@@ -223,6 +241,7 @@ pub fn run(app: App) {
         .with_ipc_handler({
             let (player, proxy, app_origin) = (player.clone(), proxy.clone(), app_origin.clone());
             let (external, paths, updater) = (external.clone(), paths.clone(), updater.clone());
+            let downloads = downloads.clone();
             move |req: Request<String>| {
                 let from = origin(&req.uri().to_string()).unwrap_or_default();
                 if from != app_origin {
@@ -232,7 +251,9 @@ pub fn run(app: App) {
                     let _ = proxy.send_event(event);
                 };
                 match serde_json::from_str::<Inbound>(req.body()) {
-                    Ok(message) => handle(message, &player, &external, &send, &paths, &updater),
+                    Ok(message) => handle(
+                        message, &player, &external, &send, &paths, &updater, &downloads,
+                    ),
                     Err(e) => log::warn!("bad message: {e}"),
                 }
             }
@@ -247,9 +268,14 @@ pub fn run(app: App) {
                 allowed
             }
         })
-        .with_new_window_req_handler(|url, _| {
-            platform::open_external(&url);
-            NewWindowResponse::Deny
+        .with_new_window_req_handler({
+            let app_origin = app_origin.clone();
+            move |url, _| {
+                if !allowed_navigation(&url, &app_origin) {
+                    platform::open_external(&url);
+                }
+                NewWindowResponse::Deny
+            }
         })
         .with_on_page_load_handler({
             let (player, external, inbox) = (player.clone(), external.clone(), inbox.clone());
@@ -291,6 +317,8 @@ pub fn run(app: App) {
     let mut maximized = window.is_maximized();
     let mut remaximize = false;
     let mut save_at: Option<Instant> = None;
+    #[cfg(target_os = "macos")]
+    let mut exit_at: Option<Instant> = None;
     event_loop.run(move |event, _, flow| {
         if save_at.is_some_and(|at| Instant::now() >= at) {
             save_at = None;
@@ -298,6 +326,14 @@ pub fn run(app: App) {
             placement::save(&data_dir, &placement);
         }
         *flow = save_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
+        #[cfg(target_os = "macos")]
+        if let Some(at) = exit_at {
+            *flow = if Instant::now() >= at {
+                ControlFlow::Exit
+            } else {
+                ControlFlow::WaitUntil(at)
+            };
+        }
         let emit = |message: Outbound| {
             let _ = webview.evaluate_script(&receive_script(&message));
         };
@@ -318,6 +354,8 @@ pub fn run(app: App) {
                     maximized = now;
                     emit(Outbound::WindowState { maximized: now });
                 }
+                #[cfg(target_os = "macos")]
+                video.refresh_hdr();
                 let at = Instant::now() + SETTLE;
                 save_at = Some(at);
                 *flow = ControlFlow::WaitUntil(at);
@@ -326,6 +364,9 @@ pub fn run(app: App) {
                 event: WindowEvent::Moved(_),
                 ..
             } => {
+                // Another screen may take over the window, with its own EDR headroom.
+                #[cfg(target_os = "macos")]
+                video.refresh_hdr();
                 let at = Instant::now() + SETTLE;
                 save_at = Some(at);
                 *flow = ControlFlow::WaitUntil(at);
@@ -342,14 +383,37 @@ pub fn run(app: App) {
                 ..
             }
             | Event::UserEvent(UserEvent::Close) => {
+                #[cfg(target_os = "macos")]
+                if exit_at.is_some() {
+                    return;
+                }
                 log::info!("closing");
                 record(&window, &mut placement);
                 placement::save(&data_dir, &placement);
                 video.shutdown();
-                player.borrow_mut().take();
-                external.close();
-                *flow = ControlFlow::Exit;
+                let player = player.borrow_mut().take();
+                // mpv's AVFoundation output tears down on the main thread, so the loop runs until it has.
+                #[cfg(target_os = "macos")]
+                {
+                    window.set_visible(false);
+                    let proxy = proxy.clone();
+                    std::thread::spawn(move || {
+                        drop(player);
+                        let _ = proxy.send_event(UserEvent::Closed);
+                    });
+                    external.close();
+                    let at = Instant::now() + CLOSE_WAIT;
+                    exit_at = Some(at);
+                    *flow = ControlFlow::WaitUntil(at);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    drop(player);
+                    external.close();
+                    *flow = ControlFlow::Exit;
+                }
             }
+            Event::UserEvent(UserEvent::Closed) => *flow = ControlFlow::Exit,
             Event::UserEvent(UserEvent::Emit(script)) => {
                 let _ = webview.evaluate_script(&script);
             }
@@ -357,6 +421,9 @@ pub fn run(app: App) {
                 set_fullscreen(&window, value, &mut remaximize)
             }
             Event::UserEvent(UserEvent::Minimize) => window.set_minimized(true),
+            Event::UserEvent(UserEvent::VideoFrame(frame)) => {
+                video.frame(frame, window.scale_factor());
+            }
             Event::UserEvent(UserEvent::Drag) => {
                 let _ = window.drag_window();
             }
@@ -397,6 +464,12 @@ pub fn run(app: App) {
                     external.set_program(kind, path);
                 }
                 emit(external.players());
+            }
+            Event::UserEvent(UserEvent::ChooseDownloadFolder) => {
+                if let Some(folder) = platform::choose_folder(&window, "Choose where downloads go")
+                {
+                    downloads.send(DownloadCommand::SetFolder(folder));
+                }
             }
             Event::UserEvent(UserEvent::Sync) => {
                 if let Some(p) = player.borrow().as_ref() {

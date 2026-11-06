@@ -19,11 +19,14 @@ import usersRouter from './users.js';
 import quickConnectRouter from './quickconnect.js';
 import segmentsRouter from './segments.js';
 import stubsRouter from './stubs.js';
+import syncPlayRouter from './syncplay.js';
+import remoteRouter from './remote.js';
 import libraryRouter from './library.js';
 import playbackRouter from './playback.js';
 import subtitlesRouter from './subtitles.js';
 import imagesRouter from './images.js';
 import playstateRouter from './playstate.js';
+import playlistsRouter from './playlists.js';
 import webRouter from './web.js';
 import { jellyfinWebRoot } from '../../app.js';
 
@@ -43,13 +46,14 @@ export const jellyfinCors: express.RequestHandler = (req, res, next) => {
   );
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-MediaBrowser-Token, Range'
+    'Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-MediaBrowser-Token, Range, X-AIOStreams-Client, X-AIOStreams-Device, X-AIOStreams-Platform, X-AIOStreams-Network, X-AIOStreams-Purpose'
   );
   res.setHeader(
     'Access-Control-Expose-Headers',
-    'Content-Length, Content-Range'
+    'Content-Length, Content-Range, Retry-After'
   );
   if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Max-Age', '86400');
     res.status(204).end();
     return;
   }
@@ -203,12 +207,15 @@ export function createJellyfinRouter(): Router {
   router.use(jellyfinContext);
   router.use(webRouter);
   router.use(systemRouter);
+  router.use(syncPlayRouter);
+  router.use(remoteRouter);
   router.use(usersRouter);
   router.use(quickConnectRouter);
   router.use(playbackRouter);
   router.use(subtitlesRouter);
   router.use(imagesRouter);
   router.use(playstateRouter);
+  router.use(playlistsRouter);
   router.use(libraryRouter);
   router.use(segmentsRouter);
   router.use(stubsRouter);

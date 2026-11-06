@@ -14,10 +14,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aiostreams_desktop_core::bridge::{Inbound, Outbound, PROTOCOL_VERSION, origin};
+use aiostreams_desktop_core::bridge::{Inbound, Outbound, PROTOCOL_VERSION, VideoFrame, origin};
+use aiostreams_desktop_core::downloads::{self, Downloads};
 use aiostreams_desktop_core::external::{self, External};
+use aiostreams_desktop_core::playback::{self, PlayerState};
 use aiostreams_desktop_core::player::Player;
-use aiostreams_desktop_core::{discord, now_playing};
+use aiostreams_desktop_core::{discord, licenses, now_playing, thumbnails};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use updates::{Command, Updater};
@@ -26,8 +28,11 @@ use updates::{Command, Updater};
 pub enum UserEvent {
     Emit(String),
     Fullscreen(Option<bool>),
+    VideoFrame(Option<VideoFrame>),
     Minimize,
     Close,
+    /// The player closed after the window did.
+    Closed,
     Sync,
     Drag,
     Resize(Edge),
@@ -37,6 +42,7 @@ pub enum UserEvent {
     Link(String),
     LinksReady,
     ChoosePlayer(external::Kind),
+    ChooseDownloadFolder,
 }
 
 /// The window edges the page resizes from; the system handles the others.
@@ -92,6 +98,20 @@ fn portable_root() -> Option<PathBuf> {
     root.join(".portable").is_file().then(|| root.to_path_buf())
 }
 
+/// Beside the app or libmpv, or in a macOS bundle's Resources beside either.
+fn licence_dirs() -> Vec<PathBuf> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(PathBuf::from));
+    let libmpv = platform::libmpv_candidates()
+        .into_iter()
+        .filter_map(|p| p.parent().map(PathBuf::from));
+    exe.into_iter()
+        .chain(libmpv)
+        .flat_map(|dir| [dir.join("../Resources"), dir])
+        .collect()
+}
+
 fn web_dir(args: &Args) -> PathBuf {
     let mut candidates: Vec<PathBuf> = args.web_dir.iter().cloned().collect();
     candidates.extend(std::env::var_os("AIOSTREAMS_WEB_DIR").map(PathBuf::from));
@@ -106,7 +126,7 @@ fn web_dir(args: &Args) -> PathBuf {
     if cfg!(debug_assertions) {
         candidates.push(PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../jellyfin-web/dist-standalone"
+            "/../../web/dist-standalone"
         )));
     }
     candidates
@@ -115,7 +135,7 @@ fn web_dir(args: &Args) -> PathBuf {
         .cloned()
         .unwrap_or_else(|| {
             platform::fatal(&format!(
-                "The web app was not found. Build it with `pnpm -F @aiostreams/jellyfin-web build:standalone`. Looked in:\n{}",
+                "The web app was not found. Build it with `pnpm -F @aiostreams/web build:standalone`. Looked in:\n{}",
                 candidates
                     .iter()
                     .map(|p| p.display().to_string())
@@ -146,8 +166,15 @@ pub struct Served {
     pub body: Vec<u8>,
 }
 
-/// Serves the web app's files; a path without an extension is one of its routes.
+/// Serves the web app's files and thumbnails; a path without an extension is one of its routes.
 pub fn serve(root: Option<&Path>, path: &str) -> Served {
+    if let Some(body) = thumbnails::image(path) {
+        return Served {
+            status: 200,
+            content_type: "image/jpeg",
+            body,
+        };
+    }
     let not_found = Served {
         status: 404,
         content_type: "text/plain",
@@ -191,6 +218,10 @@ pub struct Paths {
     log_file: PathBuf,
     players: PathBuf,
     subtitles: PathBuf,
+    /// The download queue, kept across restarts.
+    downloads: PathBuf,
+    /// Where downloads go until the user picks a folder.
+    download_folder: PathBuf,
 }
 
 pub struct App {
@@ -243,9 +274,14 @@ fn main() {
     velopack.run();
     #[cfg(windows)]
     platform::claim_app_id();
-    let (config_dir, data_dir) = match portable_root() {
+    let portable = portable_root();
+    let (config_dir, data_dir) = match &portable {
         Some(root) => (root.join("data"), root.join("data")),
         None => (app_dir(dirs::config_dir()), app_dir(dirs::data_local_dir())),
+    };
+    let download_folder = match (&portable, dirs::video_dir()) {
+        (None, Some(videos)) => videos.join("AIOStreams"),
+        _ => data_dir.join("downloads"),
     };
     let logs = data_dir.join("logs");
     let log_file = logging::init(&logs);
@@ -280,6 +316,8 @@ fn main() {
         log_file,
         players: config_dir.join("players.json"),
         subtitles,
+        downloads: data_dir.join("downloads.json"),
+        download_folder,
     });
     shell::run(App {
         args,
@@ -293,7 +331,7 @@ fn main() {
 }
 
 pub fn receive_script(message: &Outbound) -> String {
-    format!("window.__aiostreamsDesktopReceive?.({})", message.to_json())
+    format!("window.__aiostreamsAppReceive?.({})", message.to_json())
 }
 
 fn mpv_config_dir(config_dir: &Path) -> PathBuf {
@@ -316,6 +354,11 @@ pub fn start_player(
         ("config-dir", mpv_dir.to_string_lossy().into_owned()),
         ("config", "yes".into()),
         ("audio-client-name", "AIOStreams".into()),
+        // `%23%` quotes the next 23 characters, whose commas would split the option.
+        (
+            "stream-lavf-o",
+            "reconnect=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15".into(),
+        ),
     ];
     defaults.extend(platform::mpv_options(video));
     let defaults: Vec<(&str, &str)> = defaults.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -355,15 +398,22 @@ pub fn start_player(
     platform::load_vulkan_loader(library);
     let awake = Mutex::new(Awake::default());
     let emit = move |message: Outbound| {
-        if let Outbound::MpvProp { name, data, .. } = &message
+        if let Outbound::PlayerState { state, .. } = &message
             && let Ok(mut awake) = awake.lock()
         {
-            awake.update(name, data);
+            awake.update(state);
+        }
+        if let Outbound::VideoColour { gamma, primaries } = message {
+            platform::update_hdr(gamma, primaries);
+            return;
         }
         now_playing::observe(&message);
         emit(message)
     };
-    Player::start(library, &defaults, &required, Arc::new(emit))
+    let sized = std::fs::read_to_string(mpv_dir.join("mpv.conf"))
+        .is_ok_and(|c| c.contains("demuxer-max-bytes"));
+    let auto_cache = (!sized).then(|| playback::auto_cache(platform::total_memory()));
+    Player::start(library, &defaults, &required, auto_cache, Arc::new(emit))
         .unwrap_or_else(|e| platform::fatal(&format!("mpv failed to start: {e}")))
 }
 
@@ -376,6 +426,11 @@ pub fn start_external(paths: &Paths, emit: impl Fn(Outbound) + Send + Sync + 'st
             emit(message)
         }),
     )
+}
+
+/// `emit` is called on the download queue's thread.
+pub fn start_downloads(paths: &Paths, emit: impl Fn(Outbound) + Send + 'static) -> Downloads {
+    Downloads::start(paths.downloads.clone(), paths.download_folder.clone(), emit)
 }
 
 const SUBTITLE_TYPES: &[&str] = &["srt", "vtt", "ass", "ssa", "sub", "sup"];
@@ -421,12 +476,12 @@ impl Default for Awake {
 }
 
 impl Awake {
-    fn update(&mut self, name: &str, data: &serde_json::Value) {
-        match name {
-            "pause" => self.paused = data == true,
-            "idle-active" => self.idle = data == true,
-            _ => return,
+    fn update(&mut self, state: &PlayerState) {
+        if state.paused.is_none() && state.idle.is_none() {
+            return;
         }
+        self.paused = state.paused.unwrap_or(self.paused);
+        self.idle = state.idle.unwrap_or(self.idle);
         let on = !self.paused && !self.idle;
         if on != self.on {
             self.on = on;
@@ -442,6 +497,7 @@ pub fn handle(
     send: &dyn Fn(UserEvent),
     paths: &Paths,
     updater: &Option<Updater>,
+    downloads: &Downloads,
 ) {
     let emit = |message: Outbound| send(UserEvent::Emit(receive_script(&message)));
     let fail = |message: String| {
@@ -450,35 +506,137 @@ pub fn handle(
     };
     let player = player.borrow();
     match message {
-        Inbound::MpvCommand {
-            args,
+        Inbound::PlayerLoad {
+            load,
+            external: to_external,
+        } => {
+            let local = |path: &str| downloads.is_local(path);
+            let done = if to_external {
+                Some(external.load(&load, &local))
+            } else {
+                player.as_ref().map(|p| p.load(&load, &local))
+            };
+            if let Some(Err(e)) = done {
+                fail(format!("player-load: {e}"));
+            }
+        }
+        Inbound::PlayerStop { external: true } => external.stop(),
+        Inbound::PlayerStop { external: false } => {
+            if let Some(p) = player.as_ref() {
+                p.stop();
+            }
+        }
+        Inbound::PlayerUnqueue { external: true } => external.unqueue(),
+        Inbound::PlayerUnqueue { external: false } => {
+            if let Some(p) = player.as_ref() {
+                p.unqueue();
+            }
+        }
+        Inbound::PlayerSet {
+            change,
             external: to_external,
         } => {
             let done = if to_external {
-                Some(external.command(&args))
+                Some(external.change(&change))
             } else {
-                player.as_ref().map(|p| p.command(&args))
+                player.as_ref().map(|p| p.change(&change))
             };
             if let Some(Err(e)) = done {
-                fail(format!("mpv command {args:?}: {e}"));
+                fail(format!("player-set: {e}"));
             }
         }
-        Inbound::MpvSetProp {
-            name,
-            value,
+        Inbound::PlayerSeek {
+            position_ms,
+            external: true,
+        } => external.seek(position_ms),
+        Inbound::PlayerSeek { position_ms, .. } => {
+            if let Some(p) = player.as_ref() {
+                p.seek(position_ms);
+            }
+        }
+        Inbound::PlayerSubtitleAdd {
+            url,
+            title,
+            language,
+            replace,
+            external: to_external,
+        } => {
+            let local = |path: &str| downloads.is_local(path);
+            let done = if to_external {
+                Some(external.add_subtitle_url(&url, &title, &language, replace, &local))
+            } else {
+                player
+                    .as_ref()
+                    .map(|p| p.add_subtitle_url(&url, &title, &language, replace, &local))
+            };
+            if let Some(Err(e)) = done {
+                fail(format!("player-subtitle-add: {e}"));
+            }
+        }
+        Inbound::PlayerStyle(mut style) => {
+            style.fit = platform::fit_video(style.fit);
+            if let Some(Err(e)) = player.as_ref().map(|p| p.style(&style)) {
+                fail(format!("player-style: {e}"));
+            }
+        }
+        Inbound::PlayerStatsOverlay {
+            page,
             external: to_external,
         } => {
             let done = if to_external {
-                Some(external.set_prop(&name, &value))
+                Some(external.stats_overlay(page.as_deref()))
             } else {
-                player.as_ref().map(|p| p.set_prop(&name, &value))
+                player.as_ref().map(|p| p.stats_overlay(page.as_deref()))
             };
             if let Some(Err(e)) = done {
-                fail(format!("mpv set {name}={value}: {e}"));
+                fail(format!("player-stats-overlay: {e}"));
             }
         }
-        Inbound::MpvSync { external: true } => external.sync(),
-        Inbound::MpvSync { external: false } => send(UserEvent::Sync),
+        Inbound::PlayerSubtitleLines { track } => {
+            if let Some(Err(e)) = player.as_ref().map(|p| p.subtitle_lines(track.as_deref())) {
+                fail(format!("player-subtitle-lines: {e}"));
+            }
+        }
+        Inbound::PlayerSubtitleIndex => match player.as_ref() {
+            Some(p) => p.subtitle_index(),
+            None => emit(Outbound::PlayerSubtitleIndex { tracks: None }),
+        },
+        Inbound::PlayerThumbnail {
+            url,
+            headers,
+            position_ms,
+            showing_ms,
+        } => {
+            let local = |path: &str| downloads.is_local(path);
+            let done = player
+                .as_ref()
+                .map(|p| p.thumbnail(&url, &headers, position_ms, showing_ms, &local));
+            if let Some(Err(e)) = done {
+                fail(format!("player-thumbnail: {e}"));
+            }
+        }
+        Inbound::PlayerSync { external: true } => external.sync(),
+        Inbound::PlayerSync { external: false } => send(UserEvent::Sync),
+        Inbound::PlayerKey { key } => {
+            if let Some(Err(e)) = player.as_ref().map(|p| p.keypress(&key)) {
+                fail(format!("player-key: {e}"));
+            }
+        }
+        Inbound::PlayerSettings(settings) => {
+            if let Some(p) = player.as_ref() {
+                p.settings(&settings);
+            }
+        }
+        Inbound::YoutubeResolve { request, id } => {
+            if let Some(p) = player.as_ref() {
+                p.resolve_youtube(request, id);
+            }
+        }
+        Inbound::AudioDevices => {
+            if let Some(p) = player.as_ref() {
+                p.audio_devices();
+            }
+        }
         Inbound::SubtitleFile {
             name,
             data,
@@ -506,6 +664,15 @@ pub fn handle(
         },
         Inbound::ExternalClose => external.close(),
         Inbound::Fullscreen { value } => send(UserEvent::Fullscreen(value)),
+        Inbound::PlayerFrame { frame } => {
+            if let Some(p) = player.as_ref() {
+                let shown = frame.is_none_or(|frame| frame.subtitles);
+                let _ = p
+                    .mpv()
+                    .set_property_async("sub-visibility", if shown { "yes" } else { "no" });
+            }
+            send(UserEvent::VideoFrame(frame));
+        }
         Inbound::Minimize => send(UserEvent::Minimize),
         Inbound::WindowDrag => send(UserEvent::Drag),
         Inbound::WindowResize { edge } => match edge.as_str() {
@@ -525,7 +692,24 @@ pub fn handle(
                 platform: platform::PLATFORM,
                 mpv,
                 ffmpeg,
+                ac3_encoder: player.as_ref().is_some_and(Player::ac3_encoder),
             });
+        }
+        Inbound::VideoOutput { output } => {
+            if let Some(output) = output {
+                platform::choose_video_output(&output);
+            }
+            let (outputs, running, chosen) = platform::video_outputs();
+            emit(Outbound::VideoOutput {
+                outputs,
+                running,
+                chosen,
+            });
+        }
+        Inbound::Restart => {
+            if platform::relaunch() {
+                send(UserEvent::Close);
+            }
         }
         Inbound::OpenMpvConfig => platform::open_external(&paths.mpv.to_string_lossy()),
         Inbound::OpenLogs => platform::open_external(&paths.logs.to_string_lossy()),
@@ -543,6 +727,7 @@ pub fn handle(
             );
             emit(Outbound::Diagnostics { text });
         }
+        Inbound::Licenses => emit(Outbound::Licenses(licenses::read(&licence_dirs()))),
         Inbound::UpdateCheck { channel } => match updater {
             Some(updater) => updater.send(Command::Check(channel)),
             None => emit(Outbound::UpdateState {
@@ -561,6 +746,28 @@ pub fn handle(
         Inbound::NowPlaying { item } => now_playing::set_item(item),
         Inbound::DiscordCheck => discord::check(),
         Inbound::LinksReady => send(UserEvent::LinksReady),
+        Inbound::DownloadAdd { jobs } => downloads.send(downloads::Command::Add(jobs)),
+        Inbound::DownloadControl { id, action } => match action.as_str() {
+            "pause" => downloads.send(downloads::Command::Pause(id)),
+            "resume" => downloads.send(downloads::Command::Resume(id)),
+            "retry" => downloads.send(downloads::Command::Retry(id)),
+            _ => log::warn!("download-control: unknown action {action}"),
+        },
+        Inbound::DownloadRemove { id, files } => {
+            downloads.send(downloads::Command::Remove { id, files })
+        }
+        Inbound::DownloadList => downloads.send(downloads::Command::List),
+        Inbound::DownloadFolder => send(UserEvent::ChooseDownloadFolder),
+        Inbound::DownloadOpen { id } => {
+            let folder = id
+                .and_then(|id| downloads.job_folder(&id))
+                .unwrap_or_else(|| downloads.folder());
+            let _ = std::fs::create_dir_all(&folder);
+            platform::open_external(&folder.to_string_lossy());
+        }
+        Inbound::DownloadConfig { concurrent } => {
+            downloads.send(downloads::Command::SetConcurrent(concurrent))
+        }
         Inbound::WebError { message } => {
             let message: String = message.chars().take(4000).collect();
             log::error!(target: "web", "{message}");

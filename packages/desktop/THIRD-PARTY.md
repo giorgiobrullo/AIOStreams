@@ -3,18 +3,18 @@
 AIOStreams Desktop is licensed under the AGPL-3.0. It ships with:
 
 - **libmpv**, from [mpv](https://mpv.io), licensed under the GPL-2.0-or-later.
-  - Windows: `libmpv-2.dll`, built by
-    [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake), whose tag
-    is in `libmpv.pin` in the AIOStreams repository. Source:
-    [mpv-player/mpv](https://github.com/mpv-player/mpv) and the build scripts in that repository.
-  - macOS: `libmpv.2.dylib` and the libraries it uses, such as FFmpeg, libass, libplacebo and
-    Rubber Band, in `Contents/Frameworks`. They are the builds [IINA](https://iina.io) publishes
-    for its releases, and the release is in `libmpv-macos.pin` in the AIOStreams repository. Each
-    is under its own project's licence (GPL, LGPL or permissive). Source:
-    [mpv-player/mpv](https://github.com/mpv-player/mpv), [FFmpeg](https://ffmpeg.org) and each
-    library's own project.
+  - Windows: `libmpv-2.dll` and FFmpeg's DLLs beside it. macOS: `libmpv.2.dylib` with FFmpeg's,
+    libdovi's and [MoltenVK](https://github.com/KhronosGroup/MoltenVK)'s dylibs in
+    `Contents/Frameworks`. libass, libplacebo, dav1d and the other libraries they use are built in.
+    mpv and FFmpeg carry [edde746's MPVKit](https://github.com/edde746/MPVKit) patches, licensed
+    under the GPL-3.0-only, and FFmpeg is built with its GPL-3.0 parts, so together they are
+    licensed under the GPL-3.0. Each library's licence text is in `licenses`
+    (`Contents/Resources/licenses` on macOS). They are built from pinned sources by
+    [AIOStreams/libs](https://github.com/AIOStreams/libs), whose release is in `libs.pin` and
+    `libs-macos.pin` in the AIOStreams repository. Source: that repository's build scripts, its
+    forks of mpv, FFmpeg and libass, and each library's own project.
 - **The Vulkan loader** on Windows: `vulkan/vulkan-1.dll`, from the
-  [LunarG Vulkan Runtime](https://vulkan.lunarg.com/sdk/home), whose version is in `libmpv.pin` in
+  [LunarG Vulkan Runtime](https://vulkan.lunarg.com/sdk/home), whose version is in `libs.pin` in
   the AIOStreams repository. Licensed under the Apache-2.0; its licence text is beside it in
   `vulkan/VulkanRT-License.txt`. Source:
   [KhronosGroup/Vulkan-Loader](https://github.com/KhronosGroup/Vulkan-Loader).

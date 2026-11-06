@@ -7,13 +7,11 @@
     "sonarr-radarr",
     "release-blocklist",
     "scored-sorting",
-    "app",
-    "desktop-app",
-    "jellyfin",
-    "media-server",
     "seanime",
     "sso",
     "config-profiles",
-    "development"
+    "development",
+    "addon-development",
+    "translating"
   ]
 }

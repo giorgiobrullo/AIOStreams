@@ -19,8 +19,9 @@ use crate::placement::{self, MIN_SIZE, Placement, SETTLE};
 use crate::updates::Updater;
 use crate::{
     App, Edge, Served, UserEvent, allowed_navigation, handle, platform, receive_script, serve,
-    start_external, start_player,
+    start_downloads, start_external, start_player,
 };
+use aiostreams_desktop_core::downloads::{Command as DownloadCommand, Downloads};
 
 /// The bridge posts through `window.ipc`, as wry names it on the other platforms.
 const IPC_SHIM: &str = "window.ipc = { postMessage: (message) => window.webkit.messageHandlers.ipc.postMessage(message) };";
@@ -49,6 +50,7 @@ struct Shell {
     video: platform::VideoSurface,
     player: Rc<RefCell<Option<Player>>>,
     external: Rc<External>,
+    downloads: Rc<Downloads>,
     press: RefCell<Option<Press>>,
     links: RefCell<Inbox>,
     main_loop: glib::MainLoop,
@@ -88,6 +90,30 @@ fn add_frame_style(window: &gtk4::Window) {
     );
 }
 
+/// Skia compositing (2.54+) flashes stale opacity when an animation ends, and redrawing only what
+/// changed leaves parts of the page stale.
+const FEATURES_OFF: &[&str] = &[
+    "UseSkiaForComposition",
+    "UseDamagingInformationForCompositing",
+    "PropagateDamagingInformation",
+];
+
+/// Skips a feature this WebKitGTK does not have.
+fn turn_features_off(settings: &webkit6::Settings) {
+    let Some(features) = webkit6::Settings::all_features() else {
+        return;
+    };
+    for i in 0..features.length() {
+        if let Some(feature) = features.get(i)
+            && feature
+                .identifier()
+                .is_some_and(|id| FEATURES_OFF.contains(&id.as_str()))
+        {
+            settings.set_feature_enabled(&feature, false);
+        }
+    }
+}
+
 fn respond(request: &webkit6::URISchemeRequest, served: Served) {
     let length = served.body.len() as i64;
     let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(served.body));
@@ -124,6 +150,7 @@ impl Shell {
             }
             UserEvent::Minimize => self.window.minimize(),
             UserEvent::Close => self.close(),
+            UserEvent::Closed => {}
             UserEvent::Sync => {
                 if let Some(p) = self.player.borrow().as_ref() {
                     p.sync();
@@ -157,6 +184,7 @@ impl Shell {
             UserEvent::WindowState => self.emit(Outbound::WindowState {
                 maximized: self.window.is_maximized(),
             }),
+            UserEvent::VideoFrame(frame) => self.video.frame(frame),
             UserEvent::WindowButtons(_) => {}
             UserEvent::Link(link) => {
                 self.window.present();
@@ -183,6 +211,18 @@ impl Shell {
                     }
                     if let Some(shell) = shell() {
                         shell.emit(external.players());
+                    }
+                });
+            }
+            UserEvent::ChooseDownloadFolder => {
+                let dialog = gtk4::FileDialog::builder()
+                    .title("Choose where downloads go")
+                    .modal(true)
+                    .build();
+                let downloads = self.downloads.clone();
+                dialog.select_folder(Some(&self.window), None::<&gio::Cancellable>, move |file| {
+                    if let Some(folder) = file.ok().and_then(|f| f.path()) {
+                        downloads.send(DownloadCommand::SetFolder(folder));
                     }
                 });
             }
@@ -223,6 +263,13 @@ pub fn run(app: App) {
     // The window's app id and class, which desktops match to its entry and icon.
     glib::set_prgname(Some("io.github.viren070.aiostreams"));
     glib::set_application_name("AIOStreams");
+    // From 4.16 GTK draws with Vulkan, which stutters mpv's OpenGL frames in fullscreen.
+    let minor = gtk4::minor_version();
+    if minor >= 16 && std::env::var_os("GSK_RENDERER").is_none() {
+        let gl = if minor >= 18 { "opengl" } else { "ngl" };
+        // SAFETY: on the main thread, before any other thread starts.
+        unsafe { std::env::set_var("GSK_RENDERER", gl) };
+    }
     gtk4::init().unwrap_or_else(|e| platform::fatal(&format!("could not start GTK: {e}")));
     // libmpv refuses to start unless LC_NUMERIC is C, which GTK's init replaced.
     // SAFETY: on the main thread, before any other thread starts.
@@ -245,20 +292,23 @@ pub fn run(app: App) {
     video.widget().set_overflow(gtk4::Overflow::Hidden);
     window.set_child(Some(video.widget()));
     let started = start_player(&video, &paths.mpv, |message| {
-        if let Outbound::MpvProp { name, data, .. } = &message
-            && name == "idle-active"
-            && data == true
+        if let Outbound::PlayerState { state, .. } = &message
+            && state.idle == Some(true)
         {
             platform::clear_video();
         }
         post(UserEvent::Emit(receive_script(&message)))
     });
     video.attach(started.mpv());
+    video.on_input(|message| post(UserEvent::Emit(receive_script(&message))));
     let player = Rc::new(RefCell::new(Some(started)));
     let external = Rc::new(start_external(&paths, |message| {
         post(UserEvent::Emit(receive_script(&message)))
     }));
     let updater = Rc::new(Updater::start(|message| {
+        post(UserEvent::Emit(receive_script(&message)))
+    }));
+    let downloads = Rc::new(start_downloads(&paths, |message| {
         post(UserEvent::Emit(receive_script(&message)))
     }));
     discord::start(|message| post(UserEvent::Emit(receive_script(&message))));
@@ -289,6 +339,7 @@ pub fn run(app: App) {
     content.register_script_message_handler("ipc", None);
     let settings = webkit6::Settings::new();
     settings.set_enable_developer_extras(args.devtools);
+    turn_features_off(&settings);
     let webview = webkit6::WebView::builder()
         .web_context(&context)
         .network_session(&session)
@@ -296,12 +347,13 @@ pub fn run(app: App) {
         .settings(&settings)
         .build();
     webview.set_background_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
-    video.widget().add_overlay(&webview);
+    video.set_page(&webview);
 
     content.connect_script_message_received(Some("ipc"), {
         let (webview, player, app_origin) =
             (webview.downgrade(), player.clone(), app_origin.clone());
         let (external, paths, updater) = (external.clone(), paths.clone(), updater.clone());
+        let downloads = downloads.clone();
         move |_, value| {
             let page = webview.upgrade().and_then(|w| w.uri()).unwrap_or_default();
             let from = origin(&page).unwrap_or_default();
@@ -309,7 +361,9 @@ pub fn run(app: App) {
                 return log::warn!("ignored a message from {from}");
             }
             match serde_json::from_str::<Inbound>(&value.to_str()) {
-                Ok(message) => handle(message, &player, &external, &post, &paths, &updater),
+                Ok(message) => handle(
+                    message, &player, &external, &post, &paths, &updater, &downloads,
+                ),
                 Err(e) => log::warn!("bad message: {e}"),
             }
         }
@@ -320,19 +374,22 @@ pub fn run(app: App) {
             let uri = decision
                 .downcast_ref::<NavigationPolicyDecision>()
                 .and_then(|d| d.navigation_action())
-                .and_then(|mut a| a.request())
+                .and_then(|a| a.request())
                 .and_then(|r| r.uri());
             let Some(uri) = uri else { return false };
-            let leave = match kind {
-                PolicyDecisionType::NavigationAction => !allowed_navigation(&uri, &app_origin),
+            let ours = allowed_navigation(&uri, &app_origin);
+            let ignore = match kind {
+                PolicyDecisionType::NavigationAction => !ours,
                 PolicyDecisionType::NewWindowAction => true,
                 _ => false,
             };
-            if leave {
-                platform::open_external(&uri);
+            if ignore {
+                if !ours {
+                    platform::open_external(&uri);
+                }
                 decision.ignore();
             }
-            leave
+            ignore
         }
     });
     webview.connect_load_changed({
@@ -434,6 +491,7 @@ pub fn run(app: App) {
             video,
             player,
             external,
+            downloads,
             press: RefCell::new(None),
             links: RefCell::new(Inbox::default()),
             main_loop: main_loop.clone(),

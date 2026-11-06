@@ -29,7 +29,10 @@ windows = { version = "0.62", features = [
   "Media",
   "Storage_Streams",
   "Win32_Foundation",
+  "Win32_System_Com",
   "Win32_System_WinRT",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
 ] }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
@@ -41,13 +44,14 @@ windows-sys = { workspace = true, features = [
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_UI_Controls_Dialogs",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk4 = { version = "0.9", features = ["v4_14"] }
-webkit6 = "0.4"
+gtk4 = { version = "0.11", features = ["v4_14"] }
+webkit6 = { version = "0.6", features = ["v2_42"] }
 libc = "0.2"
 libloading.workspace = true
 
@@ -59,6 +63,7 @@ objc2-quartz-core = { version = "0.3", features = ["objc2-open-gl", "objc2-core-
 objc2-open-gl = "0.3"
 objc2-core-video = "0.3"
 objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
 dispatch2 = "0.3"
 block2 = "0.6"
 objc2-media-player = { version = "0.3", default-features = false, features = [

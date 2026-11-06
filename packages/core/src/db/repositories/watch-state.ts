@@ -267,12 +267,14 @@ export class WatchStateRepository {
   ): Promise<WatchStateRow[]> {
     const out = new Map<string, WatchStateRow>();
     const wanted = [...new Set(keys.filter(Boolean))];
+    const owner = sql`uuid = ${scope.uuid} AND persona = ${scope.persona}`;
     for (let i = 0; i < wanted.length; i += CHUNK) {
       const list = join(wanted.slice(i, i + CHUNK).map((k) => sql`${k}`));
+      // Two branches, not an OR: SQLite only uses both indexes this way.
       const rows = await db.query<DbRow>(
-        sql`SELECT * FROM watch_state
-             WHERE uuid = ${scope.uuid} AND persona = ${scope.persona}
-               AND (item_key IN (${list}) OR match_key IN (${list}))`
+        sql`SELECT * FROM watch_state WHERE ${owner} AND item_key IN (${list})
+            UNION ALL
+            SELECT * FROM watch_state WHERE ${owner} AND match_key IN (${list})`
       );
       for (const r of rows) out.set(r.item_key, toRow(r));
     }
@@ -376,11 +378,12 @@ export class WatchStateRepository {
   static async upsert(
     scope: WatchScope,
     identity: WatchIdentity,
-    patch: WatchStatePatch
-  ): Promise<WatchStateRow> {
+    patch: WatchStatePatch,
+    opts: { unlessPlayedAfter?: number } = {}
+  ): Promise<WatchStateRow | null> {
     const now = Date.now();
-    const pos = patch.positionMs ?? null;
-    const dur = patch.durationMs ?? null;
+    const pos = patch.positionMs == null ? null : Math.round(patch.positionMs);
+    const dur = patch.durationMs == null ? null : Math.round(patch.durationMs);
     const played = patch.played == null ? null : patch.played ? 1 : 0;
     const fav = patch.favorite == null ? null : patch.favorite ? 1 : 0;
     const setFav = fav == null ? 0 : 1;
@@ -407,6 +410,11 @@ export class WatchStateRepository {
     const origin = patch.origin ?? 'local';
     const sinkId = patch.sinkId ?? null;
     const externalAt = patch.externalAt ?? null;
+    const guarded = opts.unlessPlayedAfter != null;
+    const guard = guarded
+      ? sql`WHERE watch_state.last_played_at IS NULL
+               OR watch_state.last_played_at <= ${opts.unlessPlayedAfter}`
+      : raw('');
 
     const row = await getDb().maybeOne<DbRow>(
       sql`INSERT INTO watch_state
@@ -456,16 +464,18 @@ export class WatchStateRepository {
             last_played_at = CASE WHEN ${setLastPlayed} = 1 THEN ${lastPlayed} ELSE watch_state.last_played_at END,
             -- Maintained on write so the shelves can order on a plain indexed
             -- column instead of a COALESCE the index cannot serve.
-            sort_at = excluded.sort_at,
+            sort_at = CASE WHEN ${setLastPlayed} = 1 THEN excluded.sort_at ELSE watch_state.sort_at END,
             updated_at = excluded.updated_at,
             origin = excluded.origin,
             sink_id = excluded.sink_id,
             external_at = excluded.external_at,
             snapshot = COALESCE(${snapshot}, watch_state.snapshot),
             match_key = COALESCE(excluded.match_key, watch_state.match_key)
+          ${guard}
           RETURNING *`
     );
     if (row) return toRow(row);
+    if (guarded) return null;
     return {
       uuid: scope.uuid,
       persona: scope.persona,
@@ -543,39 +553,31 @@ export class WatchStateRepository {
     const shown = new Set<string>();
     for (let offset = 0; ; offset += page) {
       // Picks the series first, so only their rows are ranked, not the history.
-      const latest = await getDb().query<{
-        series_key: string;
-        at: number | string;
-      }>(
-        sql`SELECT series_key, MAX(sort_at) AS at FROM watch_state
-             WHERE ${where}
-             GROUP BY series_key
-             ORDER BY at DESC, series_key
-             LIMIT ${page} OFFSET ${offset}`
-      );
-      if (!latest.length) return;
-      const lastAt = new Map(latest.map((l) => [l.series_key, Number(l.at)]));
-      const anchors = join(
-        latest.map(
-          (l) =>
-            sql`(series_key = ${l.series_key} AND sort_at = ${Number(l.at)})`
-        ),
-        ' OR '
-      );
       const rows = (
         await getDb().query<DbRow>(
-          sql`SELECT * FROM (
-                 SELECT *, ROW_NUMBER() OVER (
-                          PARTITION BY series_key
-                          ORDER BY season DESC, episode DESC
+          sql`WITH latest AS (
+                 SELECT series_key, MAX(sort_at) AS at FROM watch_state
+                  WHERE ${where}
+                  GROUP BY series_key
+                  ORDER BY at DESC, series_key
+                  LIMIT ${page} OFFSET ${offset}
+               )
+               SELECT * FROM (
+                 SELECT w.*, ROW_NUMBER() OVER (
+                          PARTITION BY w.series_key
+                          ORDER BY w.season DESC, w.episode DESC
                         ) AS series_rank
-                   FROM watch_state
-                  WHERE ${where} AND (${anchors})
+                   FROM latest l
+                   JOIN watch_state w
+                     ON w.uuid = ${scope.uuid} AND w.persona = ${scope.persona}
+                    AND w.series_key = l.series_key AND w.sort_at = l.at
+                  WHERE w.episode IS NOT NULL AND ${WATCHED}
                ) ranked
                WHERE series_rank = 1
                ORDER BY sort_at DESC, season DESC, episode DESC`
         )
       ).map(toRow);
+      if (!rows.length) return;
       const showOf = (row: WatchStateRow) =>
         row.matchKey ? seriesKeyOfMatch(row.matchKey, row.mediaType) : null;
       const droppedAt = await this.dropTimes(scope, [
@@ -585,12 +587,12 @@ export class WatchStateRepository {
           )
         ),
       ]);
-      const kept = rows.filter((row) => {
-        const at = lastAt.get(row.seriesKey!) ?? 0;
-        return ![row.seriesKey, showOf(row)].some(
-          (key) => key && (droppedAt.get(key) ?? 0) > at
-        );
-      });
+      const kept = rows.filter(
+        (row) =>
+          ![row.seriesKey, showOf(row)].some(
+            (key) => key && (droppedAt.get(key) ?? 0) > row.sortAt
+          )
+      );
       const bySeries = new Map(kept.map((row) => [row.seriesKey!, row]));
       for (const row of kept) {
         const show = showOf(row) ?? row.seriesKey!;
@@ -599,7 +601,7 @@ export class WatchStateRepository {
         const whole = bySeries.get(show);
         yield whole && whole !== row ? underShow(row, whole) : row;
       }
-      if (latest.length < page) return;
+      if (rows.length < page) return;
     }
   }
 

@@ -9,6 +9,7 @@ import {
   DistributedLock,
   hasProgrammeVideos,
   encodeItemId,
+  FULL_SUPPORT,
   requestLockType,
   isPlayable,
   resolveMarkerId as markerIdFor,
@@ -132,7 +133,7 @@ export async function playTargetFor(
   return null;
 }
 
-function maxVersionsFor(ctx: JellyfinRequestContext): number {
+export function maxVersionsFor(ctx: JellyfinRequestContext): number {
   const cap = appConfig.jellyfin.maxVersions;
   const wanted = ctx.userData.jellyfin?.maxVersions ?? cap;
   return Math.max(1, Math.min(cap, wanted));
@@ -156,7 +157,7 @@ function noticeStreamsOf(
   );
   return all.filter(
     (stream) =>
-      !isPlayable(stream) &&
+      !isPlayable(stream, FULL_SUPPORT) &&
       NOTICE_TYPES.includes(stream.type) &&
       !(stream.externalUrl && playableUrls.has(stream.externalUrl))
   );
@@ -274,14 +275,14 @@ async function resolveUncached(
       ? { ...stream, type: constants.LIVE_STREAM_TYPE }
       : stream;
   const inline = (target.streams ?? []) as ParsedStream[];
-  const ownPlayable = inline.filter(isPlayable);
+  const ownPlayable = inline.filter((s) => isPlayable(s, FULL_SUPPORT));
   const streamsRes = ownPlayable.length
     ? undefined
     : await engine.getStreams(target.videoId, target.type);
   const all = (
     ownPlayable.length ? inline : (streamsRes?.data?.streams ?? [])
   ) as ParsedStream[];
-  const playable = all.filter(isPlayable);
+  const playable = all.filter((s) => isPlayable(s, FULL_SUPPORT));
   const addonSubtitles: SubtitleTrack[] = [];
 
   const streamContext = engine.getStreamContext();
@@ -300,8 +301,22 @@ async function resolveUncached(
       return fallback;
     }
   };
-  const top = playable.slice(0, maxVersionsFor(ctx));
+  // A client that plays only plain URLs is offered its own first `max`.
+  const max = maxVersionsFor(ctx);
+  const plain = new Set(all.filter((s) => isPlayable(s)).slice(0, max));
+  const top = playable.filter((s, i) => i < max || plain.has(s));
   const identities = sourceIdentities(itemId, top);
+
+  const errors = showErrors(ctx) ? (streamsRes?.errors ?? []) : [];
+  const statistics = (streamsRes?.data?.statistics ?? []).filter(
+    (s) => s.forced || ctx.userData.statistics?.enabled
+  );
+  // As the Stremio list orders them.
+  const statisticsFirst = ctx.userData.statistics?.position === 'top';
+  const streamsAt = statisticsFirst ? statistics.length : 0;
+  const errorsAt = streamsAt + all.length;
+  const statisticsAt = statisticsFirst ? 0 : errorsAt + errors.length;
+  const placeOf = new Map(all.map((stream, i) => [stream, streamsAt + i]));
 
   const sources: MediaSourceRecord[] = [];
   for (const [index, raw] of top.entries()) {
@@ -315,7 +330,10 @@ async function resolveUncached(
         formatted,
         labelFrom(formatted, stream),
         addonSubtitles,
-        generateBingeGroup(stream, index, ctx.userData)
+        {
+          bingeGroup: generateBingeGroup(stream, index, ctx.userData),
+          index: placeOf.get(raw),
+        }
       )
     );
   }
@@ -326,7 +344,7 @@ async function resolveUncached(
     label: string,
     type: string,
     text: { name: string; description: string },
-    extra: { addon?: string; externalUrl?: string } = {}
+    extra: { index: number; addon?: string; externalUrl?: string }
   ) =>
     sources.push(
       noticeRecordFrom(ctx.uuid, `notice|${itemId}|${sources.length}`, label, {
@@ -334,32 +352,35 @@ async function resolveUncached(
         addon: extra.addon ?? '',
         externalUrl: extra.externalUrl,
         type,
+        index: extra.index,
       })
     );
 
   for (const stream of noticeStreamsOf(all, playable)) {
     const formatted = await format(stream);
     notice(labelFrom(formatted, stream), stream.type, formatted, {
+      index: placeOf.get(stream)!,
       addon: stream.addon?.name ?? '',
       externalUrl: webUrl(stream.externalUrl),
     });
   }
-  if (showErrors(ctx)) {
-    for (const error of streamsRes?.errors ?? []) {
-      const text = {
-        name: error.title || appConfig.branding.addonName,
-        description: error.description || 'Unknown error',
-      };
-      notice(labelFrom(text), constants.ERROR_STREAM_TYPE, text);
-    }
+  for (const [i, error] of errors.entries()) {
+    const text = {
+      name: error.title || appConfig.branding.addonName,
+      description: error.description || 'Unknown error',
+    };
+    notice(labelFrom(text), constants.ERROR_STREAM_TYPE, text, {
+      index: errorsAt + i,
+    });
   }
-  for (const statistic of streamsRes?.data?.statistics ?? []) {
-    if (!statistic.forced && !ctx.userData.statistics?.enabled) continue;
+  for (const [i, statistic] of statistics.entries()) {
     const text = {
       name: statistic.title,
       description: statistic.description,
     };
-    notice(labelFrom(text), constants.STATISTIC_STREAM_TYPE, text);
+    notice(labelFrom(text), constants.STATISTIC_STREAM_TYPE, text, {
+      index: statisticsAt + i,
+    });
   }
 
   const memo: PlaybackMemo = {

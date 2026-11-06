@@ -1,4 +1,4 @@
-import { languageToIso6392 } from '../utils/languages.js';
+import { tagLanguage } from '../utils/languages.js';
 import type { JellyfinMediaStream } from './types.js';
 
 export const SUBTITLE_MODES = [
@@ -10,59 +10,73 @@ export const SUBTITLE_MODES = [
 ] as const;
 export type SubtitleMode = (typeof SUBTITLE_MODES)[number];
 
+/** The kinds of subtitle track a user ranks; commentary always comes last. */
+export const SUBTITLE_TYPES = ['normal', 'sdh', 'forced', 'signs'] as const;
+export type SubtitleType = (typeof SUBTITLE_TYPES)[number];
+
+/** The kinds of audio track a user ranks. */
+export const AUDIO_TYPES = ['main', 'description', 'commentary'] as const;
+export type AudioType = (typeof AUDIO_TYPES)[number];
+
 export interface TrackPreferences {
-  /** A language code, `OriginalLanguage`, or empty for none. */
-  audioLanguage: string;
+  /** Language codes in order, any of them `OriginalLanguage`. */
+  audioLanguages: string[];
   playDefaultAudioTrack: boolean;
-  subtitleLanguage: string;
+  audioTypes: AudioType[];
+  subtitleLanguages: string[];
   subtitleMode: SubtitleMode;
+  subtitleTypes: SubtitleType[];
+}
+
+/** The stored order of `all`, any it leaves out after the rest. */
+function ranked<T extends string>(stored: unknown, all: readonly T[]): T[] {
+  const order = Array.isArray(stored) ? stored : [];
+  const saved = all
+    .filter((t) => order.includes(t))
+    .sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  return [...new Set([...saved, ...all])];
 }
 
 /** A stored configuration, with Jellyfin's defaults for what it leaves out. */
 export function trackPreferencesFrom(
   config: Record<string, unknown> | null | undefined
 ): TrackPreferences {
-  const text = (key: string) =>
-    typeof config?.[key] === 'string' ? (config[key] as string) : '';
+  // The ordered list where there is one, else Jellyfin's single language.
+  const languages = (list: string, single: string) => {
+    const value = config?.[list];
+    if (Array.isArray(value) && value.length)
+      return value.filter((v): v is string => typeof v === 'string' && !!v);
+    const one = config?.[single];
+    return typeof one === 'string' && one ? [one] : [];
+  };
   const mode = SUBTITLE_MODES.find((m) => m === config?.SubtitleMode);
   return {
-    audioLanguage: text('AudioLanguagePreference'),
+    audioLanguages: languages('AudioLanguages', 'AudioLanguagePreference'),
     playDefaultAudioTrack: config?.PlayDefaultAudioTrack !== false,
-    subtitleLanguage: text('SubtitleLanguagePreference'),
+    audioTypes: ranked(config?.AudioTypes, AUDIO_TYPES),
+    subtitleLanguages: languages(
+      'SubtitleLanguages',
+      'SubtitleLanguagePreference'
+    ),
     subtitleMode: mode ?? 'Default',
+    subtitleTypes: ranked(config?.SubtitleTypes, SUBTITLE_TYPES),
   };
 }
 
-/** Clients send the bibliographic ISO 639-2 codes; tracks carry the terminologic ones. */
-const TERMINOLOGIC: Record<string, string> = {
-  alb: 'sqi',
-  arm: 'hye',
-  baq: 'eus',
-  bur: 'mya',
-  chi: 'zho',
-  cze: 'ces',
-  dut: 'nld',
-  fre: 'fra',
-  geo: 'kat',
-  ger: 'deu',
-  gre: 'ell',
-  ice: 'isl',
-  mac: 'mkd',
-  mao: 'mri',
-  may: 'msa',
-  per: 'fas',
-  rum: 'ron',
-  slo: 'slk',
-  tib: 'bod',
-  wel: 'cym',
-};
-
+/** The language a code or tag names; one the mapping lacks stays as written. */
 function canonical(code: unknown): string | undefined {
   if (typeof code !== 'string') return undefined;
   const lower = code.trim().toLowerCase();
   if (!lower) return undefined;
-  return TERMINOLOGIC[lower] ?? languageToIso6392(lower) ?? lower;
+  return tagLanguage(lower) ?? lower;
 }
+
+const isOriginal = (language: string | undefined) =>
+  language?.toLowerCase() === 'originallanguage';
+
+const known = (codes: (string | undefined)[]) => [
+  ...new Set(codes.filter((c): c is string => !!c)),
+];
 
 const UNDEFINED_LANGUAGES = new Set([
   'und',
@@ -83,6 +97,29 @@ function matches(stream: JellyfinMediaStream, preferred: string[]): boolean {
 }
 
 const flag = (stream: JellyfinMediaStream, key: string) => stream[key] === true;
+
+const COMMENTARY = /\bcommentary\b/;
+const DESCRIPTION = /\b(audio description|descriptive audio|described video)\b/;
+const SIGNS = /\b(signs?|songs?)\b/;
+const FORCED = /\bforced\b/;
+const SDH = /\b(sdh|cc|hearing[ -]impaired)\b/;
+
+/** Signs before forced, as files often flag a signs and songs track forced. */
+function subtitleType(
+  stream: JellyfinMediaStream
+): SubtitleType | 'commentary' {
+  const title =
+    typeof stream.Title === 'string' ? stream.Title.toLowerCase() : '';
+  if (COMMENTARY.test(title)) return 'commentary';
+  if (SIGNS.test(title)) return 'signs';
+  if (flag(stream, 'IsForced') || FORCED.test(title)) return 'forced';
+  if (flag(stream, 'IsHearingImpaired') || SDH.test(title)) return 'sdh';
+  return 'normal';
+}
+
+/** Only forced lines, which a signs and songs track also is. */
+const forcedOnly = (stream: JellyfinMediaStream) =>
+  ['forced', 'signs'].includes(subtitleType(stream));
 
 /** Stable, so equal keys keep the file's order. */
 function sortBy(
@@ -112,16 +149,41 @@ function score(stream: JellyfinMediaStream, preferred: string[]): number {
   return total;
 }
 
+function audioType(stream: JellyfinMediaStream): AudioType {
+  const title = [stream.Title, stream.DisplayTitle]
+    .filter((t) => typeof t === 'string')
+    .join(' ')
+    .toLowerCase();
+  if (DESCRIPTION.test(title)) return 'description';
+  if (COMMENTARY.test(title)) return 'commentary';
+  return 'main';
+}
+
+/**
+ * The language as before, from kinds the user ranks no lower than main where
+ * the version has any, then the best-ranked kind in that language.
+ */
 function audioIndex(
   streams: JellyfinMediaStream[],
   preferred: string[],
-  preferDefault: boolean
+  preferDefault: boolean,
+  types: AudioType[]
 ): number | undefined {
-  const sorted = sortBy(streams, (s) => score(s, preferred));
-  return (
+  const rank = (s: JellyfinMediaStream) => types.indexOf(audioType(s));
+  const usual = streams.filter((s) => rank(s) <= types.indexOf('main'));
+  const sorted = sortBy(usual.length ? usual : streams, (s) =>
+    score(s, preferred)
+  );
+  const chosen =
     (preferDefault ? sorted.find((s) => flag(s, 'IsDefault')) : undefined) ??
-    sorted[0]
-  )?.Index;
+    sorted[0];
+  if (!chosen) return undefined;
+  const language = canonical(chosen.Language);
+  return sortBy(
+    streams.filter((s) => canonical(s.Language) === language),
+    (s) => -rank(s),
+    (s) => score(s, preferred)
+  )[0].Index;
 }
 
 function defaultAudio(
@@ -131,23 +193,19 @@ function defaultAudio(
 ): number | undefined {
   const audio = streams.filter((s) => s.Type === 'Audio');
   const original = canonical(originalLanguage);
-  if (prefs.audioLanguage.toLowerCase() !== 'originallanguage') {
-    const preferred = canonical(prefs.audioLanguage);
-    return audioIndex(
-      audio,
-      preferred ? [preferred] : [],
-      prefs.playDefaultAudioTrack
-    );
-  }
-  if (!prefs.playDefaultAudioTrack) {
+  if (isOriginal(prefs.audioLanguages[0]) && !prefs.playDefaultAudioTrack) {
     const flagged = audio.find((s) => flag(s, 'IsOriginal'));
     if (flagged && (!original || canonical(flagged.Language) === original))
       return flagged.Index;
   }
+  const preferred = known(
+    prefs.audioLanguages.map((l) => (isOriginal(l) ? original : canonical(l)))
+  );
   return audioIndex(
     audio,
-    original ? [original] : [],
-    prefs.playDefaultAudioTrack
+    preferred,
+    prefs.playDefaultAudioTrack,
+    prefs.audioTypes
   );
 }
 
@@ -157,8 +215,7 @@ function onlyForced(
 ): JellyfinMediaStream | undefined {
   return sortBy(
     sorted.filter(
-      (s) =>
-        flag(s, 'IsForced') && (matches(s, preferred) || undefinedLanguage(s))
+      (s) => forcedOnly(s) && (matches(s, preferred) || undefinedLanguage(s))
     ),
     (s) => matches(s, preferred),
     undefinedLanguage
@@ -169,23 +226,24 @@ function onlyForced(
  * Jellyfin's subtitle modes, except that the file's own tracks come before
  * external ones and Default mode never turns an external one on: those come
  * from subtitle addons in every language, not files placed beside the video.
+ * The user's subtitle types rank tracks before the file's default does.
  */
-function defaultSubtitle(
+function subtitleIn(
   streams: JellyfinMediaStream[],
   prefs: TrackPreferences,
+  preferred: string[],
+  listed: string[],
   audioLanguage: string | undefined
 ): number {
-  if (prefs.subtitleMode === 'None') return -1;
-  const language = canonical(prefs.subtitleLanguage);
-  const preferred = language ? [language] : [];
+  const order = prefs.subtitleTypes;
   const sorted = sortBy(
     streams.filter((s) => s.Type === 'Subtitle'),
     (s) => !flag(s, 'IsExternal'),
-    (s) => flag(s, 'IsDefault'),
-    (s) => !flag(s, 'IsForced') && matches(s, preferred),
-    (s) => flag(s, 'IsForced') && matches(s, preferred),
-    (s) => flag(s, 'IsForced') && undefinedLanguage(s),
-    (s) => flag(s, 'IsForced')
+    (s) => {
+      const type = subtitleType(s);
+      return type === 'commentary' ? 0 : order.length - order.indexOf(type);
+    },
+    (s) => flag(s, 'IsDefault')
   );
   let stream: JellyfinMediaStream | undefined;
   switch (prefs.subtitleMode) {
@@ -196,14 +254,15 @@ function defaultSubtitle(
           (flag(s, 'IsDefault') || flag(s, 'IsForced'))
       );
       break;
+    // Audio in any of the user's languages needs no more than forced lines.
     case 'Smart':
-      stream = preferred.includes(canonical(audioLanguage) ?? '')
+      stream = listed.includes(canonical(audioLanguage) ?? '')
         ? onlyForced(sorted, preferred)
         : sorted.find((s) => matches(s, preferred));
       break;
     case 'Always':
       stream =
-        sorted.find((s) => !flag(s, 'IsForced') && matches(s, preferred)) ??
+        sorted.find((s) => matches(s, preferred)) ??
         onlyForced(sorted, preferred);
       break;
     case 'OnlyForced':
@@ -211,6 +270,27 @@ function defaultSubtitle(
       break;
   }
   return stream?.Index ?? -1;
+}
+
+/** Each language in turn, as the one Jellyfin knows, until one finds a track. */
+function defaultSubtitle(
+  streams: JellyfinMediaStream[],
+  prefs: TrackPreferences,
+  audioLanguage: string | undefined
+): number {
+  if (prefs.subtitleMode === 'None') return -1;
+  const languages = known(prefs.subtitleLanguages.map(canonical));
+  for (const language of languages.length ? languages : [undefined]) {
+    const index = subtitleIn(
+      streams,
+      prefs,
+      language ? [language] : [],
+      languages,
+      audioLanguage
+    );
+    if (index !== -1) return index;
+  }
+  return -1;
 }
 
 /**

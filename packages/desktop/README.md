@@ -1,9 +1,9 @@
 # AIOStreams Desktop
 
-The AIOStreams app (`packages/jellyfin-web`) in a native window, playing through mpv. It
+The AIOStreams app (`packages/web`) in a native window, playing through mpv. It
 runs on Windows, Linux and macOS, with downloads for each, and is in alpha. This file
 covers building it and how it works; using it is in the docs'
-[Desktop app guide](https://docs.aiostreams.viren070.me/guides/desktop-app).
+[Desktop app guide](https://docs.aiostreams.viren070.me/apps/desktop).
 
 The window shows the web app's standalone build, which picks its own server: any Jellyfin server
 works, and AIOStreams servers get the extras. Switching servers happens in the page.
@@ -41,8 +41,12 @@ works, and AIOStreams servers get the extras. Switching servers happens in the p
     OpenGL through libmpv's render API into a `GtkGLArea`, and GTK composites the web view over it.
     mpv is given the Wayland or X11 display, which lets VA-API hand decoded frames to OpenGL without
     copying them through the CPU.
-  - macOS: mpv draws through the render API into a `CAOpenGLLayer` under the web view. Apple has
-    deprecated OpenGL, but the render API has no Metal backend; VideoToolbox decodes.
+  - macOS: the user picks what draws into a layer under the web view, from the next start. By
+    default mpv's gpu-next draws with Vulkan through MoltenVK into a `CAMetalLayer`. The system
+    output hands VideoToolbox's frames to an `AVSampleBufferDisplayLayer`, and macOS shows them,
+    HDR and Dolby Vision included. Compatibility draws through the render API with OpenGL into a
+    `CAOpenGLLayer`, and is all there is below macOS 14. HDR switches the layer into EDR, and the
+    mpv outputs tone map to the display's headroom.
 - **The bridge** carries the page's mpv commands and property changes to the app, and sends back the
   properties the page watches: position, tracks, pause and the rest. See [Bridge](#bridge).
 - **[Velopack](https://velopack.io)** installs and updates the Windows and macOS apps, Linux ships
@@ -60,7 +64,7 @@ The code is a Cargo workspace, outside the pnpm build:
 The page comes first on every platform:
 
 ```sh
-pnpm -F @aiostreams/jellyfin-web build:standalone   # into jellyfin-web/dist-standalone
+pnpm -F @aiostreams/web build:standalone   # into web/dist-standalone
 ```
 
 A debug build finds the page in the repo, and on Windows libmpv too. A release build looks next to
@@ -71,12 +75,14 @@ the executable: the page in a `web` folder, and libmpv beside it.
 Needs Rust (MSVC toolchain), the WebView2 runtime (part of Windows 10 and 11) and 7-Zip on `PATH`.
 
 ```powershell
-./scripts/fetch-libmpv.ps1   # libmpv-2.dll and vulkan/ into vendor/x86_64 (-Arch aarch64 for ARM)
+./scripts/fetch-libs.ps1   # libmpv-2.dll, FFmpeg and vulkan/ into vendor/x86_64 (-Arch aarch64 for ARM)
 cargo run
 ```
 
-`libmpv.pin` names the libmpv build the app ships and each archive's checksum, and the script checks
-them. shinchiro keeps about four months of builds, so bump the pin when its tag disappears.
+`libs.pin` names the [AIOStreams/libs](https://github.com/AIOStreams/libs) release the app
+takes libmpv from and each archive's checksum, and the script checks them. The release's zip holds
+`libmpv-2.dll`, FFmpeg's DLLs, which the seek bar's thumbnails decode with too, and each library's
+licence in `licenses`.
 
 libmpv links the Vulkan loader, `vulkan-1.dll`, which GPU drivers install, so older machines may not
 have one. The pin also names a [LunarG Vulkan Runtime](https://vulkan.lunarg.com/sdk/home) release,
@@ -107,27 +113,29 @@ on a Windows drive. Install the bundle it prints with `flatpak install --user`.
 Needs Rust and the Xcode command line tools.
 
 ```sh
-./scripts/fetch-libmpv-macos.sh   # into vendor/macos-<arch>
+./scripts/fetch-libs-macos.sh   # into vendor/macos-<arch>
 cargo run
 ```
 
-The app ships the libmpv that IINA builds and publishes for its releases: mpv with FFmpeg and its
-libraries, built for macOS 11 and ready to sit in an app bundle. `libmpv-macos.pin` names the IINA
-release and a checksum of each architecture's libraries, and the script checks it. A debug build
-also finds Homebrew's or MacPorts' libmpv. `scripts/make-app-macos.sh` assembles `AIOStreams.app`
-from a release build.
+`libs-macos.pin` names the [AIOStreams/libs](https://github.com/AIOStreams/libs) release the app
+takes libmpv from and each architecture's checksum, and the script checks it. Its zip holds
+`libmpv.2.dylib`, built for macOS 11 with the MoltenVK and AVFoundation outputs upstream mpv lacks,
+FFmpeg's dylibs, which the seek bar's thumbnails decode with too, MoltenVK and each library's
+licence. A debug build also finds Homebrew's or MacPorts' libmpv. `scripts/make-app-macos.sh`
+assembles `AIOStreams.app` from a release build.
 `scripts/check-macos.sh` lints the macOS code for both architectures from Linux, without a Mac.
 
 ### Flags
 
 | Flag                          | Does                                                                            |
 | ----------------------------- | ------------------------------------------------------------------------------- |
-| `--web <url>`                 | Loads this page instead, e.g. `pnpm -F @aiostreams/jellyfin-web dev:standalone` |
+| `--web <url>`                 | Loads this page instead, e.g. `pnpm -F @aiostreams/web dev:standalone` |
 | `--web-dir <dir>`             | Serves the standalone build from this folder                                    |
 | `--devtools`                  | Allows DevTools in a release build                                              |
 | `--remote-debugging-port <n>` | Opens the web view's debugging port, for driving tests                          |
 
-`AIOSTREAMS_LIBMPV` and `AIOSTREAMS_WEB_DIR` point at libmpv and the standalone build too.
+`AIOSTREAMS_LIBMPV` and `AIOSTREAMS_WEB_DIR` point at libmpv and the standalone build too, and on
+macOS `AIOSTREAMS_VIDEO_OUTPUT` (`mpv`, `system` or `compatibility`) overrides the chosen output.
 
 ### Links
 
@@ -227,7 +235,7 @@ target; to look at one locally:
 
 ## Bridge
 
-The page sees `window.aiostreamsDesktop` (`protocol`, `version`, `platform`, `send`, `subscribe`) on
+The page sees `window.aiostreamsApp` (`protocol`, `version`, `platform`, `send`, `subscribe`) on
 the app's own origin only. Messages from any other origin are dropped, navigation away from it opens
 the default browser, and every mpv command, property and `loadfile` option is checked against an
 allowlist in `core/src/bridge.rs`: pages can play http(s) URLs, not local files or scripts. A page
@@ -239,7 +247,7 @@ app as data, which it writes into its own folder for mpv to load.
 
 The design follows Stremio's shells. On Windows,
 [stremio-shell-ng](https://github.com/Stremio/stremio-shell-ng): mpv drawing into the window beneath
-a transparent WebView2, and the `mpv-command` / `mpv-set-prop` message names. On Linux,
+a transparent WebView2. On Linux,
 [stremio-linux-shell](https://github.com/Stremio/stremio-linux-shell): a `GtkGLArea` under a
 transparent WebKitGTK view, given the Wayland display. On macOS, the community
 [stremio-community-v5-mac](https://github.com/nnocte/stremio-community-v5-mac) port and

@@ -74,6 +74,25 @@ export {
 } from './repositories/config-sessions.js';
 export { LinkedAccountRepository } from './repositories/linked-accounts.js';
 export {
+  JellyfinAddressRepository,
+  type JellyfinAddressTarget,
+} from './repositories/jellyfin-addresses.js';
+export {
+  JellyfinPlaylistRepository,
+  PLAYLIST_LIMITS,
+  type JellyfinPlaylist,
+  type PlaylistOwner,
+} from './repositories/jellyfin-playlists.js';
+export {
+  AppReportRepository,
+  normaliseReportCode,
+  formatReportCode,
+  type AppReport,
+  type AppReportInput,
+  type AppReportKind,
+  type AppReportListing,
+} from './repositories/app-reports.js';
+export {
   CommunityRepository,
   type CommunityItemInsert,
   type CommunityLiveUpdate,
@@ -96,6 +115,7 @@ export {
 } from './repositories/watch-air-times.js';
 export {
   WatchSessionRepository,
+  type PlayingTracks,
   type WatchSessionRow,
   type WatchSessionUpsert,
 } from './repositories/watch-sessions.js';

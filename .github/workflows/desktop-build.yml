@@ -41,29 +41,28 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - run: pnpm install --frozen-lockfile --filter "@aiostreams/jellyfin-web..."
-      - run: pnpm -F @aiostreams/jellyfin-web build:standalone
+      - run: pnpm install --frozen-lockfile --filter "@aiostreams/web..."
+      - run: pnpm -F @aiostreams/web build:standalone
       - uses: actions/upload-artifact@v7
         with:
           name: web
-          path: packages/jellyfin-web/dist-standalone
+          path: packages/web/dist-standalone
           retention-days: 1
 
-  # The Rust crates' licences, a page per target, made once for every build;
-  # cargo-about fails on a licence that about.toml does not accept.
+  # The Rust crates' licences, a page and a list for the app per target, made once for
+  # every build; cargo-about fails on a licence that about.toml does not accept.
   licences:
-    if: inputs.platforms != 'linux'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      # Scanning every crate's files takes minutes, and the pages change only with
+      # Scanning every crate's files takes minutes, and the files change only with
       # the crates, the config or the template.
       - id: cache
         uses: actions/cache@v6
         with:
           path: packages/desktop/licences
-          key: licences-${{ inputs.platforms }}-${{ env.CARGO_ABOUT_VERSION }}-${{ hashFiles('packages/desktop/Cargo.lock', 'packages/desktop/about.toml', 'packages/desktop/about.hbs') }}
+          key: licences-json-${{ inputs.platforms }}-${{ env.CARGO_ABOUT_VERSION }}-${{ hashFiles('packages/desktop/Cargo.lock', 'packages/desktop/about.toml', 'packages/desktop/about.hbs') }}
       # Only Cargo's downloads: cargo-about reads the crates, it builds nothing.
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
@@ -86,10 +85,15 @@ jobs:
           if [ "$PLATFORMS" = all ] || [ "$PLATFORMS" = macos ]; then
             targets+=(aarch64-apple-darwin x86_64-apple-darwin)
           fi
+          if [ "$PLATFORMS" = all ] || [ "$PLATFORMS" = linux ]; then
+            targets+=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
+          fi
           mkdir -p licences
           for target in "${targets[@]}"; do
             cargo about generate --config about.toml --target "$target" \
               about.hbs -o "licences/$target.html"
+            cargo about generate --config about.toml --target "$target" \
+              --format json -o "licences/$target.json"
           done
       - uses: actions/upload-artifact@v7
         with:
@@ -154,7 +158,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: web
-          path: packages/jellyfin-web/dist-standalone
+          path: packages/web/dist-standalone
 
       - uses: actions/download-artifact@v8
         with:
@@ -172,7 +176,7 @@ jobs:
           workspaces: packages/desktop
 
       - name: Fetch libmpv
-        run: ./packages/desktop/scripts/fetch-libmpv.ps1 -Arch ${{ matrix.mpv }}
+        run: ./packages/desktop/scripts/fetch-libs.ps1 -Arch ${{ matrix.mpv }}
 
       - name: Build the app
         working-directory: packages/desktop
@@ -189,11 +193,13 @@ jobs:
         run: |
           $stage = New-Item -ItemType Directory -Force stage
           Copy-Item packages/desktop/target/release/aiostreams-desktop.exe $stage
-          Copy-Item packages/desktop/vendor/${{ matrix.mpv }}/libmpv-2.dll $stage
+          Copy-Item packages/desktop/vendor/${{ matrix.mpv }}/*.dll $stage
+          Copy-Item packages/desktop/vendor/${{ matrix.mpv }}/licenses "$stage/licenses" -Recurse
           Copy-Item packages/desktop/vendor/${{ matrix.mpv }}/vulkan "$stage/vulkan" -Recurse
           Copy-Item packages/desktop/THIRD-PARTY.md $stage
-          Copy-Item packages/jellyfin-web/dist-standalone "$stage/web" -Recurse
+          Copy-Item packages/web/dist-standalone "$stage/web" -Recurse
           Copy-Item packages/desktop/licences/${{ matrix.target }}.html "$stage/third-party-licenses.html"
+          Copy-Item packages/desktop/licences/${{ matrix.target }}.json "$stage/third-party-licenses.json"
 
       - name: Pack
         run: |
@@ -255,7 +261,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: web
-          path: packages/jellyfin-web/dist-standalone
+          path: packages/web/dist-standalone
 
       - uses: actions/setup-dotnet@v6
         with:
@@ -273,7 +279,7 @@ jobs:
           workspaces: packages/desktop
 
       - name: Fetch libmpv
-        run: ./packages/desktop/scripts/fetch-libmpv-macos.sh
+        run: ./packages/desktop/scripts/fetch-libs-macos.sh
 
       - name: Build the app
         working-directory: packages/desktop
@@ -283,22 +289,34 @@ jobs:
           grep -q "^version = \"$VERSION\"" Cargo.toml
           cargo build --release
           cp licences/${{ matrix.target }}.html target/third-party-licenses.html
+          cp licences/${{ matrix.target }}.json target/third-party-licenses.json
 
       - name: Assemble the app bundle
         run: ./packages/desktop/scripts/make-app-macos.sh "$VERSION" stage
 
-      # Opens the app for a few seconds on the runner's own display and reads its log.
+      # Opens the app for a few seconds on each video output, on the runner's own display,
+      # and reads its log. A rejected mpv option means the output's libmpv lacks it.
       - name: Smoke test
         run: |
-          stage/AIOStreams.app/Contents/MacOS/aiostreams-desktop &
-          pid=$!
-          sleep 20
-          kill "$pid" 2>/dev/null || true
-          log=$(ls -t "$HOME/Library/Application Support/AIOStreams Desktop/logs/"*.log | head -1)
-          cat "$log"
-          grep -q "mpv started" "$log"
-          grep -q "mpv render context ready" "$log"
-          ! grep -q "panicked" "$log"
+          logs="$HOME/Library/Application Support/AIOStreams Desktop/logs"
+          for output in mpv system compatibility; do
+            rm -rf "$logs"
+            AIOSTREAMS_VIDEO_OUTPUT=$output stage/AIOStreams.app/Contents/MacOS/aiostreams-desktop &
+            pid=$!
+            sleep 20
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            log=$(ls -t "$logs"/*.log | head -1)
+            echo "::group::$output"; cat "$log"; echo "::endgroup::"
+            expect=("video output=$output" "mpv started")
+            [ "$output" = compatibility ] && expect+=("mpv render context ready")
+            for line in "${expect[@]}"; do
+              grep -q "$line" "$log" || { echo "$output: no '$line'" && exit 1; }
+            done
+            for line in "mpv option" "panicked"; do
+              if grep -q "$line" "$log"; then echo "$output: '$line'" && exit 1; fi
+            done
+          done
 
       - name: Pack
         run: |
@@ -349,7 +367,7 @@ jobs:
 
   linux:
     name: Linux ${{ matrix.arch }}
-    needs: [web, feed]
+    needs: [web, feed, licences]
     if: inputs.platforms == 'all' || inputs.platforms == 'linux'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -373,7 +391,12 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: web
-          path: packages/jellyfin-web/dist-standalone
+          path: packages/web/dist-standalone
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: licences
+          path: packages/desktop/licences
 
       - name: Install Flatpak
         run: |

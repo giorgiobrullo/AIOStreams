@@ -1,13 +1,13 @@
 (() => {
-  if (window.top !== window || window.aiostreamsDesktop) return;
+  if (window.top !== window || window.aiostreamsApp) return;
   const listeners = new Set();
   let idle = true;
   const send = (message) => window.ipc.postMessage(JSON.stringify(message));
 
-  Object.defineProperty(window, '__aiostreamsDesktopReceive', {
+  Object.defineProperty(window, '__aiostreamsAppReceive', {
     value(message) {
-      const own = message.type === 'mpv-prop' && !message.external;
-      if (own && message.name === 'idle-active') idle = message.data !== false;
+      const own = message.type === 'player-state' && !message.external;
+      if (own && 'idle' in message) idle = message.idle !== false;
       for (const listener of listeners) {
         try {
           listener(message);
@@ -18,10 +18,11 @@
     },
   });
 
-  window.aiostreamsDesktop = Object.freeze({
+  window.aiostreamsApp = Object.freeze({
     protocol: __PROTOCOL__,
     version: __VERSION__,
     platform: __PLATFORM__,
+    miniPlayer: true,
     device: __DEVICE__,
     send,
     subscribe(listener) {
@@ -118,7 +119,7 @@
       return;
     setTimeout(() => {
       const key = !e.defaultPrevented && mpvKey(e);
-      if (key) send({ type: 'mpv-command', args: ['keypress', key] });
+      if (key) send({ type: 'player-key', key });
     });
   });
 })();

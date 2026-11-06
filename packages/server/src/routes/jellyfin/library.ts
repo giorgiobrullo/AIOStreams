@@ -1,12 +1,16 @@
 import { Router, type Request, type Response } from 'express';
 import {
+  buildContentItem,
   buildGenre,
+  buildPerson,
   catalogHasCollections,
-  filmographyCredits,
+  encodeImageTag,
+  suggestTitles,
+  filmographyPage,
   findPerson,
   recommendedPreviews,
-  sortCredits,
-  titlePreviews,
+  searchPeople,
+  similarPreviews,
   type FilmographyKind,
   Cache,
   collectionMembers,
@@ -65,8 +69,10 @@ import {
   nextUpForSeries,
   rememberListMarkers,
   seasonsForSeries,
+  userViews,
   viewItems,
 } from './items.js';
+import { metahubPoster } from './images.js';
 import { getMeta } from './resolve.js';
 
 const router: Router = Router({ mergeParams: true });
@@ -338,16 +344,6 @@ export async function mapLimited<T, R>(
   return out;
 }
 
-async function take<T>(source: AsyncIterator<T>, n: number): Promise<T[]> {
-  const out: T[] = [];
-  while (out.length < n) {
-    const next = await source.next();
-    if (next.done) break;
-    out.push(next.value);
-  }
-  return out;
-}
-
 const CATALOG_READ_AHEAD = 4;
 
 /**
@@ -391,7 +387,7 @@ async function itemsFromRows(
 router.get(
   ['/UserViews', '/Users/:userId/Views'],
   jf(async (req, res, ctx) => {
-    const items = await viewItems(ctx);
+    const items = await userViews(ctx);
     send(req, res, items, items.length);
   })
 );
@@ -558,32 +554,33 @@ async function handleItems(
     return;
   }
   if (pd?.k === 'person' || personIds.length) {
-    let name: string | null = pd?.k === 'person' ? pd.n : null;
-    if (!name && personIds.length) {
+    let person = pd?.k === 'person' ? pd : null;
+    if (!person && personIds.length) {
       const p = await decodeForRequest(ctx, personIds[0]);
       if (p?.kind === 'descriptor' && p.descriptor.k === 'person')
-        name = p.descriptor.n;
+        person = p.descriptor;
     }
-    const found = name ? await findPerson(ctx.userData, name) : null;
+    const found = person
+      ? await findPerson(engine, ctx.userData, person)
+      : null;
     if (found) {
-      const kinds = types
-        ? (['movie', 'series'] as FilmographyKind[]).filter((k) => types.has(k))
-        : undefined;
-      const credits = sortCredits(
-        filmographyCredits(found.person, kinds),
-        qlist(req, 'SortBy'),
-        sortDescending(req)
-      );
-      const previews = await titlePreviews(
-        engine,
-        found.tmdb,
-        credits.slice(startIndex, startIndex + limit)
-      );
-      const items = await itemsFromPreviews(ctx, previews);
-      send(req, res, excludeTypes(req, items), credits.length, startIndex);
+      const page = await filmographyPage(engine, found, {
+        kinds: types
+          ? (['movie', 'series'] as FilmographyKind[]).filter((k) =>
+              types.has(k)
+            )
+          : undefined,
+        sortBy: qlist(req, 'SortBy'),
+        descending: sortDescending(req),
+        startIndex,
+        limit,
+      });
+      const items = await itemsFromPreviews(ctx, page.previews);
+      send(req, res, excludeTypes(req, items), page.total, startIndex);
       return;
     }
     // Without TMDB, a search for the name finds what it can.
+    const name = person?.n;
     const previews = name ? await searchCatalogs(engine, name, limit) : [];
     const items = filterByType(await itemsFromPreviews(ctx, previews), types);
     send(req, res, items, items.length, 0);
@@ -719,14 +716,22 @@ async function handleItems(
   }
 
   if (searchTerm) {
-    const previews = await searchCatalogs(
-      engine,
-      searchTerm,
-      startIndex + limit,
-      searchKindsFor(types),
-      ctx.userData
-    );
-    const items = filterByType(await itemsFromPreviews(ctx, previews), types);
+    const [previews, people] = await Promise.all([
+      searchCatalogs(
+        engine,
+        searchTerm,
+        startIndex + limit,
+        searchKindsFor(types),
+        ctx.userData
+      ),
+      types?.has('person')
+        ? personResults(ctx, searchTerm, startIndex + limit)
+        : [],
+    ]);
+    const items = [
+      ...filterByType(await itemsFromPreviews(ctx, previews), types),
+      ...people,
+    ];
     send(
       req,
       res,
@@ -738,7 +743,7 @@ async function handleItems(
   }
 
   if (!parentId && !recursive) {
-    const views = await viewItems(ctx);
+    const views = await userViews(ctx);
     send(req, res, views, views.length);
     return;
   }
@@ -887,6 +892,22 @@ router.get(
   })
 );
 
+/** When the show was last watched, which Next Up orders by, beside the episode's own UserData. */
+function withShowWatchedAt(
+  item: JellyfinItem,
+  row?: WatchStateRow
+): JellyfinItem {
+  if (!row?.sortAt) return item;
+  const extension = item.aiostreams as Record<string, unknown> | undefined;
+  return {
+    ...item,
+    aiostreams: {
+      ...extension,
+      showWatchedAt: new Date(row.sortAt).toISOString(),
+    },
+  };
+}
+
 /** How many of the most recently watched shows Next Up looks through. */
 const NEXT_UP_SHOWS = 200;
 
@@ -923,40 +944,45 @@ router.get(
         const next = await nextUpForSeries(ctx, d.descriptor, last, {
           includeResumable,
         });
-        if (next) items.push(next);
+        if (next) items.push(withShowWatchedAt(next, last));
       }
     } else {
       const recent = provider.recentSeries(ctx.watch, limit * 4);
       /* One show can sit under several series keys; see `itemsFromRows`. */
       const shown = new Set<string>();
-      // Reaching the limit mid-batch wastes at most the rest of that batch.
-      for (
-        let checked = 0;
-        items.length < limit && checked < NEXT_UP_SHOWS;
-        checked += ROW_CONCURRENCY
-      ) {
-        const rows = await take(recent, ROW_CONCURRENCY);
-        if (!rows.length) break;
-        const batch = await mapLimited(rows, ROW_CONCURRENCY, async (row) => {
-          const d = {
-            t: row.mediaType,
-            i: seriesIdOf(row.baseId, row.videoId, row.mediaType),
-          };
-          // A part-played anchor can still come back to resume.
-          if (row.played && (await caughtUpOn(ctx, d).catch(() => false)))
-            return null;
-          return nextUpForSeries(ctx, d, row, { includeResumable }).catch(
-            () => null
-          );
-        });
-        for (const next of batch) {
-          if (items.length >= limit) break;
-          if (!next || (next.UserData as { Played: boolean }).Played) continue;
-          const series = String(next.SeriesId ?? next.Id);
-          if (shown.has(series)) continue;
-          shown.add(series);
-          items.push(next);
+      const check = async (row: WatchStateRow) => {
+        const d = {
+          t: row.mediaType,
+          i: seriesIdOf(row.baseId, row.videoId, row.mediaType),
+        };
+        // A part-played anchor can still come back to resume.
+        if (row.played && (await caughtUpOn(ctx, d).catch(() => false)))
+          return null;
+        return nextUpForSeries(ctx, d, row, { includeResumable }).then(
+          (item) => item && withShowWatchedAt(item, row),
+          () => null
+        );
+      };
+      // A new check starts as each one ends, and answers are taken in the shows' order.
+      const running: Promise<JellyfinItem | null>[] = [];
+      let started = 0;
+      const fill = async () => {
+        while (running.length < ROW_CONCURRENCY && started < NEXT_UP_SHOWS) {
+          const row = await recent.next();
+          if (row.done) return;
+          started++;
+          running.push(check(row.value));
         }
+      };
+      await fill();
+      while (running.length && items.length < limit) {
+        const next = await running.shift()!;
+        await fill();
+        if (!next || (next.UserData as { Played: boolean }).Played) continue;
+        const series = String(next.SeriesId ?? next.Id);
+        if (shown.has(series)) continue;
+        shown.add(series);
+        items.push(next);
       }
     }
     send(req, res, items, items.length, 0);
@@ -1320,14 +1346,17 @@ router.get(
     }
     const meta = await getMeta(ctx, desc.t, desc.i);
     const engine = await ctx.engine();
-    // TMDB's picks when it knows the title; else the top of its first genre.
-    const recommended = await recommendedPreviews(
-      engine,
-      ctx.userData,
-      meta ?? { id: desc.i, type: desc.t },
-      desc.k === 'movie' ? 'movie' : 'series',
-      limit
-    );
+    const title = meta ?? { id: desc.i, type: desc.t };
+    // A similar catalog's picks, then TMDB's, then the top of its first genre.
+    const recommended =
+      (await similarPreviews(engine, desc.t, desc.i, meta, limit)) ??
+      (await recommendedPreviews(
+        engine,
+        ctx.userData,
+        title,
+        desc.k === 'movie' ? 'movie' : 'series',
+        limit
+      ));
     if (recommended) {
       const items = await itemsFromPreviews(ctx, recommended);
       send(req, res, items, items.length, 0);
@@ -1500,6 +1529,65 @@ router.get(
   })
 );
 
+async function personResults(
+  ctx: JellyfinRequestContext,
+  term: string,
+  limit: number
+): Promise<JellyfinItem[]> {
+  const people = await searchPeople(
+    await ctx.engine(),
+    ctx.userData,
+    term,
+    limit
+  );
+  return people.flatMap((p) =>
+    p.name
+      ? [
+          buildPerson(
+            ctx.build,
+            { k: 'person', n: p.name, i: p.id },
+            p.poster ?? undefined
+          ),
+        ]
+      : []
+  );
+}
+
+async function hintItems(
+  ctx: JellyfinRequestContext,
+  term: string,
+  limit: number,
+  types: Set<string> | null
+): Promise<JellyfinItem[]> {
+  const kinds = searchKindsFor(types);
+  const suggested = await suggestTitles(
+    term,
+    kinds ?? ['movie', 'series'],
+    limit
+  );
+  if (!suggested) {
+    const engine = await ctx.engine();
+    const previews = await searchCatalogs(
+      engine,
+      term,
+      limit,
+      kinds,
+      ctx.userData
+    );
+    return itemsFromPreviews(ctx, previews);
+  }
+  // Tagged rather than built with a poster, which would be remembered as the title's own.
+  return suggested.map((s) => ({
+    ...buildContentItem(ctx.build, {
+      id: s.id,
+      type: s.type,
+      name: s.name,
+      releaseInfo: s.year?.toString(),
+    }),
+    ImageTags: { Primary: encodeImageTag(metahubPoster(s.id)) },
+  }));
+}
+
 router.get(
   '/Search/Hints',
   jf(async (req, res, ctx) => {
@@ -1510,15 +1598,12 @@ router.get(
       res.json({ SearchHints: [], TotalRecordCount: 0 });
       return;
     }
-    const engine = await ctx.engine();
-    const previews = await searchCatalogs(
-      engine,
-      term,
-      limit,
-      searchKindsFor(types),
-      ctx.userData
-    );
-    const items = filterByType(await itemsFromPreviews(ctx, previews), types);
+    const wantsPeople = types?.has('person') || qb(req, 'IncludePeople');
+    const [titles, people] = await Promise.all([
+      hintItems(ctx, term, limit, types),
+      wantsPeople ? personResults(ctx, term, limit) : [],
+    ]);
+    const items = [...filterByType(titles, types), ...people];
     res.json({
       SearchHints: items.map((i) => ({
         ItemId: i.Id,
@@ -1536,6 +1621,16 @@ router.get(
       })),
       TotalRecordCount: items.length,
     });
+  })
+);
+
+router.get(
+  '/Persons',
+  jf(async (req, res, ctx) => {
+    const term = qs(req, 'SearchTerm')?.trim();
+    const limit = Math.min(Math.max(1, qi(req, 'Limit', 20)), 50);
+    const people = term ? await personResults(ctx, term, limit) : [];
+    send(req, res, people, people.length, 0);
   })
 );
 
