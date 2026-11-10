@@ -13,6 +13,7 @@ export {
   type ActionId,
 } from './actions';
 export {
+  backIsFree,
   inputCount,
   isRepeat,
   mediaKeyJustTaken,
@@ -34,6 +35,7 @@ export {
   move,
   moveTo,
   navSide,
+  navWait,
   openMenu,
   scrollStep,
   type Direction,
@@ -43,5 +45,5 @@ export { returnFocus } from './return';
 export { useRestoreFocus } from './restore-focus';
 export { focusDialog, useDialogStart } from './dialog-start';
 export { startSubmitButtons } from './submit-buttons';
-export { tab, tabList } from './tabs';
+export { pickOnFocus, tab, tabList } from './tabs';
 export { inputLabels } from './keys';

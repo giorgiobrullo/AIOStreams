@@ -2,8 +2,10 @@ import { Router, type Request, type Response } from 'express';
 import {
   config as appConfig,
   createLogger,
+  encodeItemId,
   lookupFor,
   couldHaveSegments,
+  programmeTarget,
   isMemoFresh,
   offeredSources,
   playableSources,
@@ -111,7 +113,13 @@ async function locate(
     decoded = await decodeForRequest(ctx, pointer.itemId);
   }
   if (!decoded || decoded.kind !== 'descriptor') return null;
-  const d = decoded.descriptor;
+  let d = decoded.descriptor;
+  let playedId = itemId;
+  if (d.k === 'program') {
+    d = await programmeTarget(await ctx.engine(), ctx.scope(), d);
+    // Live, it shares the channel's memo, so either id finds the same session.
+    if (d.k !== 'episode') playedId = encodeItemId(d);
+  }
   if (
     d.k !== 'movie' &&
     d.k !== 'episode' &&
@@ -122,20 +130,20 @@ async function locate(
     return null;
   if (rawMsid) {
     const norm = rawMsid.replace(/-/g, '').toLowerCase();
-    if (norm !== itemId) requestedMsid = norm;
+    if (norm !== itemId && norm !== playedId) requestedMsid = norm;
   }
   // No persona check: personas on the same variants share a memo and its session.
   const scope =
     opts.bySession && session?.scope && session.uuid === ctx.uuid
       ? session.scope
       : ctx.scope();
-  const memo = await resolveByItem(ctx.uuid, scope, itemId).then(
+  const memo = await resolveByItem(ctx.uuid, scope, playedId).then(
     (m) => m ?? null
   );
   return {
     ctx,
     descriptor: d as ContentDescriptor,
-    itemId,
+    itemId: playedId,
     memo,
     requestedMsid,
   };
@@ -251,7 +259,8 @@ async function playbackInfo(req: Request, res: Response) {
       loc.ctx.persona?.id
     );
   const target = loc.requestedMsid ?? offered[0].msid;
-  await enrichSourceSubtitles(loc.ctx, memo, target);
+  if (bodyOf(req).SkipSubtitles !== true)
+    await enrichSourceSubtitles(loc.ctx, memo, target);
   await applyProbedMediaInfo(loc.ctx, memo, target, {
     playing: isPlaying(req, loc),
   });
